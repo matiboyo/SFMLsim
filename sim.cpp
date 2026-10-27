@@ -806,6 +806,22 @@ const Color kExileCloakColors[raceCount] = {
     Color(140, 120, 162),                     // dwarf-born: dull lavender
     Color(112, 150, 104),                     // elf-born: dull mint
 };
+// R56-F2 Coin for Peace, phase 1: when tryLaunchRaid() picks a cold pair, the defender's leader (free, hale, its race able
+// to spare the coin) walks to the attacker's crate as an envoy and the column does not march: the raid stays unlaunched
+// while the envoy is on the road. On arrival transferCoin() and the raid cancel happen in one step. A dead envoy, a
+// wiped attacker race or a failed payment moves no coin and cancels nothing (the next raid scan launches it as usual).
+// Envoy only: sellswords are phase 2.
+const int kTributeMax = 6;                    // coin per tribute at most...
+const float kTributeShare = 0.5f;             // ...and never more than this share of the payer's purse, so it never hits zero
+const int kTributeMin = 2;                    // a purse that can't spare this much sends no envoy
+const int kTributeCooldown = 2 * 24 * ticksPerGameHour;   // per paying race between envoys (two game days, over the raid day)
+const float kTributeRelationDelta = 0.3f;     // relation warmth when tribute is accepted
+const int kEnvoyMinHealth = 40;               // the leader must be at least this hale to make the walk
+const int kEnvoyMaxTicks = 10 * ticksPerMinute;   // backstop on the whole trip
+const int kEnvoyCrateSlot = 3;                // stands this many column gaps left of the attacker crate's stand spot
+const Vector2f kEnvoyPipSize(1.0f, 2.0f);     // upright 1x2 coin stack beside the envoy (the caravan pip is a 1px dot on a cart)
+const Color kEnvoyPipColor(226, 164, 44);     // deep amber gold: apart from the pale brass cart pips and the bright crown
+const Color kTributeTickerTint(226, 196, 120);   // warm gold: apart from the trade jade, the raid reds and the exile tan
 
 // Skittish deer: bolt away from a nearby barb for a short, capped time, then a cooldown so hunts can still land
 const int deerStepInterval = 3;            // ticks per 1px step while wandering (deer row of speciesDefs)
@@ -3159,7 +3175,7 @@ enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
 // R53-F4: the one exclusive state a barb is in (work flags like chopping/building stay separate). Set only by
 // beginActivity(), cleared only by endActivity(), which also runs the activity's cleanup.
 enum barbActivity { actNone, actShelter, actExpedition, actRaidAttack, actRaidDefend, actTemper, actSmelt, actDrill, actWatch,
-                    actKneel, actHerb, actCaravan, actExile, activityCount };   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile
+                    actKneel, actHerb, actCaravan, actExile, actEnvoy, activityCount };   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy
 struct activityDef {
     const char* name;
     bool ownsBarb;    // its tick owns the barb outright: every job selector skips it (barbAvailable() false)
@@ -3180,6 +3196,7 @@ const activityDef activityDefs[activityCount] = {
     {"tend herbs",    false, false, true},   // R53-F2: any claim outranks tending, like the drill
     {"caravan",       true,  false, false},  // R54-F1: caravanTick() owns the barb for the whole trip
     {"emigrate",      true,  false, false},  // R54-F3: exileTick() owns the migrant until it joins or is called back
+    {"envoy",         true,  false, false},  // R56-F2: envoyTick() owns the leader for the whole trip
 };
 
 struct barb {
@@ -3417,6 +3434,23 @@ struct exileTransfer { int barbId, from, to; };
 vector<exileTransfer> exileQueue;
 int exileSeasonMark[raceCount] = {-1, -1, -1};   // absolute season (game_day / daysPerSeason) of each race's last departure
 
+// R56-F2: the one envoy. The leader is held by barb id (never an index) and re-resolved by envoyTick() every tick;
+// removeBarb() invalidates a dying envoy's id through envoyMemberLost(), and the trip aborts the next tick unpaid.
+struct envoyTrip {
+    enum Phase {Out, Home} phase = Out;
+    bool active = false;
+    int barbId = -1;
+    int payer = -1, payee = -1;             // defender (sends the coin) and attacker (whose raid it buys off)
+    int amount = 0;                         // coin offered, fixed at launch; it moves only on arrival
+    int ticks = 0;
+};
+envoyTrip envoy;
+int tributeCooldown[raceCount] = {};        // R56-F2: ticks before race r may send another envoy
+void envoyMemberLost(const barb& b) {
+    if (envoy.active && envoy.barbId == b.id) envoy.barbId = -1;
+}
+int envoyCoinId() { return envoy.active && envoy.phase == envoyTrip::Out ? envoy.barbId : -1; }   // R56-F2: drawBarbs() pip
+
 // R52-F1: the one way out of the raid state, on every exit (outcome, abort, beaten defender, removeBarb, backstop)
 bool inRaid(const barb& b) { return b.activity == actRaidAttack || b.activity == actRaidDefend; }   // R53-F4
 void clearRaid(barb& b) {
@@ -3555,6 +3589,7 @@ void endActivity(barb& b) {
         case actKneel:       // R52-F3: nothing else to reset
         case actCaravan:     // R54-F1: the cart's goods live on the caravan entry, not the barb
         case actExile:       // R54-F3: the trip lives on the exile entry; exileTick() resets the walk
+        case actEnvoy:       // R56-F2: the coin stays in the purse until arrival; envoyTick() resets the walk
         case actNone:
         case activityCount:
             break;
@@ -4115,6 +4150,7 @@ const char* barbTaskName(const barb& b) {
         return caravan.phase == caravanTrip::Trade ? "caravan: trading at the crate"
              : caravan.phase == caravanTrip::Home ? "caravan: heading home" : "caravan: on the road";
     if (b.activity == actExile) return "emigrating";   // R54-F3: the tooltip names the destination
+    if (b.activity == actEnvoy) return envoy.phase == envoyTrip::Home ? "envoy: heading home" : "envoy: carrying tribute";   // R56-F2
     if (b.deertargeting) return b.hasSpear ? weaponOf(b).huntLabel : "hunting";   // R47-F8: "hunting (axe)" for dwarves
     if (b.building) return "building";
     if (b.activity == actTemper) return "tempering pick";   // R41-F2
@@ -5342,6 +5378,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
     int cartId = caravanCartId();       // R54-F1
     bool cartLaden = caravanLaden();
     bool cartCoin = caravanPaidInCoin();   // R55-F3
+    int envoyId = envoyCoinId();           // R56-F2
     static VertexArray lookVerts(PrimitiveType::Triangles);   // R35-F1: every race mark this frame, one draw after the loop
     lookVerts.clear();
     watchTorchPts.clear();   // R51-F1
@@ -5546,6 +5583,12 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
                 dot.setPosition(cart + Vector2f(kTradeCartSize.x - 1.0f, -1.0f));
                 window.draw(dot);
             }
+        }
+        if (b.id == envoyId) {   // R56-F2: upright 1x2 amber coin stack on the bottom body rows, two columns out from the body:
+            stripe.setSize(kEnvoyPipSize);   // the spear shaft only reaches that column above the head, so it stays clear; bobs with the body
+            stripe.setFillColor(kEnvoyPipColor);
+            stripe.setPosition(Vector2f(side + 2.0f, bodyTop + bodyH - kEnvoyPipSize.y));
+            window.draw(stripe);
         }
         if (b.activity == actWatch)   // R51-F1: torch held out left at head height, clear of horns, ears and the trait dot; drawn after the overlay
             watchTorchPts.push_back(Vector2f(base.x - 2.0f, bodyTop - 1.0f));
@@ -5907,6 +5950,10 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
             if (b.birthRace != b.race) label += string(", born ") + raceDefs[clampRace(b.birthRace)].name;   // R54-F3
             if (b.activity == actExile && exile.active)   // R54-F3
                 label += string("\nLeaving the ") + racePlurals[clampRace(exile.from)] + " for the " + racePlurals[clampRace(exile.to)];
+            if (b.activity == actEnvoy && envoy.active)   // R56-F2
+                label += envoy.phase == envoyTrip::Out
+                             ? "\nEnvoy to the " + string(racePlurals[clampRace(envoy.payee)]) + ", tribute " + to_string(envoy.amount) + "c"
+                             : "\nEnvoy home to the " + string(racePlurals[clampRace(envoy.payer)]);
             if (b.activity == actCaravan && caravan.active) {   // R54-F1: where the cart goes and what it carries
                 int dest = caravan.phase == caravanTrip::Home ? caravan.from : caravan.to;
                 label += string("\nCaravan ") + (caravan.phase == caravanTrip::Home ? "home to the " : "to the ") + racePlurals[clampRace(dest)];
@@ -9809,6 +9856,8 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     clearRaid(b);
     caravanMemberLost(b);                         // R54-F1: drops its caravan id; caravanTick() aborts the trip next tick
     endActivity(b, actCaravan);
+    envoyMemberLost(b);                           // R56-F2: drops the envoy id; envoyTick() aborts unpaid next tick
+    endActivity(b, actEnvoy);
     clearSick(b);                                 // R52-F4
     clearKneel(b);                                // R52-F3: explicit, though releaseBarbWork()'s clearTraining() already did it
     if (isLeader(b)) loseLeader(b.race);
@@ -11209,8 +11258,44 @@ Vector2f raidCrateSpot(int r, int k) { return storehousePos[clampRace(r)] + stor
 // R52-F1: a cold pair whose cooldown has run out, by daylight, both crates built. The aggressor is the side with more
 // eligible armed barbs (at least kRaidPartySize, its bell silent); ties are rolled. The column is the nearest eligible
 // barbs to its crate. The pair's cooldown restarts at launch, so a broken-up raid still costs the pair a day.
+// R56-F2: coin race r can offer as tribute now: kTributeShare of its purse capped at kTributeMax, 0 if under kTributeMin
+int tributeAmountOf(int r) {
+    if (r < 0 || r >= raceCount) return 0;
+    int a = min(kTributeMax, (int)(purse[r] * kTributeShare));
+    return a >= kTributeMin ? a : 0;
+}
+// R56-F2: called by tryLaunchRaid() once it has chosen the pair and the column, before anything launches. The defender's
+// elected leader goes as envoy if it is free (raidIdle()), hale, the race's tribute cooldown has run out and the purse
+// can spare kTributeMin. Nothing is paid here; true = the envoy is out and the raid stays unlaunched.
+bool trySendEnvoy(vector<barb>& barbs, int att, int def) {
+    if (envoy.active || att < 0 || att >= raceCount || def < 0 || def >= raceCount || att == def) return false;
+    if (tributeCooldown[def] > 0 || !raceElected[def]) return false;
+    int amount = tributeAmountOf(def);
+    if (amount <= 0) return false;
+    int li = findBarbById(barbs, raceLeaderId[def]);
+    if (li < 0) return false;
+    barb& l = barbs[li];
+    if (!isLeader(l) || l.race != def || !raidIdle(l) || l.health < kEnvoyMinHealth) return false;
+    expeditionReset(l);   // ends any drill or wander walk first
+    beginActivity(l, actEnvoy);
+    envoy = envoyTrip{};
+    envoy.active = true;
+    envoy.phase = envoyTrip::Out;
+    envoy.barbId = l.id;
+    envoy.payer = def;
+    envoy.payee = att;
+    envoy.amount = amount;
+    tributeCooldown[def] = kTributeCooldown;
+    string line = string(racePlurals[def]) + "' leader " + l.name + " carries " + to_string(amount) + "c to the " + racePlurals[att]
+                  + " to buy off a raid";
+    printf("---ENVOY OUT--- %s (purse %d, relation %.2f)\n", line.c_str(), purse[def], raceRelation[att][def]);
+    logEvent(line, kTributeTickerTint);
+    return true;
+}
+
 void tryLaunchRaid(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
     if (isNightHour(game_time)) return;
+    if (envoy.active && envoy.phase == envoyTrip::Out) return;   // R56-F2: no raid launches while tribute is on the road
     int n = min((int)barbs.size(), (int)squares.size());
     int start = uniform_int_distribution<int>(0, raceCount - 1)(gen);
     for (int o = 0; o < raceCount; o++) {
@@ -11241,6 +11326,7 @@ void tryLaunchRaid(vector<barb>& barbs, vector<RectangleShape>& squares, const s
             ok = pick[k] >= 0;
         }
         if (!ok) continue;
+        if (trySendEnvoy(barbs, att, def)) return;   // R56-F2: the column stays home while the envoy walks
         raid = raidParty{};
         raid.active = true;
         raid.att = att;
@@ -11953,6 +12039,93 @@ void applyExileTransfers(vector<barb>& barbs, vector<RectangleShape>& squares, c
         exile = exileTrip{};
         printf("---EXILE JOINS--- %s (id %d, born %s) joins the %s, house %d\n", barbs[i].name, barbs[i].id,
                raceDefs[clampRace(barbs[i].birthRace)].name, racePlurals[clampRace(q.to)], houseId + 1);
+    }
+}
+
+// R56-F2: hand the envoy back to the other systems, standing where it is (every exit goes through here)
+void releaseEnvoyBarb(barb& b) {
+    if (b.activity != actEnvoy) return;
+    expeditionReset(b);
+    endActivity(b, actEnvoy);
+}
+void endEnvoy(vector<barb>& barbs) {
+    int i = findBarbById(barbs, envoy.barbId);
+    if (i >= 0) releaseEnvoyBarb(barbs[i]);
+    envoy = envoyTrip{};
+}
+// any exit short of the walk home. On the way out nothing has been paid and the raid is not called off.
+void abortEnvoy(vector<barb>& barbs, const char* why) {
+    int payer = clampRace(envoy.payer), payee = clampRace(envoy.payee);
+    bool unpaid = envoy.phase == envoyTrip::Out;
+    printf("---ENVOY ABORTED--- %s envoy to the %s: %s%s\n", racePlurals[payer], racePlurals[payee], why,
+           unpaid ? " (no tribute paid, raid not called off)" : "");
+    if (unpaid) logEvent(string(racePlurals[payer]) + "' envoy never reaches the " + racePlurals[payee] + ": no tribute paid", kTributeTickerTint);
+    endEnvoy(barbs);
+}
+// R56-F2: on arrival, the one place tribute moves. Only for an unlaunched raid on a pair that is still cold. The coin
+// goes through transferCoin() and, in the same step and only if it moved, the raid is called off: the pair's raid
+// cooldown restarts exactly as a launch restarts it (no extension) and the relation warms. Returns nullptr when paid,
+// otherwise why not; a refusal pays nothing and cancels nothing.
+const char* envoyPay() {
+    int d = clampRace(envoy.payer), a = clampRace(envoy.payee);
+    if (raid.active) return "a raid is already out";
+    if (relationTierOf(raceRelation[a][d]) != relCold) return "the pair is no longer cold";
+    int amount = min(envoy.amount, tributeAmountOf(d));   // the purse may have thinned on the road
+    if (amount <= 0 || !transferCoin(d, a, amount)) return "the purse is too thin";
+    raidPairCooldown[a][d] = raidPairCooldown[d][a] = kRaidPairCooldownTicks;
+    setRelation(a, d, raceRelation[a][d] + kTributeRelationDelta);
+    string paid = "Tribute delivered: the " + string(racePlurals[d]) + " pay the " + racePlurals[a] + " " + to_string(amount) + "c";
+    string averted = "Raid averted: the " + string(racePlurals[a]) + " will not march on the " + racePlurals[d];
+    printf("---TRIBUTE--- %s; %s (purses %d / %d, relation %.2f)\n", paid.c_str(), averted.c_str(), purse[d], purse[a], raceRelation[a][d]);
+    logEvent(paid, kTributeTickerTint);
+    logEvent(averted, kTributeTickerTint);
+    return nullptr;
+}
+
+// R56-F2: runs in the fixed-step sim loop after applyExileTransfers(). Counts the tribute cooldowns down, clears a stale
+// envoy flag, then walks the envoy (re-resolved by id every tick) to the attacker's crate and back. A missing or dying
+// envoy, a state conflict, the attacker race wiped out or its crate gone aborts the trip unpaid.
+void envoyTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
+    for (auto& c : tributeCooldown) if (c > 0) c--;
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (int i = 0; i < n; i++) {   // backstop: an envoy flag with no envoy entry behind it is cleared
+        barb& b = barbs[i];
+        if (b.activity == actEnvoy && (!envoy.active || envoy.barbId != b.id)) {
+            printf("ENVOY FLAG CLEARED - barb %d (no envoy entry)\n", b.id);
+            releaseEnvoyBarb(b);
+        }
+    }
+    if (!envoy.active) return;
+    envoy.ticks++;
+    int i = findBarbById(barbs, envoy.barbId);
+    if (i < 0 || i >= n) { abortEnvoy(barbs, "envoy gone"); return; }
+    const barb& m = barbs[i];
+    if (m.activity != actEnvoy || inRaid(m) || m.chopping || m.building || m.movingbspot || m.deertargeting || m.inMine
+        || m.race != envoy.payer || m.health <= 0 || !isLeader(m)) {
+        printf("ENVOY CONFLICT - barb %d (%s)\n", m.id, activityDefs[m.activity].name);
+        abortEnvoy(barbs, "state conflict");
+        return;
+    }
+    int payer = clampRace(envoy.payer), payee = clampRace(envoy.payee);
+    if (envoy.ticks > kEnvoyMaxTicks) { abortEnvoy(barbs, "timeout"); return; }
+    int ri[1] = {i};
+    if (envoy.phase == envoyTrip::Out) {
+        int payeeLeft = 0;
+        for (auto& b : barbs) if (b.race == payee) payeeLeft++;
+        if (payeeLeft == 0 || !stores[payee].built) { abortEnvoy(barbs, payeeLeft == 0 ? "race wiped out" : "crate gone"); return; }
+        if (!raidColumnStep(barbs, squares, ri, raidCrateSpot(payee, kEnvoyCrateSlot))) return;
+        if (const char* why = envoyPay()) {
+            printf("---TRIBUTE REFUSED--- %s envoy at the %s crate: %s\n", racePlurals[payer], racePlurals[payee], why);
+            logEvent(string(racePlurals[payer]) + "' envoy turns back from the " + racePlurals[payee] + ": no tribute paid", kTributeTickerTint);
+        }
+        envoy.phase = envoyTrip::Home;
+        return;
+    }
+    // Home: released on reaching its own crate (or where it stands if the crate is gone)
+    if (!stores[payer].built) { abortEnvoy(barbs, "home crate gone"); return; }
+    if (raidColumnStep(barbs, squares, ri, raidCrateSpot(payer, kEnvoyCrateSlot))) {
+        printf("ENVOY HOME - %s leader back at their crate\n", racePlurals[payer]);
+        endEnvoy(barbs);
     }
 }
 
@@ -14482,6 +14655,7 @@ int main() {
                 campTick(barbs, squares, wd);   // R55-F1: wildfolk hunters, deer trade, trespass and tents
                 exileTick(barbs, squares, stores);     // R54-F3: walks the migrant; an arrival is only queued here...
                 applyExileTransfers(barbs, squares, houses);   // ...and applied here, outside every barb loop
+                envoyTick(barbs, squares, stores);     // R56-F2: the tribute envoy's walk and payment
                 bellTick(barbs, squares, houses, houseshapes, wolves, stores, smoke, dwarfForge, fields,
                          trees, tris, rocks, octs, bushes);   // INBOX-F1: after the wolves move
                 expeditionTick(barbs, squares, wolves, stores);   // R45-F2: after the wolves and the bell, before hungerTick()
