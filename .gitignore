@@ -16,3 +16,6 @@ feature-reports/.requeue-counts.json
 
 # brainstormer: last commit reviewed
 feature-reports/.brainstorm-last
+
+# python bytecode cache
+__pycache__/
