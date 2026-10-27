@@ -37,8 +37,8 @@ constexpr int treeSpawnOneIn = (int)(100000 / worldAreaScale); // 1-in-N per tic
 // new trees pick a band by its share of the startup trees, and the core stops taking new trees at zoneCoreTreeCap.
 enum zoneId { zoneCore, zoneWild, zoneEdge, zoneCount };
 const char* const zoneNames[zoneCount] = {"core", "wild", "edge"};
-const float zoneCoreRadius = 420.0f;        // safe core: px from villageCenter (quarters reach ~313, so they sit inside)
-const float zoneEdgeBandPx = 320.0f;        // rocky edge: px in from each map border
+constexpr float zoneCoreRadius = 420.0f;       // safe core: px from villageCenter (quarters reach ~313, so they sit inside)
+constexpr float zoneEdgeBandPx = 320.0f;       // rocky edge: px in from each map border
 const float zoneTreeDensity[zoneCount] = {1500.0f, 2200.0f, 400.0f};   // trees per 800x800 (old map: 2000 everywhere)
 const float zoneRockDensity[zoneCount] = {100.0f, 60.0f, 200.0f};      // rocks per 800x800 (old map: 100 everywhere)
 const int zoneCoreTreeCap = 1400;           // core never holds more than this (startup is clamped to it too)
@@ -817,6 +817,28 @@ const int deerFleeTicks = 40;              // hard cap on one flee (~40px at fle
 const float deerFleeDistance = 40.0f;      // how far the flee target is set from the deer
 const int deerFleeCooldown = 600;          // ticks after a flee before the deer can flee again (barb gains ~60px)
 const float deerFleeEdgeMargin = 4.0f;     // flee targets stay this far inside the map and below the HUD strip
+
+// R56-F1 The Autumn Trek, phase 1: at the first midnight of autumn every deer on the map sets out (deer::migrate) for one
+// graze patch in the rocky west rim, grazes there through winter and turns for home at the first midnight of spring.
+// Rabbits and late arrivals stay put. kHerdGoal is the one shared goal: herdTick, deerwander, the hunters and the draw
+// all read it. Camp relocation and the paler winter tint are phase 2.
+constexpr Vector2f kHerdGoal(zoneEdgeBandPx * 0.5f, worldSize * 0.5f);   // patch centre, mid west edge band
+constexpr float kHerdPatchRadius = 110.0f;     // grazing disc; deer inside it are out of every hunter's reach
+const float kHerdLegPx = 30.0f;             // one trek leg (a deer pauses between legs, so the herd strings out)
+const int kHerdLegOneIn = 120;              // 1-in-N per idle tick to start the next leg (wander uses 1-in-150)
+const float kHerdLegJitterPx = 10.0f;       // +- sideways wobble per leg
+const int kHerdLanes = 9;                   // each deer keeps its own lane across the trek line: a loose column
+const float kHerdLanePx = 12.0f;            // lane spacing (lanes span +-48px)
+const int kHerdSettleOneIn = 12;            // homing deer past the edge band settle with this 1-in-N per leg
+const float kHerdGrazeFill = 0.8f;          // graze targets fall inside this share of the patch radius
+const Color kHerdPatchColor(150, 156, 98, 13);   // dry pale grass, two stacked discs (~26 alpha at the heart)
+const float kHerdPatchInner = 0.62f;        // inner disc radius share
+const Color kHerdTickerTint(198, 168, 128); // deer tan, readable on the black strip
+constexpr bool kWolvesTrail = false;        // ON: hunting wolves chase only trekking deer while a trek is on (phase 1: off)
+static_assert(kHerdGoal.x - kHerdPatchRadius >= mapEdgeInset && kHerdGoal.x + kHerdPatchRadius <= zoneEdgeBandPx,
+              "the graze patch must sit wholly inside the west edge band");
+static_assert(worldSize * 0.5f - kHerdGoal.x - kHerdPatchRadius > zoneCoreRadius + 300.0f,
+              "the graze patch must stay well clear of the core (storehouses and quarters)");
 
 const float barbWorkSearchRadius = 25.0f;  // barbs only notice trees/rocks within this many px (findNearest)
 const float barbWorkFallbackRadius = 160.0f; // R45-F1a: nothing in reach and no shore to fish: one wider look before wandering
@@ -3584,6 +3606,7 @@ void leaveMine(barb& b, bool withLoad = false) {
     printf("SHAFT CLIMB OUT - barb %d%s\n", b.id, withLoad ? " with stone" : "");
 }
 
+enum deerTrek {trekNone, trekOut, trekHome};   // R56-F1: off the trek, heading for / grazing at kHerdGoal, walking home
 struct deer {            // any game animal; species picks its row in speciesDefs
 animalSpecies species = speciesDeer;
 int x, y;
@@ -3596,6 +3619,7 @@ bool invincible = false;
 int invincibleTimer = 0;
 int fleeTimer = 0;      // ticks of flee left; only deerwander touches the flee fields (never health/invincible)
 int fleeCooldown = 0;
+deerTrek migrate = trekNone;   // R56-F1: a deer field, so swapRemove(deers, i) carries it with the deer/deershape pair
 };
 
 int nextDeerId = 0;
@@ -4016,6 +4040,21 @@ void buildZoneTint() {
         }
 }
 
+// R56-F1: the herd's graze patch at kHerdGoal, two faint stacked discs of dry grass. Drawn just over the zone tint, under
+// trails, lakes and everything else, so it reads as ground and never hides a deer.
+void drawHerdPatch(RenderWindow& window, const FloatRect& view) {
+    FloatRect bounds(kHerdGoal - Vector2f(kHerdPatchRadius, kHerdPatchRadius), Vector2f(2 * kHerdPatchRadius, 2 * kHerdPatchRadius));
+    if (!view.findIntersection(bounds)) return;
+    const float radii[2] = {kHerdPatchRadius, kHerdPatchRadius * kHerdPatchInner};
+    for (float r : radii) {
+        CircleShape disc(r, 40);
+        disc.setOrigin(Vector2f(r, r));
+        disc.setPosition(kHerdGoal);
+        disc.setFillColor(kHerdPatchColor);
+        window.draw(disc);
+    }
+}
+
 // World layer, straight after the clear: under trails, lakes and everything else
 void drawZoneTint(RenderWindow& window, const FloatRect& view) {
     if (zoneTintN == 0) return;
@@ -4116,6 +4155,94 @@ void validateDeerTargets(vector<barb>& barbs, const vector<deer>& deers) {
 		if (b.deertargeting && findDeerById(deers, b.targetDeerId) == -1) clearHunt(b);
 }
 
+// R56-F1: the hunters' reach test, one distance check (no path search): a trekking deer in the far graze patch is out of
+// reach. Deer still on the road, stragglers and late arrivals stay huntable, so hunting goes on through winter.
+bool deerUnreachable(const deer& d, Vector2f pos) {
+	if (d.migrate == trekNone) return false;
+	Vector2f g = pos - kHerdGoal;
+	return g.x * g.x + g.y * g.y < kHerdPatchRadius * kHerdPatchRadius;
+}
+
+bool herdOnTrek(const vector<deer>& deers) {
+	for (auto& d : deers) if (d.migrate != trekNone) return true;
+	return false;
+}
+
+// R56-F1: runs right before deerwander(). Acts only on season edges: autumn flags every deer on the map trekOut, spring
+// turns the grazers trekHome; one ticker line each. A run that starts in autumn or winter sets out on its first tick.
+void herdTick(world& wd) {
+	static int lastSeason = -1;
+	int now = seasonOf(game_day);
+	if (now == lastSeason) return;
+	bool first = lastSeason < 0;
+	lastSeason = now;
+	const char* dir = compassName(kHerdGoal - villageCenter);
+	int n = 0;
+	if (now == seasonAutumn || (first && now == seasonWinter)) {
+		for (auto& d : wd.deers)
+			if (d.species == speciesDeer && d.migrate == trekNone) { d.migrate = trekOut; n++; }
+		if (n == 0) return;
+		printf("HERD TREK - %d deer set out for the %s grazing\n", n, dir);
+		logEvent(string("The deer herd sets out for the ") + dir + " grazing (" + to_string(n) + " deer)", kHerdTickerTint);
+	} else if (now == seasonSpring) {
+		for (auto& d : wd.deers)
+			if (d.migrate == trekOut) { d.migrate = trekHome; n++; }
+		if (n == 0) return;
+		printf("HERD TREK - %d deer head home from the %s grazing\n", n, dir);
+		logEvent(string("The deer herd returns from the ") + dir + " grazing (" + to_string(n) + " deer)", kHerdTickerTint);
+	}
+}
+
+// R56-F1: one idle step for a trekking deer (called by deerwander instead of the plain wander). Out: short legs toward
+// kHerdGoal in the deer's own lane, then grazing inside the patch. Home: legs back toward the village, settling at random
+// once past the edge band. Random pauses between legs string the herd out into a loose column.
+void herdStep(deer& d, const RectangleShape& ds, Vector2f pos) {
+	Vector2f box = ds.getSize() + Vector2f(0.0f, speciesOf(d).legPx);
+	Vector2f t;
+	Vector2f g = pos - kHerdGoal;
+	if (d.migrate == trekOut && g.x * g.x + g.y * g.y < kHerdPatchRadius * kHerdPatchRadius) {   // grazing
+		if (wanderChance(gen) != 0) return;
+		t = pos + Vector2f(wanderDX(gen), wanderDY(gen));
+		Vector2f tg = t - kHerdGoal;
+		float fill = kHerdPatchRadius * kHerdGrazeFill;
+		if (tg.x * tg.x + tg.y * tg.y >= fill * fill) {   // would stray out: a fresh spot inside the patch instead
+			float a = uniform_real_distribution<float>(0.0f, 6.2831853f)(gen);
+			float r = fill * sqrt(uniform_real_distribution<float>(0.0f, 1.0f)(gen));
+			t = kHerdGoal + Vector2f(cos(a), sin(a)) * r;
+		}
+	} else {
+		if (uniform_int_distribution<int>(0, kHerdLegOneIn - 1)(gen) != 0) return;
+		Vector2f home = villageCenter - kHerdGoal;
+		float trekLen = hypot(home.x, home.y);
+		Vector2f axis = home / trekLen;
+		Vector2f lane = Vector2f(-axis.y, axis.x) * ((d.id % kHerdLanes - kHerdLanes / 2) * kHerdLanePx);
+		Vector2f diff = (d.migrate == trekOut ? kHerdGoal : villageCenter) + lane - pos;
+		float len = hypot(diff.x, diff.y);
+		if (d.migrate == trekHome) {
+			Vector2f c = pos - villageCenter;
+			float fromVillage = hypot(c.x, c.y);
+			bool pastEdge = hypot(g.x, g.y) > kHerdPatchRadius + zoneEdgeBandPx * 0.5f;   // out in the wild band
+			if (fromVillage < zoneCoreRadius || len < kHerdLegPx
+			    || (pastEdge && uniform_int_distribution<int>(0, kHerdSettleOneIn - 1)(gen) == 0)) {
+				d.migrate = trekNone;   // home: plain wandering from here
+				return;
+			}
+		}
+		Vector2f dir = len > 0.0f ? diff / len : axis;
+		Vector2f side(-dir.y, dir.x);
+		t = pos + dir * min(kHerdLegPx, len) + side * uniform_real_distribution<float>(-kHerdLegJitterPx, kHerdLegJitterPx)(gen);
+		if (!lakeClear(FloatRect(t, box), &pos))   // water ahead: sidestep one leg and try again next time
+			t = pos + side * (uniform_int_distribution<int>(0, 1)(gen) == 0 ? kHerdLegPx : -kHerdLegPx);
+	}
+	t.x = clamp(t.x, deerFleeEdgeMargin, worldSize - box.x - deerFleeEdgeMargin);
+	t.y = clamp(t.y, hudBarHeight + deerFleeEdgeMargin, worldSize - box.y - deerFleeEdgeMargin);
+	if (!lakeClear(FloatRect(t, box), &pos)) return;
+	d.targetx = (int)t.x;
+	d.targety = (int)t.y;
+	d.moving = true;
+	d.stepTimer = 0;
+}
+
 void deerkilling(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares, smokehouseSet& sh) {
 	vector<deer>& deers = wd.deers;
 	vector<RectangleShape>& deershape = wd.deershape;
@@ -4134,11 +4261,16 @@ void deerkilling(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares
 			}
 		}
 		bool removed = false;
+		bool farGraze = deerUnreachable(d, deerpos);   // R56-F1: once per deer, not per barb
 		for (int j = 0; j < (int)barbs.size(); ++j) {
 			auto& b = barbs[j];
 			auto& sq = squares[j];
 			if (!barbAvailable(b) || b.building || b.movingbspot || b.chopping || b.timer > 0 || b.carryKind != carryNone || atForgeTask(b)) continue;   // R29-F1: haulers finish the trip; R41-F2: so do temperers (R47-F7: and smelters); R45-F2
 			if (b.activity == actWatch) continue;   // R51-F1: watchmen keep to the watch
+			if (farGraze) {   // R56-F1: out of reach in the graze patch: nobody starts on it, a chaser gives up
+				if (b.deertargeting && b.targetDeerId == d.id) clearHunt(b);
+				continue;
+			}
 			if (!b.deertargeting) {
 				Vector2f bpos = sq.getPosition();
 				float dx = deerpos.x - bpos.x, dy = deerpos.y - bpos.y;
@@ -4222,6 +4354,7 @@ void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs) {
 			logEvent(string("A wolf comes out of the wilds to the ") + dir);
 		}
 	}
+	bool trail = kWolvesTrail && herdOnTrek(deers);   // R56-F1: while the herd treks, wolves follow it (off by default)
 	for (int i = 0; i < (int)wolves.size(); ) {
 		wolf& w = wolves[i];
 		Vector2f pos = w.shape.getPosition();
@@ -4231,7 +4364,7 @@ void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs) {
 		if (w.phase == wolf::Hunting) {
 			prey = findNearest(pos, noSearchRadius, (int)deershape.size(),
 			                   [&](int k) { return deershape[k].getPosition(); },
-			                   [&](int k) { return deers[k].species != speciesDeer; });
+			                   [&](int k) { return deers[k].species != speciesDeer || (trail && deers[k].migrate == trekNone); });
 			if (prey != -1) goal = deershape[prey].getPosition();
 		}
 		if (prey != -1 && w.shape.getGlobalBounds().findIntersection(deershape[prey].getGlobalBounds()).has_value()) {
@@ -4364,6 +4497,7 @@ void deerwander(world& wd, const vector<RectangleShape>& squares, const vector<b
             }
         }
         if (!d.moving) {
+            if (d.migrate != trekNone) { herdStep(d, ds, pos); continue; }   // R56-F1: trek legs / grazing replace the wander
             if (wanderChance(gen) != 0) continue;
             int tx = (int)pos.x + wanderDX(gen);
             int ty = (int)pos.y + wanderDY(gen);
@@ -13563,6 +13697,12 @@ void campTick(vector<barb>& barbs, const vector<RectangleShape>& squares, world&
             int k = findDeerById(deers, h.targetDeerId);
             RectangleShape& ds = deershape[k];
             deer& d = deers[k];
+            if (deerUnreachable(d, ds.getPosition())) {   // R56-F1: it reached the far graze patch
+                printf("WILDFOLK - hunter %d loses deer %d to the far grazing\n", h.id, h.targetDeerId);
+                clearCampHunt(h);
+                h.restTicks = kCampHunterRestTicks;
+                continue;
+            }
             campHunterStep(h, s, ds.getPosition() + ds.getSize() / 2.0f - s.getSize() / 2.0f);
             if (d.invincible || !s.getGlobalBounds().findIntersection(ds.getGlobalBounds())) continue;
             d.health -= kCampHunterDamage;
@@ -13588,6 +13728,7 @@ void campTick(vector<barb>& barbs, const vector<RectangleShape>& squares, world&
                                [&](int k) { return deershape[k].getPosition(); },
                                [&](int k) {
                                    if (deers[k].species != speciesDeer) return true;
+                                   if (deerUnreachable(deers[k], deershape[k].getPosition())) return true;   // R56-F1
                                    for (auto& o : campHunters) if (o.deertargeting && o.targetDeerId == deers[k].id) return true;
                                    return false;
                                });
@@ -14330,6 +14471,7 @@ int main() {
                 birthRingTick(birthRings);
                 catchRingTick(catchRings);
                 deerspawn(wd);
+                herdTick(wd);   // R56-F1: season-edge trek flags, before the deer move
                 deerwander(wd, squares, barbs);
                 deerkilling(wd, barbs, squares, smoke);
                 wolfTick(wolves, wd, barbs);
@@ -14413,6 +14555,7 @@ int main() {
         window.setView(worldView);
         FloatRect camRect(worldView.getCenter() - worldView.getSize() / 2.0f, worldView.getSize());   // R47-F1: view culling
         drawZoneTint(window, camRect);   // R47-F1: faint band wash, first on the ground
+        drawHerdPatch(window, camRect);  // R56-F1: faint graze patch, over the band wash, under trails and lakes
         drawTrails(window, trailVerts);
         drawWalls(window, wallVerts);    // R31-F2: under paving, quarter marks, buildings and barbs
         drawPaving(window, paveVerts);   // over the trail tint, under everything else
