@@ -451,6 +451,29 @@ const int graveGlowTicks = 90;                    // brighten fades out over thi
 const Color graveGlowColor(232, 228, 212);        // pale stone the colour lifts toward while lit
 const float graveGlowMix = 0.45f;                 // at full glow
 const float graveSpreadPx = 4.0f;                 // a stone landing on another is nudged right by this much (a few tries)
+// R56-F3 Deeds and Legends (phase 1): kills and raid wins add renown, a plain barb field that moves with the struct on
+// every swapRemove(barbs, i). At kTitleRenown a barb is hailed with a title (fixed char[], written only through snprintf)
+// once, with one ticker line; at most kTitleMaxLiving titled barbs live at once, so titles stay rare. A titled barb's
+// stone is kHeroGraveH tall (one row over graveSize.y), same muted colours. The LEGD chronicle block is phase 2.
+enum deedKind { deedHunt, deedWatch, deedRaid, deedDefend, deedCount };
+const int kRenownHunt = 1;                        // a deer or boar brought down
+const int kRenownProwler = 4;                     // a night prowler slain on the watch
+const int kRenownRaidWin = 5;                     // each raider still standing when its raid is won
+const int kRenownDefend = 4;                      // each defender still standing when the raid is driven off
+const int kTitleRenown = 30;                      // renown at which a barb is hailed with a title
+const int kTitleMaxLiving = 4;                    // titled barbs alive at once; past this, renown waits for a free slot
+const int kTitleLen = 24;                         // title buffer, NUL included
+const char* const kDeedTitles[deedCount][2] = {   // picked by the deed that crossed kTitleRenown
+    {"the Stag-Bane", "the Far-Tracker"},
+    {"the Night-Warden", "the Fang-Breaker"},
+    {"the Shield-Breaker", "the Raid-Bold"},
+    {"the Gate-Holder", "the Crate-Warden"},
+};
+const float kHeroGraveH = 5.0f;                   // a titled barb's stone: one row taller than graveSize.y
+const Vector2f kTitlePipSize(1.0f, 1.0f);         // 1px mark over the head, one row of air above the crown row
+const Color kTitlePipColor(226, 218, 186, 200);   // pale parchment, softer than the body white, far from crown gold
+const int kTitlePipMax = 6;                       // pips on screen at once, highest renown first
+const Color kTitleTickerTint(206, 196, 160);      // muted parchment for the one "hailed" ticker line
 // Morale: one term per race per tick, graveMoralePerStone per own stone up to graveMoraleMax. The race's hunger grows
 // that much slower (a rest tick every 1/term ticks), so 4 stones = 4% longer between meals at most.
 const float graveMoralePerStone = 0.01f;
@@ -3270,6 +3293,8 @@ struct barb {
     int lootFrom = -1;           // R53-F1: race the pack was taken from (gets it back on a drop); -1 = no pack
     int herbTimer = 0;           // R53-F2: work ticks at the herb bed (separate from timer); reset by endActivity()
     int bornHour = 0;            // R55-F4: game hour of birth (game_day * 24 + game_time); set only in makeBarb(), age = now - this
+    int renown = 0;              // R56-F3: deeds; moves with the struct on swapRemove; written only by addRenown()
+    char title[kTitleLen] = "";  // R56-F3: "" = untitled; written only by addRenown() via snprintf
 };
 // R53-F4: the only writer of barb.activity on the way in. Starting a second activity over a live one is a bug: a debug
 // build aborts; a release build ends the old one (with its cleanup) first so no state is left half-set.
@@ -3718,6 +3743,7 @@ struct prowler {
 };
 int nextProwlerId = 0;
 vector<Vector2f> watchTorchPts;   // R51-F1: this frame's torch pixels, filled by drawBarbs(), drawn by drawWatchTorches()
+vector<pair<int, Vector2f>> titlePipPts;   // R56-F3: {renown, pip top-left} per titled barb this frame, filled by drawBarbs()
 
 char tradeMsg[64] = "";
 int tradeMsgTimer = 0;
@@ -3745,6 +3771,22 @@ void logEvent(const string& text, Color tint = Color::Transparent) { pushEvent(t
 void logRaceEvent(const string& text, int r) { pushEvent(text, raceEventColors[clampRace(r)], true); }
 
 string eventText(const gameEvent& e) { return e.count > 1 ? e.text + " x" + to_string(e.count) : e.text; }
+
+// R56-F3: the one writer of renown and title. Adds pts for a deed; an untitled barb at kTitleRenown is hailed once (title
+// from the deed that crossed the line) while fewer than kTitleMaxLiving titled barbs live, with one ticker line.
+void addRenown(vector<barb>& barbs, int i, int pts, deedKind kind) {
+    if (i < 0 || i >= (int)barbs.size() || pts <= 0 || kind < 0 || kind >= deedCount) return;
+    barb& b = barbs[i];
+    b.renown += pts;
+    if (b.title[0] != '\0' || b.renown < kTitleRenown) return;
+    int titled = 0;
+    for (auto& o : barbs) if (o.title[0] != '\0') titled++;
+    if (titled >= kTitleMaxLiving) return;   // rare: tried again on the barb's next deed
+    const char* t = kDeedTitles[kind][uniform_int_distribution<int>(0, 1)(gen)];
+    snprintf(b.title, sizeof(b.title), "%s", t);   // bounds-checked, always NUL-terminated
+    printf("TITLE - %s (id %d, %s) hailed %s, renown %d\n", b.name, b.id, racePlurals[clampRace(b.race)], b.title, b.renown);
+    pushEvent(string(b.name) + " is hailed " + b.title, kTitleTickerTint, false);
+}
 
 // R51-F4: symmetric relations matrix; written only through setRelation(), so [a][b] == [b][a] always
 float raceRelation[raceCount][raceCount] = {};
@@ -4344,6 +4386,7 @@ void deerkilling(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares
 					printf("%s KILLED%s - %s food: %d (+%d, +%d smoked)\n", name, arms.c_str(), racePlurals[clampRace(b.race)], rs.food, yield, smoked);
 					logRaceEvent(string(b.name) + (speared ? string(" ") + weaponOf(b).killVerb + " a " : string(" killed a ")) + name + " (+" + to_string(yield) + " food"
 					         + (smoked > 0 ? ", +" + to_string(smoked) + " smoked" : string()) + ", " + to_string(rs.food) + ")", b.race);
+					addRenown(barbs, j, kRenownHunt, deedHunt);   // R56-F3: after the kill line, so a title line follows it
 					break;
 				}
 			}
@@ -4941,8 +4984,9 @@ struct grave {
     int race = 0;
     int age = 0;         // sim ticks since it was raised
     int glow = 0;        // ticks of brightening left (refreshed while a same-race barb is near)
+    bool hero = false;   // R56-F3: the barb held a title; stone is kHeroGraveH tall, growing up from the same base
 };
-vector<grave> graves;                       // oldest first, at most graveMax
+vector<grave> graves;                      // oldest first, at most graveMax
 float graveMorale[raceCount] = {};          // the one morale term per race, recomputed by graveTick() every tick
 float graveRestAcc[raceCount] = {};         // carries the fractional rest ticks between ticks
 bool graveHungerRest[raceCount] = {};       // this tick, race r's hunger does not grow (read in hungerTick)
@@ -5157,13 +5201,16 @@ void addGrave(const barb& b, const RectangleShape& sq) {
         p.x += graveSpreadPx;
     }
     p.x = clamp(p.x, 0.0f, worldSize - graveSize.x);
-    p.y = clamp(p.y, 0.0f, worldSize - graveSize.y);
+    bool hero = b.title[0] != '\0';   // R56-F3
+    p.y = clamp(p.y, hero ? kHeroGraveH - graveSize.y : 0.0f, worldSize - graveSize.y);   // the taller cap stays on the map
     if ((int)graves.size() >= graveMax) graves.erase(graves.begin());   // oldest-first eviction
     grave g;
     g.pos = p;
     g.race = clampRace(b.race);
+    g.hero = hero;
     graves.push_back(g);
-    printf("GRAVE - stone raised for %s (%s) at %d,%d - %d stones\n", b.name, raceOf(b).name, (int)p.x, (int)p.y, (int)graves.size());
+    printf("GRAVE - stone raised for %s (%s)%s%s at %d,%d - %d stones\n", b.name, raceOf(b).name, hero ? " " : "", b.title,
+           (int)p.x, (int)p.y, (int)graves.size());
 }
 
 // Ages the stones, lights the ones a same-race barb is beside, and computes each race's morale term once.
@@ -5382,6 +5429,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
     static VertexArray lookVerts(PrimitiveType::Triangles);   // R35-F1: every race mark this frame, one draw after the loop
     lookVerts.clear();
     watchTorchPts.clear();   // R51-F1
+    titlePipPts.clear();     // R56-F3
     auto addLookQuad = [](Vector2f p, Vector2f sz, Color c) {
         Vector2f q[4] = {p, p + Vector2f(sz.x, 0.0f), p + sz, p + Vector2f(0.0f, sz.y)};
         int idx[6] = {0, 1, 2, 0, 2, 3};
@@ -5495,6 +5543,11 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             stripe.setFillColor(crownColor);
             stripe.setPosition(Vector2f(base.x + floor((bodySize.x - crownSize.x) / 2.0f), headTop - crownSize.y));
             window.draw(stripe);
+        }
+        if (b.title[0] != '\0') {   // R56-F3: centred over the head, the crown row (worn or not) plus 1px of air below it; bobs
+            float headTop = bodyTop - rd.hatSize.y - rd.hatTipSize.y;
+            titlePipPts.push_back({b.renown, Vector2f(base.x + floor((bodySize.x - kTitlePipSize.x) / 2.0f),
+                                                      headTop - crownSize.y - 1.0f - kTitlePipSize.y)});
         }
 
         float side = base.x + bodySize.x;                // tool/arm sits just right of the body
@@ -5948,6 +6001,8 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
             }
             if (b.sick > 0) label += ", coughing";   // R52-F4
             if (b.birthRace != b.race) label += string(", born ") + raceDefs[clampRace(b.birthRace)].name;   // R54-F3
+            if (b.title[0] != '\0') label += string("\nHailed ") + b.title + ", renown " + to_string(b.renown);   // R56-F3
+            else if (b.renown > 0) label += ", renown " + to_string(b.renown);
             if (b.activity == actExile && exile.active)   // R54-F3
                 label += string("\nLeaving the ") + racePlurals[clampRace(exile.from)] + " for the " + racePlurals[clampRace(exile.to)];
             if (b.activity == actEnvoy && envoy.active)   // R56-F2
@@ -9305,6 +9360,24 @@ void drawBallots(RenderWindow& window, const View& worldView, float zoom,
     }
 }
 
+// R56-F3: world layer right after drawBarbs() (under the trees and the overlay, like the other barb marks). At most
+// kTitlePipMax in view, highest renown first. Hidden while the open-ballot pips show: an elf's pip would meet the ballot.
+void drawTitlePips(RenderWindow& window, const FloatRect& camRect, float zoom) {
+    if (titlePipPts.empty() || (ballotFramesLeft > 0 && zoom >= ballotMinZoom)) return;
+    auto& pts = titlePipPts;
+    pts.erase(remove_if(pts.begin(), pts.end(), [&](const pair<int, Vector2f>& p) {
+                  return !camRect.findIntersection(FloatRect(p.second, kTitlePipSize)); }), pts.end());
+    int n = min((int)pts.size(), kTitlePipMax);
+    partial_sort(pts.begin(), pts.begin() + n, pts.end(),
+                 [](const pair<int, Vector2f>& a, const pair<int, Vector2f>& b) { return a.first > b.first; });
+    RectangleShape pip(kTitlePipSize);
+    pip.setFillColor(kTitlePipColor);
+    for (int k = 0; k < n; k++) {
+        pip.setPosition(pts[k].second);
+        window.draw(pip);
+    }
+}
+
 // R28-F2: dawn elections. Each leaderless race with enough members puts up its best-liked member;
 // every other member approves with raceTraitLike odds. More than half wins the crown, else retry next dawn.
 // R30-F2: the only place a leader is cleared, so the race drops back to global weights the same tick
@@ -9774,7 +9847,8 @@ void drawGraves(RenderWindow& window, const FloatRect& camRect) {
     static VertexArray va(PrimitiveType::Triangles);
     va.clear();
     for (auto& g : graves) {
-        if (!camRect.findIntersection(FloatRect(g.pos, graveSize))) continue;
+        float extra = g.hero ? kHeroGraveH - graveSize.y : 0.0f;   // R56-F3: the hero stone's slab grows up by this much
+        if (!camRect.findIntersection(FloatRect(g.pos - Vector2f(0.0f, extra), graveSize + Vector2f(0.0f, extra)))) continue;
         float old = clamp((float)(g.age - graveFadeStartTicks) / graveFadeTicks, 0.0f, 1.0f);
         float lit = (float)g.glow / graveGlowTicks;
         float a = 255.0f + (graveOldAlpha - 255.0f) * old;
@@ -9782,8 +9856,8 @@ void drawGraves(RenderWindow& window, const FloatRect& camRect) {
         Color c = lerpColor(lerpColor(graveStoneColor, raceEventColors[clampRace(g.race)], graveRaceTint), graveGlowColor, graveGlowMix * lit);
         c.a = (uint8_t)a;
         Color base = shade(c, graveBaseShade);
-        pushQuad(va, g.pos + Vector2f(1.0f, 0.0f), Vector2f(1.0f, 1.0f), c);          // rounded cap
-        pushQuad(va, g.pos + Vector2f(0.0f, 1.0f), Vector2f(graveSize.x, 2.0f), c);   // slab
+        pushQuad(va, g.pos + Vector2f(1.0f, -extra), Vector2f(1.0f, 1.0f), c);          // rounded cap
+        pushQuad(va, g.pos + Vector2f(0.0f, 1.0f - extra), Vector2f(graveSize.x, 2.0f + extra), c);   // slab
         pushQuad(va, g.pos + Vector2f(0.0f, 3.0f), Vector2f(graveSize.x, 1.0f), base);  // set in the ground
     }
     if (va.getVertexCount() > 0) window.draw(va);
@@ -10178,6 +10252,7 @@ void watchTick(vector<barb>& barbs, vector<RectangleShape>& squares, vector<prow
                     printf("WATCH HIT - %s (id %d) hits prowler %d for %d, %d hp left\n", b.name, b.id, p.id, dmg, p.hp);
                     if (p.hp <= 0) {
                         logRaceEvent(string(b.name) + " " + weaponOf(b).killVerb + " a night prowler", b.race);
+                        addRenown(barbs, i, kRenownProwler, deedWatch);   // R56-F3
                         dissolveProwler(p, "slain");   // removal stays in prowlerTick(): indices here stay valid
                         b.watchPreyId = -1;
                     }
@@ -11648,7 +11723,9 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
         raid.won = won;
         raid.phase = raidParty::Home;
         raidThreat[def] = false;
+        int holders[kRaidDefenderMax];   // R56-F3: unbeaten defenders (beaten ones were dropped above), kept for the renown
         for (int k = 0; k < kRaidDefenderMax; k++) {
+            holders[k] = di[k];
             if (di[k] >= 0) releaseRaidBarb(barbs[di[k]]);
             raid.defenderIds[k] = -1;
         }
@@ -11662,6 +11739,12 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
                                                 : " (the raiders tire)");
         printf("---RAID %s--- %s after %d fight ticks\n", won ? "WON" : "LOST", line.c_str(), raid.fightTicks);
         logEvent(line, kRaidTickerTint);
+        if (won) {   // R56-F3: the side that held the field; beaten fighters earn nothing
+            for (int k = 0; k < kRaidPartySize; k++)
+                if (ri[k] >= 0 && !barbs[ri[k]].raidBeaten) addRenown(barbs, ri[k], kRenownRaidWin, deedRaid);
+        } else {
+            for (int k = 0; k < kRaidDefenderMax; k++) if (holders[k] >= 0) addRenown(barbs, holders[k], kRenownDefend, deedDefend);
+        }
         if (won) raidPlunder(barbs, ri);   // R53-F1
         return;
     }
@@ -14791,6 +14874,7 @@ int main() {
         drawRiteRings(window, shrines);   // R52-F3: faint ring round each rite shrine, under the kneelers
         drawCampHunters(window, camRect);   // R55-F1: with the barbs, under the trees
         drawBarbs(window, barbs, squares, frameCount, zoom);
+        drawTitlePips(window, camRect, zoom);   // R56-F3: pale 1px pip over titled barbs, capped
         for (auto& b : barbs) if (b.raidFlash > 0 && !paused) b.raidFlash--;   // R52-F1: the hit flash lasts 2 drawn frames
 	if (activeTrader) drawSnapped(window, activeTrader->shape);
 	drawTrees(window, tris, treeVerts, camRect);
