@@ -15,6 +15,14 @@
 using namespace sf;
 using namespace std;
 
+// R56-F4: debug-only checks. Build with -DSIM_DEBUG to turn them on; release builds (build.sh) compile them out and
+// never evaluate the condition.
+#ifdef SIM_DEBUG
+#define SIM_DEBUG_ASSERT(cond) do { if (!(cond)) { fprintf(stderr, "SIM_DEBUG_ASSERT failed: %s (%s:%d)\n", #cond, __FILE__, __LINE__); abort(); } } while (0)
+#else
+#define SIM_DEBUG_ASSERT(cond) ((void)0)
+#endif
+
 // R45-F1a Far Reaches: the map grew from 800 to 1200 px a side. Every count tuned on the old map scales with area so
 // density (and so walk distance between jobs) holds; the window stays 800 px and shows the world 1:1 at zoom 1.
 constexpr float baseWorldSize = 800.0f;     // map side the density tunables were tuned on
@@ -3600,6 +3608,18 @@ int countSpecies(const vector<deer>& deers, animalSpecies s) {
 	return n;
 }
 
+// R56-F4 One World Struct, slice 1: the deer pair moves in here as plain members, same names, same index rule. Later
+// slices add the barb, tree and house groups. checkWorldSync() runs after every sim tick (debug builds only).
+struct world {
+	vector<deer> deers;
+	vector<RectangleShape> deershape;   // parallel to deers: every push and swapRemove touches both at the same index
+};
+
+void checkWorldSync(const world& wd) {
+	(void)wd;   // unused when SIM_DEBUG is off
+	SIM_DEBUG_ASSERT(wd.deers.size() == wd.deershape.size());
+}
+
 struct trader {
     enum Phase {Arriving, Trading, Leaving} phase = Arriving;
     Vector2f exit;
@@ -4096,7 +4116,9 @@ void validateDeerTargets(vector<barb>& barbs, const vector<deer>& deers) {
 		if (b.deertargeting && findDeerById(deers, b.targetDeerId) == -1) clearHunt(b);
 }
 
-void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<barb>& barbs, vector<RectangleShape>& squares, smokehouseSet& sh) {
+void deerkilling(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares, smokehouseSet& sh) {
+	vector<deer>& deers = wd.deers;
+	vector<RectangleShape>& deershape = wd.deershape;
 	const float deerInfluenceDSq = 625.0f;
 	validateDeerTargets(barbs, deers);
 	for (int i = 0; i < (int)deers.size(); ) {
@@ -4168,7 +4190,9 @@ void deerkilling(vector<deer>& deers, vector<RectangleShape>& deershape, vector<
 
 // Wolves enter from an edge, chase the nearest deer and kill it on contact (no food). After one kill,
 // or once deer are scarce (<= wolfMinDeer), they walk back out, so they can never wipe the deer out.
-void wolfTick(vector<wolf>& wolves, vector<deer>& deers, vector<RectangleShape>& deershape, vector<barb>& barbs) {
+void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs) {
+	vector<deer>& deers = wd.deers;
+	vector<RectangleShape>& deershape = wd.deershape;
 	int deerCount = countSpecies(deers, speciesDeer);   // only deer count: rabbits are never wolf prey
 	if ((int)wolves.size() < maxWolves && deerCount > wolfMinDeer
 	    && uniform_int_distribution<int>(0, wolfSpawnChance - 1)(gen) == 0) {
@@ -4236,7 +4260,9 @@ void wolfTick(vector<wolf>& wolves, vector<deer>& deers, vector<RectangleShape>&
 }
 
 // Pushes one animal onto deers and its shape onto deershape together (same index)
-void addAnimal(vector<deer>& deers, vector<RectangleShape>& deershape, deer d) {
+void addAnimal(world& wd, deer d) {
+	vector<deer>& deers = wd.deers;
+	vector<RectangleShape>& deershape = wd.deershape;
 	const speciesDef& sp = speciesOf(d);
 	d.id = nextDeerId++;
 	d.health = sp.maxHealth;
@@ -4249,7 +4275,9 @@ void addAnimal(vector<deer>& deers, vector<RectangleShape>& deershape, deer d) {
 }
 
 // Each species walks in from a side edge under its own cap; species with a breed rate also multiply in place
-void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
+void deerspawn(world& wd) {
+	const vector<deer>& deers = wd.deers;
+	const vector<RectangleShape>& deershape = wd.deershape;
 	for (int s = 0; s < speciesCount; s++) {
 		const speciesDef& sp = speciesDefs[s];
 		int n = countSpecies(deers, (animalSpecies)s);
@@ -4269,7 +4297,7 @@ void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
 			d.moving  = true;
 			Vector2f from(d.x, d.y);
 			if (!lakeClear(FloatRect(Vector2f(d.targetx, d.targety), sp.bodySize + Vector2f(0.0f, sp.legPx)), &from)) continue; // retry next tick
-			addAnimal(deers, deershape, d);
+			addAnimal(wd, d);
 			printf("%s arrived - %d now\n", sp.name, n + 1);
 		} else if (sp.breedOneIn > 0 && n >= 2 && uniform_int_distribution<int>(0, sp.breedOneIn - 1)(gen) == 0) {
 			int pick = uniform_int_distribution<int>(0, n - 1)(gen);
@@ -4281,7 +4309,7 @@ void deerspawn(vector<deer>& deers, vector<RectangleShape>& deershape) {
 			d.x = (int)clamp(p.x + side, 0.0f, worldSize - sp.bodySize.x);
 			d.y = (int)p.y;
 			if (!lakeClear(FloatRect(Vector2f(d.x, d.y), sp.bodySize + Vector2f(0.0f, sp.legPx)))) continue; // no kits in the water
-			addAnimal(deers, deershape, d);
+			addAnimal(wd, d);
 			printf("%s born - %d now\n", sp.name, n + 1);
 		}
 	}
@@ -4295,7 +4323,9 @@ void endFlee(deer& d) {
     d.stepTimer = 0;
 }
 
-void deerwander(vector<RectangleShape>& deershape, vector<deer>& deers, const vector<RectangleShape>& squares, const vector<barb>& barbs) {
+void deerwander(world& wd, const vector<RectangleShape>& squares, const vector<barb>& barbs) {
+    vector<RectangleShape>& deershape = wd.deershape;
+    vector<deer>& deers = wd.deers;
     static int fleeCheckTick = 0;
     bool checkFlee = ++fleeCheckTick >= deerFleeCheckInterval;
     if (checkFlee) fleeCheckTick = 0;
@@ -13443,7 +13473,9 @@ static const char* const campTentWords[kCampMaxTents + 1] = {"no", "a first", "a
 // nothing holds a camp index across removeCamp(). The barb scan is O(barbs) every kCampScanEveryTicks (no tree scan:
 // trespass reads the chopping barb's own flags). Deer killed here are swapRemoved from deers/deershape together and
 // every barb chasing it is freed through validateDeerTargets().
-void campTick(vector<barb>& barbs, const vector<RectangleShape>& squares, vector<deer>& deers, vector<RectangleShape>& deershape) {
+void campTick(vector<barb>& barbs, const vector<RectangleShape>& squares, world& wd) {
+    vector<deer>& deers = wd.deers;
+    vector<RectangleShape>& deershape = wd.deershape;
     for (int i = (int)campHunters.size() - 1; i >= 0; i--)   // a hunter whose camp is gone leaves with it
         if (findCampById(campHunters[i].campId) < 0) removeCampHunter(i);
     for (auto& g : campRegard)
@@ -14108,8 +14140,9 @@ int main() {
     storehouse stores[raceCount];   // R29-F1: one per race, indexed by barbRace
     fieldGrid fields;   // FARM-F1: fields[race][k], each race's wheat plots beside its storehouse
 
-    vector<deer> deers;
-    vector<RectangleShape> deershape;
+    world wd;   // R56-F4: owns the deer pair; the references keep every existing name working unchanged
+    vector<deer>& deers = wd.deers;
+    vector<RectangleShape>& deershape = wd.deershape;
 
     vector<CircleShape> tris;
     vector<RectangleShape> stumps;
@@ -14296,15 +14329,15 @@ int main() {
                 quarterReachTick(barbs);   // R47-F10: after births, so a new barb can earn a step the same tick
                 birthRingTick(birthRings);
                 catchRingTick(catchRings);
-                deerspawn(deers, deershape);
-                deerwander(deershape, deers, squares, barbs);
-                deerkilling(deers, deershape, barbs, squares, smoke);
-                wolfTick(wolves, deers, deershape, barbs);
+                deerspawn(wd);
+                deerwander(wd, squares, barbs);
+                deerkilling(wd, barbs, squares, smoke);
+                wolfTick(wolves, wd, barbs);
                 prowlerTick(prowlers, barbs, squares, houses, houseshapes, fire);   // R48-F1: bites land before starveDeathTick()
                 watchTick(barbs, squares, prowlers);   // R51-F1: watchmen patrol and fight; slain prowlers fade, prowlerTick() removes them
                 raidTick(barbs, squares, stores);   // R52-F1: raid march and fight; sets raidThreat[] for bellTick() just below
                 caravanTick(barbs, squares, stores);   // R54-F1: caravans, swaps and the friendly timers, once per sim tick
-                campTick(barbs, squares, deers, deershape);   // R55-F1: wildfolk hunters, deer trade, trespass and tents
+                campTick(barbs, squares, wd);   // R55-F1: wildfolk hunters, deer trade, trespass and tents
                 exileTick(barbs, squares, stores);     // R54-F3: walks the migrant; an arrival is only queued here...
                 applyExileTransfers(barbs, squares, houses);   // ...and applied here, outside every barb loop
                 bellTick(barbs, squares, houses, houseshapes, wolves, stores, smoke, dwarfForge, fields,
@@ -14342,6 +14375,7 @@ int main() {
                 orderTick(barbs);   // INBOX-F2b: after leaderWatchTick, so a dead leader's orders lapse the same tick
                 starveDeathTick(barbs, squares, smoke, dwarfForge, stores, fields);   // R30-F5: last, once per tick
                 stockShortageTick(barbs);   // RACE-F1: after deaths, so an emptied race never announces
+                checkWorldSync(wd);   // R56-F4: parallel pairs equal-sized after every tick (no-op unless SIM_DEBUG)
             }
         }
 
