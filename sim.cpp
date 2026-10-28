@@ -417,6 +417,21 @@ const Color kAshStumpColor(104, 100, 96);          // ash grey: clearly not the 
 const int kAshTintTicks = 24 * ticksPerGameHour;   // ash fades to stump colour over one game day
 const int kAshStumpHoldTicks = 24 * ticksPerGameHour;   // then stands as a plain stump this long
 const int kAshStumpFadeTicks = ticksPerGameHour;   // then fades out over one game hour and is removed
+// R58-F3 Wildfire Spread, phase 2: in dry weather a burning tree can light one wild neighbour (found through treeGrid)
+// every kSpreadCheckTicks. Never in the safe core, never a tree within kFirebreakPx of a house/homestead, clan building,
+// site, camp, ruin or field, and never past kMaxFlames trees alight at once. Rain stops spread outright and quenches a
+// fire after kRainQuenchTicks of rain on it: well burnt trees still fall to ash, the rest survive. A burnt-out ash stump,
+// once it fades, queues its spot in a small capped regrowQueue, replanted one per kRegrowEveryTicks through tryAddTree().
+const int kSpreadCheckTicks = 10 * 60;             // a burning tree rolls to spread every 10 real seconds at 1x
+const float kSpreadChance = 0.06f;                 // per roll in dry weather: ~1 neighbour per 3-minute burn (fires fizzle)
+const float kSpreadRadiusPx = 24.0f;               // tree-to-tree reach (trees are 16px wide, so only touching neighbours)
+const float kFirebreakPx = 24.0f;                  // a tree whose footprint grown by this touches a structure never catches
+const int kRainQuenchTicks = 2 * ticksPerMinute;   // rain on a fire this long puts it out
+const float kQuenchStumpFrac = 0.5f;               // a quenched tree at least this far burnt still falls to an ash stump
+const int kRegrowQueueMax = 6;                     // ash spots waiting to regrow; extra spots are simply not replanted
+const int kRegrowEveryTicks = ticksPerGameHour;    // at most one regrowth per game hour, and none while a fire burns
+const int kFireSmokeMaxPuffs = 9;                  // smoke puffs drawn at once across every burning tree (3 trees' worth)
+const Color kWildfireTickerColor(226, 160, 84);    // muted amber on the black ticker strip
 
 const int traderIntervalTicks = ticksPerGameHour; // one in-game hour between trader visits
 const int traderStepInterval = 6;         // ticks per 1px step while walking
@@ -4125,7 +4140,7 @@ FloatRect drawEvents(RenderWindow& window, const Font& font) {
     return FloatRect(topLeft, {width, height});
 }
 
-struct tree  {int x, y; bool dying = false; int id = -1; int burnLeft = 0;};   // R57-F3: id given only when struck; burnLeft > 0 = alight
+struct tree  {int x, y; bool dying = false; int id = -1; int burnLeft = 0; int wetTicks = 0;};   // R57-F3: id given only when struck; burnLeft > 0 = alight; R58-F3: wetTicks = rain on the fire
 struct rock  {int x, y; bool dying = false;};
 struct bush  {int x, y; bool ripe = true; bool picking = false; int regrow = 0;};
 
@@ -9922,6 +9937,7 @@ void placeTowers(int r, vector<barb>& barbs, vector<tree>& trees, vector<CircleS
                 }
             }
             swapRemove(tris, i); swapRemove(stumps, i); swapRemove(trees, i);
+            treeGrid.stale = true;   // R58-F3: grid synced on every tree remove
         }
         t.race = r;
         towers[r][k] = t;
@@ -9994,6 +10010,7 @@ void wallTick(vector<barb>& barbs, vector<tree>& trees, vector<CircleShape>& tri
                     }
                 }
                 swapRemove(tris, i); swapRemove(stumps, i); swapRemove(trees, i);
+                treeGrid.stale = true;   // R58-F3: grid synced on every tree remove
             }
             Vector2f m = blocks[blocks.size() / 2] + Vector2f(wallThickPx, wallThickPx) / 2.0f;
             wallsegs.push_back(wallseg{nextWallSegId++, r, (int)m.x, (int)m.y, s});
@@ -13922,6 +13939,9 @@ CircleShape makeTreeTri(int x, int y) {
     return tri;
 }
 
+bool tryAddTree(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, const fieldGrid& fields,
+                const vector<house>& houses, const vector<barb>& barbs, tree t);
+
 void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, const fieldGrid& fields,
                const vector<house>& houses, const vector<barb>& barbs) {
     if (treespawnChance(gen) != 0) return;
@@ -13943,21 +13963,28 @@ void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
         if (groveRoll(gen) < accept) break;
         if (rollInZone(zoneCore, treeFootprint, p)) t = tree{p.x, p.y, false};
     }
-    if (!lakeClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return; // no trees in the water
-    if (!fieldsClear(fields, FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return; // nor on a wheat plot
-    if (!towerClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return;  // R33-F2: nor on a gate tower
+    tryAddTree(trees, tris, stumps, fields, houses, barbs, t);
+}
+
+// The one runtime tree add path (treespawn, and R58-F3 regrowth): every placement check, then trees/tris/stumps pushed
+// together and the tree grid marked stale. False if the spot is blocked.
+bool tryAddTree(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, const fieldGrid& fields,
+                const vector<house>& houses, const vector<barb>& barbs, tree t) {
+    if (!lakeClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return false; // no trees in the water
+    if (!fieldsClear(fields, FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return false; // nor on a wheat plot
+    if (!towerClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return false;  // R33-F2: nor on a gate tower
     {   // R44-F4a: nor on a homestead (or its pending spot) out past the quarter clearing
         FloatRect tr(Vector2f(t.x - homesteadClutterPad, t.y - homesteadClutterPad),
                      Vector2f(treeFootprint + 2 * homesteadClutterPad, treeFootprint + 2 * homesteadClutterPad));
         for (auto& h : houses)
-            if (tr.findIntersection(FloatRect(Vector2f(h.x - 3.0f, h.y - 3.0f), houseSlabSize))) return;
+            if (tr.findIntersection(FloatRect(Vector2f(h.x - 3.0f, h.y - 3.0f), houseSlabSize))) return false;
         for (auto& o : barbs)
             if (o.movingbspot && o.jobKind == jobNone
-                && tr.findIntersection(FloatRect(Vector2f(o.targetx - 3.0f, o.targety - 3.0f), houseSlabSize))) return;
+                && tr.findIntersection(FloatRect(Vector2f(o.targetx - 3.0f, o.targety - 3.0f), houseSlabSize))) return false;
     }
-    if (!ruinsClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return;  // R45-F1b: nor in the ruin site
-    if (!poiClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return;    // R47-F4: nor on a hut or well
-    if (!campClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return;   // R55-F1: nor in the wildfolk camp
+    if (!ruinsClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return false;  // R45-F1b: nor in the ruin site
+    if (!poiClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return false;    // R47-F4: nor on a hut or well
+    if (!campClear(FloatRect(Vector2f(t.x, t.y), Vector2f(treeFootprint, treeFootprint)))) return false;   // R55-F1: nor in the wildfolk camp
     trees.push_back(t);
 
     tris.push_back(makeTreeTri(t.x, t.y));
@@ -13966,14 +13993,17 @@ void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
     stump.setFillColor(stumpColor);
     stump.setPosition(Vector2f(t.x + 6, t.y + 12));
     stumps.push_back(stump);
+    treeGrid.stale = true;   // R58-F3: grid synced on every tree add
+    return true;
 }
 
 // R57-F3 Thunderstorm Wildfire, phase 1. A burning tree stays in trees/tris/stumps (dying, so nobody chops it) and is
 // referred to only by its id, re-resolved by a scan each tick, since any swapRemove elsewhere moves indices.
 vector<int> burningIds;        // ids of the trees alight now
 int nextTreeId = 0;            // handed out only when a tree is struck; never reused
-struct ashStump {Vector2f pos; long long burntAt = 0;};   // pos: the 4x4 stump's top-left; burntAt: stormClock when it fell
+struct ashStump {Vector2f pos; long long burntAt = 0; Vector2i treePos;};   // pos: the 4x4 stump's top-left; burntAt: stormClock when it fell; treePos: R58-F3 the burnt tree's x,y
 vector<ashStump> ashStumps;    // the timestamp lives on the entry, so a swapRemove carries it
+vector<Vector2i> regrowQueue;  // R58-F3: tree x,y of faded ash stumps, oldest first, at most kRegrowQueueMax
 long long stormClock = 0;      // sim ticks counted by stormTick(); the ash fade's time base
 int stormStrikeIn = -1;        // ticks until this storm's one strike; -1 = none pending
 int lightningFrames = 0;       // > 0 while the flash and bolt show (drawn frames)
@@ -14003,19 +14033,40 @@ uint32_t fireHash(uint32_t a, uint32_t b) {
 
 // The storm's one bolt: a random wild tree beyond zoneCoreRadius + kFireSafeMargin catches fire. A tree already being
 // chopped (dying) or alight is never picked; after kStrikeTries misses the bolt hits open ground.
-void lightningStrike(vector<tree>& trees) {
-    if (trees.empty()) return;
-    uniform_int_distribution<int> pick(0, (int)trees.size() - 1);
+// R58-F3: can t catch fire? Not already dying or alight, beyond zoneCoreRadius + kFireSafeMargin, and its footprint grown
+// by kFirebreakPx touches no house or homestead slab, clan building zone (forgeClear: crates, smokehouses, keeps, towers,
+// shafts, barracks, herb hut), wall segment, site, camp, ruin or wheat field. Checked against the real footprints, so it
+// holds for wild-band homesteads, camps and sites at any distance.
+bool fireCanTake(const tree& t, const fieldGrid& fields, const vector<house>& houses) {
+    if (t.dying || t.burnLeft > 0) return false;
     const float minD = zoneCoreRadius + kFireSafeMargin;
+    Vector2f d = Vector2f(t.x + treeFootprint / 2, t.y + treeFootprint / 2) - villageCenter;
+    if (d.x * d.x + d.y * d.y <= minD * minD) return false;
+    FloatRect r(Vector2f(t.x - kFirebreakPx, t.y - kFirebreakPx), Vector2f(treeFootprint + 2 * kFirebreakPx, treeFootprint + 2 * kFirebreakPx));
+    for (auto& h : houses)
+        if (r.findIntersection(FloatRect(Vector2f(h.x - 3.0f, h.y - 3.0f), houseSlabSize))) return false;
+    for (auto& w : wallsegs)
+        if (r.contains(Vector2f((float)w.x, (float)w.y))) return false;
+    return forgeClear(r) && poiClear(r) && campClear(r) && ruinsClear(r) && fieldsClear(fields, r);
+}
+
+// Sets t alight (the caller has checked fireCanTake and the kMaxFlames cap)
+void igniteTree(tree& t) {
+    if (t.id < 0) t.id = nextTreeId++;
+    t.dying = true;   // no new chopper; one already walking to it drops the target on arrival
+    t.burnLeft = kBurnTicks;
+    t.wetTicks = 0;
+    burningIds.push_back(t.id);
+}
+
+void lightningStrike(vector<tree>& trees, const fieldGrid& fields, const vector<house>& houses) {
+    if (trees.empty() || (int)burningIds.size() >= kMaxFlames) return;   // R58-F3: the cap holds for strikes too
+    uniform_int_distribution<int> pick(0, (int)trees.size() - 1);
     for (int k = 0; k < kStrikeTries; k++) {
         tree& t = trees[pick(gen)];
-        if (t.dying || t.burnLeft > 0) continue;
+        if (!fireCanTake(t, fields, houses)) continue;   // R58-F3: safe core and firebreak, as for spread
         Vector2f d = Vector2f(t.x + treeFootprint / 2, t.y + treeFootprint / 2) - villageCenter;
-        if (d.x * d.x + d.y * d.y <= minD * minD) continue;
-        if (t.id < 0) t.id = nextTreeId++;
-        t.dying = true;   // no new chopper; one already walking to it drops the target on arrival
-        t.burnLeft = kBurnTicks;
-        burningIds.push_back(t.id);
+        igniteTree(t);
         lightningAt = Vector2f(t.x + treeFootprint / 2, t.y + treeTierRect(Vector2f(t.x, t.y), 0).position.y);
         lightningSeed = (uint32_t)gen();
         lightningFrames = kLightningFlashFrames;
@@ -14028,7 +14079,31 @@ void lightningStrike(vector<tree>& trees) {
 
 // Once per sim tick, after weatherTick(): schedules the one strike when a summer rain starts, burns the alight trees down
 // (trees/tris/stumps removed together, in reverse index order) into ash stumps, and ages the ash stumps out.
-void stormTick(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<barb>& barbs) {
+// R58-F3: rain quenches, dry fires spread through the tree grid, faded ash spots queue for slow regrowth.
+
+// R58-F3: a random fire-ready tree whose work spot is within kSpreadRadiusPx of tree src's, via the tree grid; -1 if none
+int spreadTarget(const vector<tree>& trees, const vector<CircleShape>& tris, int src, const fieldGrid& fields, const vector<house>& houses) {
+    if (treeGrid.stale) treeGridRebuild(tris);
+    static vector<int> cand;
+    cand.clear();
+    Vector2f pos = tris[src].getPosition() + treeWorkOffset;
+    const float r = kSpreadRadiusPx;
+    int x0 = treeGridCoord(pos.x - r), x1 = treeGridCoord(pos.x + r);
+    int y0 = treeGridCoord(pos.y - r), y1 = treeGridCoord(pos.y + r);
+    for (int cy = y0; cy <= y1; cy++)
+        for (int cx = x0; cx <= x1; cx++)
+            for (int i : treeGrid.cells[cy * treeGridN + cx]) {
+                if (i == src || i >= (int)trees.size()) continue;
+                Vector2f d = tris[i].getPosition() + treeWorkOffset - pos;
+                if (d.x * d.x + d.y * d.y < r * r && fireCanTake(trees[i], fields, houses)) cand.push_back(i);
+            }
+    if (cand.empty()) return -1;
+    return cand[uniform_int_distribution<int>(0, (int)cand.size() - 1)(gen)];
+}
+
+void stormTick(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<barb>& barbs,
+               const fieldGrid& fields, const vector<house>& houses) {
+    static bool spreadSaid = false;   // one "spreads" ticker line per wildfire, reset once every fire is out
     static bool wasRaining = false;
     stormClock++;
     if (raining && !wasRaining && seasonOf(game_day) == seasonSummer) {
@@ -14038,16 +14113,36 @@ void stormTick(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
     }
     if (!raining) stormStrikeIn = -1;
     wasRaining = raining;
-    if (stormStrikeIn > 0 && --stormStrikeIn == 0) { stormStrikeIn = -1; lightningStrike(trees); }
+    if (stormStrikeIn > 0 && --stormStrikeIn == 0) { stormStrikeIn = -1; lightningStrike(trees, fields, houses); }
 
     if (!burningIds.empty()) {
         vector<int> done;   // tree indices burnt out this tick
+        int quenched = 0;
         for (int k = (int)burningIds.size() - 1; k >= 0; k--) {
             int i = treeIndexById(trees, burningIds[k]);
             if (i < 0) { swapRemove(burningIds, k); continue; }   // removed by other code (cleared or built over)
-            if (--trees[i].burnLeft > 0) continue;
+            tree& t = trees[i];
+            if (raining && ++t.wetTicks >= kRainQuenchTicks) {   // R58-F3: rain puts the fire out
+                quenched++;
+                swapRemove(burningIds, k);
+                if (1.0f - (float)t.burnLeft / kBurnTicks >= kQuenchStumpFrac) {
+                    t.burnLeft = 0;
+                    done.push_back(i);   // too far gone: falls to ash like a burnt-out tree
+                    printf("FIRE QUENCHED - tree %d too charred, falls\n", t.id);
+                } else {
+                    t.burnLeft = 0; t.wetTicks = 0;
+                    t.dying = false;     // choppable again (it was not dying when it caught)
+                    printf("FIRE QUENCHED - tree %d survives at (%d,%d)\n", t.id, t.x, t.y);
+                }
+                continue;
+            }
+            if (--t.burnLeft > 0) continue;
             done.push_back(i);
             swapRemove(burningIds, k);
+        }
+        if (quenched > 0 && burningIds.empty()) {
+            printf("FIRE QUENCHED - rain douses the last of the wildfire\n");
+            logEvent("Rain douses the wildfire", kWildfireTickerColor);
         }
         sort(done.begin(), done.end(), greater<int>());   // highest first, so each swapRemove leaves the rest valid
         for (int i : done) {
@@ -14059,15 +14154,50 @@ void stormTick(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
                     b.timer = 0;
                     b.targetx = b.targety = -1;
                 }
-            ashStumps.push_back(ashStump{stumps[i].getPosition(), stormClock});
+            ashStumps.push_back(ashStump{stumps[i].getPosition(), stormClock, Vector2i(trees[i].x, trees[i].y)});
             printf("TREE BURNT - tree %d falls to an ash stump at (%d,%d)\n", trees[i].id, trees[i].x, trees[i].y);
             swapRemove(trees, i); swapRemove(tris, i); swapRemove(stumps, i);
             treeGrid.stale = true;   // R47-F1: indices moved; the next lookup rebuilds
         }
     }
+
+    // R58-F3: spread, dry weather only, one roll per burning tree every kSpreadCheckTicks; burningIds never past kMaxFlames.
+    // After the removals above, so the grid (rebuilt in spreadTarget if stale) and the indices agree.
+    if (!raining && !burningIds.empty() && stormClock % kSpreadCheckTicks == 0) {
+        uniform_real_distribution<float> roll(0.0f, 1.0f);
+        int n0 = (int)burningIds.size();   // fires lit this pass wait for the next roll
+        for (int k = 0; k < n0 && (int)burningIds.size() < kMaxFlames; k++) {
+            if (roll(gen) >= kSpreadChance) continue;
+            int src = treeIndexById(trees, burningIds[k]);
+            if (src < 0) continue;
+            int j = spreadTarget(trees, tris, src, fields, houses);
+            if (j < 0) continue;
+            igniteTree(trees[j]);
+            printf("FIRE SPREAD - tree %d lights tree %d at (%d,%d), %d alight\n", trees[src].id, trees[j].id, trees[j].x, trees[j].y, (int)burningIds.size());
+            if (!spreadSaid) {
+                spreadSaid = true;
+                Vector2f d = Vector2f(trees[j].x + treeFootprint / 2, trees[j].y + treeFootprint / 2) - villageCenter;
+                logEvent(string("The wildfire spreads to the ") + compassName(d), kWildfireTickerColor);
+            }
+        }
+    }
+    if (burningIds.empty()) spreadSaid = false;
+
     for (int k = (int)ashStumps.size() - 1; k >= 0; k--)
-        if (stormClock - ashStumps[k].burntAt >= (long long)kAshTintTicks + kAshStumpHoldTicks + kAshStumpFadeTicks)
+        if (stormClock - ashStumps[k].burntAt >= (long long)kAshTintTicks + kAshStumpHoldTicks + kAshStumpFadeTicks) {
+            if ((int)regrowQueue.size() < kRegrowQueueMax) regrowQueue.push_back(ashStumps[k].treePos);   // R58-F3
             swapRemove(ashStumps, k);
+        }
+
+    // R58-F3 regrowth: after the loops, at most one queued spot per kRegrowEveryTicks and never while a fire burns, through
+    // the one runtime add path (tryAddTree). A blocked spot is dropped. One burnt tree queues at most one, so regrowth
+    // can never outpace the fires.
+    if (!regrowQueue.empty() && burningIds.empty() && stormClock % kRegrowEveryTicks == 0) {
+        Vector2i p = regrowQueue.front();
+        regrowQueue.erase(regrowQueue.begin());
+        bool grown = tryAddTree(trees, tris, stumps, fields, houses, barbs, tree{p.x, p.y, false});
+        printf(grown ? "REGROWTH - a sapling takes the ash spot at (%d,%d)\n" : "REGROWTH - ash spot at (%d,%d) is blocked, dropped\n", p.x, p.y);
+    }
 }
 
 // Ash stumps: kAshStumpColor smoothstepped to stumpColor over kAshTintTicks, held, then faded out. Same 4x4 as every stump.
@@ -14094,7 +14224,9 @@ void drawAshStumps(RenderWindow& window, VertexArray& va, const FloatRect& view)
 void drawFires(RenderWindow& window, const vector<tree>& trees, VertexArray& va, const FloatRect& view, int frame) {
     if (burningIds.empty()) return;
     va.clear();
-    int flames = 0;
+    int flames = 0, puffs = 0;
+    // R58-F3: the kMaxFlames budget is shared out, so every tree in a spreading fire shows at least one tongue
+    const int perTree = max(1, kMaxFlames / (int)burningIds.size());
     uint32_t cyc = (uint32_t)(frame / kFlameFlickerFrames);
     for (int id : burningIds) {
         int i = treeIndexById(trees, id);
@@ -14105,6 +14237,7 @@ void drawFires(RenderWindow& window, const vector<tree>& trees, VertexArray& va,
         if (!view.findIntersection(reach)) continue;
         float burnt = 1.0f - (float)t.burnLeft / kBurnTicks;
         int n = burnt < 0.75f ? kFlamesPerTree : max(1, (int)ceil(kFlamesPerTree * (1.0f - burnt) / 0.25f));
+        n = min(n, perTree);
         for (int k = 0; k < n && flames < kMaxFlames; k++, flames++) {
             uint32_t h = fireHash(cyc * 31u + (uint32_t)k, (uint32_t)id);
             FloatRect tier = treeTierRect(p, (int)(h % treeTiers));
@@ -14114,7 +14247,7 @@ void drawFires(RenderWindow& window, const vector<tree>& trees, VertexArray& va,
             pushQuad(va, at, Vector2f(1.0f, fh), kFlameColors[(h >> 24) & 1]);
         }
         Vector2f src = p + Vector2f(treeFootprint / 2 - 1, treeTierRect(p, 0).position.y - 2);
-        for (int k = 0; k < kFireSmokePuffs; k++) {
+        for (int k = 0; k < kFireSmokePuffs && puffs < kFireSmokeMaxPuffs; k++, puffs++) {   // R58-F3: smoke capped too
             int age = (frame + k * kFireSmokeLifeFrames / kFireSmokePuffs) % kFireSmokeLifeFrames;
             float u = (float)age / kFireSmokeLifeFrames;
             float sz = u < 0.5f ? 2.0f : 1.0f;
@@ -14230,6 +14363,7 @@ void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
     for (int i = (int)tris.size() - 1; i >= 0; i--) {
         if (lakeClear(FloatRect(tris[i].getPosition(), Vector2f(treeFootprint, treeFootprint)))) continue;
         swapRemove(trees, i); swapRemove(tris, i); swapRemove(stumps, i);
+        treeGrid.stale = true;   // R58-F3: grid synced on every tree remove
     }
     for (int i = (int)octs.size() - 1; i >= 0; i--) {
         if (lakeClear(octs[i].getGlobalBounds())) continue;
@@ -14282,6 +14416,7 @@ void spawnBushes(vector<bush>& bushes, vector<CircleShape>& bushshapes, vector<t
             bb.size += Vector2f(2 * bushTreeClearance, 2 * bushTreeClearance + bushWorkOffset.y); // keep the work spot clear too
             if (!tb.findIntersection(bb)) continue;
             swapRemove(trees, i); swapRemove(tris, i); swapRemove(stumps, i);
+            treeGrid.stale = true;   // R58-F3: grid synced on every tree remove
             break;
         }
     }
@@ -14332,6 +14467,7 @@ void checkQuarters(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectan
                 stump.setFillColor(stumpColor);
                 stump.setPosition(Vector2f(p.x + 6, p.y + 12));
                 stumps.push_back(stump);
+                treeGrid.stale = true;   // R58-F3: grid synced on every tree add
                 addT++;
             } else {
                 Vector2f p = snapPx(c - rockSz / 2.0f);
@@ -14412,6 +14548,7 @@ void spawnRuins(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
     for (int i = (int)tris.size() - 1; i >= 0; i--) {
         if (ruinsClear(FloatRect(tris[i].getPosition(), Vector2f(treeFootprint, treeFootprint)))) continue;
         swapRemove(trees, i); swapRemove(tris, i); swapRemove(stumps, i);
+        treeGrid.stale = true;   // R58-F3: grid synced on every tree remove
         clearedT++;
     }
     for (int i = (int)octs.size() - 1; i >= 0; i--) {
@@ -14466,6 +14603,7 @@ void spawnRuins(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
         for (int k = ridgeFirst; k < (int)octs.size(); k++) {
             if (!tb.findIntersection(octs[k].getGlobalBounds())) continue;
             swapRemove(trees, i); swapRemove(tris, i); swapRemove(stumps, i);
+            treeGrid.stale = true;   // R58-F3: grid synced on every tree remove
             break;
         }
     }
@@ -14509,6 +14647,7 @@ void spawnPois(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
     for (int i = (int)tris.size() - 1; i >= 0; i--) {
         if (poiClear(FloatRect(tris[i].getPosition(), Vector2f(treeFootprint, treeFootprint)))) continue;
         swapRemove(trees, i); swapRemove(tris, i); swapRemove(stumps, i);
+        treeGrid.stale = true;   // R58-F3: grid synced on every tree remove
         clearedT++;
     }
     for (int i = (int)octs.size() - 1; i >= 0; i--) {
@@ -14603,6 +14742,7 @@ void spawnWildCamp(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectan
     for (int i = (int)tris.size() - 1; i >= 0; i--) {
         if (campClear(FloatRect(tris[i].getPosition(), Vector2f(treeFootprint, treeFootprint)))) continue;
         swapRemove(trees, i); swapRemove(tris, i); swapRemove(stumps, i);
+        treeGrid.stale = true;   // R58-F3: grid synced on every tree remove
         clearedT++;
     }
     for (int i = (int)octs.size() - 1; i >= 0; i--) {
@@ -15334,6 +15474,7 @@ int main() {
         stump.setPosition(Vector2f(t.x + 6, t.y + 12));
         stumps.push_back(stump);
     }
+    treeGrid.stale = true;   // R58-F3: grid synced on every tree add
 
     vector<CircleShape> octs;
     octs.reserve(rocks.size());
@@ -15534,7 +15675,7 @@ int main() {
                     }
                 }
                 weatherTick();
-                stormTick(trees, tris, stumps, barbs);   // R57-F3: after weatherTick, so a summer rain's first tick schedules its strike
+                stormTick(trees, tris, stumps, barbs, fields, houses);   // R57-F3: after weatherTick, so a summer rain's first tick schedules its strike
                 relationTick();   // R51-F4: drift to neutral and clash cooldowns, before the trader prices a visit
                 traderTick(activeTrader, barbs, stores);
                 graveTick(barbs, squares);   // R47-F9: morale term per race, before hungerTick() reads it
@@ -15575,6 +15716,7 @@ int main() {
                     }
                 }
                 swapRemove(tris, i); swapRemove(stumps, i); swapRemove(trees, i);
+                treeGrid.stale = true;   // R58-F3: grid synced on every tree remove
             }
         }
         for (int i = (int)octs.size() - 1; i >= 0; i--) {
