@@ -3694,14 +3694,23 @@ int countSpecies(const vector<deer>& deers, animalSpecies s) {
 
 // R56-F4 One World Struct, slice 1: the deer pair moves in here as plain members, same names, same index rule. Later
 // slices add the barb, tree and house groups. checkWorldSync() runs after every sim tick (debug builds only).
+// R57-F4 slice 2: the barb pair (barbs, squares) moves in too, same names; main binds references to it.
 struct world {
 	vector<deer> deers;
 	vector<RectangleShape> deershape;   // parallel to deers: every push and swapRemove touches both at the same index
+	vector<barb> barbs;
+	vector<RectangleShape> squares;     // parallel to barbs: every push and swapRemove touches both at the same index
 };
 
 void checkWorldSync(const world& wd) {
 	(void)wd;   // unused when SIM_DEBUG is off
 	SIM_DEBUG_ASSERT(wd.deers.size() == wd.deershape.size());
+#ifdef SIM_DEBUG
+	if (wd.barbs.size() != wd.squares.size())   // R57-F4: first index present in one vector but not the other
+		fprintf(stderr, "checkWorldSync: barbs %zu vs squares %zu, first mismatched index %zu\n",
+		        wd.barbs.size(), wd.squares.size(), min(wd.barbs.size(), wd.squares.size()));
+#endif
+	SIM_DEBUG_ASSERT(wd.barbs.size() == wd.squares.size());
 }
 
 struct trader {
@@ -14488,8 +14497,9 @@ int main() {
 
     resetKnowHow();   // fresh practice counters and no learned techs for every new game (R20-F1)
     resetTrails();    // wear, tiers and cobbles (R20-F2)
-    vector<barb> barbs;
-    vector<RectangleShape> squares;
+    world wd;   // R56-F4/R57-F4: owns the deer and barb pairs; constructed first, the references below keep every name
+    vector<barb>& barbs = wd.barbs;             // bound only after wd exists; wd is never copied
+    vector<RectangleShape>& squares = wd.squares;
     vector<birthRing> birthRings;
     vector<birthRing> catchRings;   // fishing ripples (R19-F1)
     vector<shinobiPuff> shinobiPuffs; // Sasuke's blink puffs (R25-F2)
@@ -14537,7 +14547,6 @@ int main() {
     storehouse stores[raceCount];   // R29-F1: one per race, indexed by barbRace
     fieldGrid fields;   // FARM-F1: fields[race][k], each race's wheat plots beside its storehouse
 
-    world wd;   // R56-F4: owns the deer pair; the references keep every existing name working unchanged
     vector<deer>& deers = wd.deers;
     vector<RectangleShape>& deershape = wd.deershape;
 
