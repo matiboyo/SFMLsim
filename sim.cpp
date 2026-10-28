@@ -374,6 +374,36 @@ const float rainStreakFallPx = 4.0f;       // px fallen per frame (~240px/s)
 const float rainStreakDriftPx = 1.0f;      // px drifted left per frame, matches the slant
 const Color rainStreakColor(170, 195, 225, 64); // pale blue, ~25% alpha
 bool raining = false;
+// R57-F3 Thunderstorm Wildfire, phase 1: every summer rain is a storm with exactly one lightning strike. It burns one wild
+// tree well outside the safe core (no spread, no rain quench, no firebreak yet: phase 2). The burning tree is tracked by id
+// (burningIds) and, once burnt out, leaves an ash-grey stump that fades back to stump colour over one game day, stands
+// plain for a while, then fades out. Flash and bolt are draw-only (drawn frames, frozen while paused).
+const float kFireSafeMargin = 120.0f;              // strikes only hit trees farther than zoneCoreRadius + this from villageCenter
+const float kStormStrikeMinFrac = 0.2f;            // the strike lands between these fractions of the rain spell
+const float kStormStrikeMaxFrac = 0.8f;
+const int kStrikeTries = 80;                       // random tree picks per strike before the bolt hits nothing
+const int kBurnTicks = 3 * ticksPerMinute;         // a struck tree burns 3 real minutes at 1x before it falls to a stump
+const int kMaxFlames = 12;                         // flame pixels drawn at once, across every burning tree
+const int kFlamesPerTree = 7;                      // flame tongues on a fully alight canopy (thins out over the last quarter)
+const int kFlameFlickerFrames = 5;                 // tongues re-hash their spot every this many drawn frames
+const Color kFlameColors[2] = {Color(222, 118, 44, 225), Color(238, 184, 86, 215)};   // muted orange, pale amber
+const int kFireSmokePuffs = 3;                     // staggered puffs per burning tree
+const int kFireSmokeLifeFrames = 150;              // ~2.5 s per puff
+const float kFireSmokeRisePx = 20.0f;
+const float kFireSmokeDriftPx = 4.0f;
+const uint8_t kFireSmokeAlpha = 60;                // fainter than smokehouse puffs (smokeAlpha 110)
+const int kLightningFlashFrames = 2;               // screen flash + bolt, drawn frames
+const Color kLightningFlashColor(222, 228, 255, 64);  // translucent wash; the world stays readable through it
+const uint8_t kLightningFarFlashAlpha = 28;        // flash alpha when the strike is outside the view (no bolt drawn)
+const Color kLightningBoltColor(236, 240, 255, 235);
+const int kBoltSegPx = 6;                          // vertical run of each bolt segment (world px)
+const int kBoltJagPx = 2;                          // max sideways jag between segments
+const float kBoltMaxPx = 260.0f;                   // the bolt starts at most this far above the strike (or at the view top)
+const Color kLightningTickerColor(196, 204, 232);   // pale storm blue on the black ticker strip
+const Color kAshStumpColor(104, 100, 96);          // ash grey: clearly not the rust stumpColor, still dim on the grass
+const int kAshTintTicks = 24 * ticksPerGameHour;   // ash fades to stump colour over one game day
+const int kAshStumpHoldTicks = 24 * ticksPerGameHour;   // then stands as a plain stump this long
+const int kAshStumpFadeTicks = ticksPerGameHour;   // then fades out over one game hour and is removed
 
 const int traderIntervalTicks = ticksPerGameHour; // one in-game hour between trader visits
 const int traderStepInterval = 6;         // ticks per 1px step while walking
@@ -3986,7 +4016,7 @@ FloatRect drawEvents(RenderWindow& window, const Font& font) {
     return FloatRect(topLeft, {width, height});
 }
 
-struct tree  {int x, y; bool dying = false;};
+struct tree  {int x, y; bool dying = false; int id = -1; int burnLeft = 0;};   // R57-F3: id given only when struck; burnLeft > 0 = alight
 struct rock  {int x, y; bool dying = false;};
 struct bush  {int x, y; bool ripe = true; bool picking = false; int regrow = 0;};
 
@@ -13474,6 +13504,193 @@ void treespawn(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
     stumps.push_back(stump);
 }
 
+// R57-F3 Thunderstorm Wildfire, phase 1. A burning tree stays in trees/tris/stumps (dying, so nobody chops it) and is
+// referred to only by its id, re-resolved by a scan each tick, since any swapRemove elsewhere moves indices.
+vector<int> burningIds;        // ids of the trees alight now
+int nextTreeId = 0;            // handed out only when a tree is struck; never reused
+struct ashStump {Vector2f pos; long long burntAt = 0;};   // pos: the 4x4 stump's top-left; burntAt: stormClock when it fell
+vector<ashStump> ashStumps;    // the timestamp lives on the entry, so a swapRemove carries it
+long long stormClock = 0;      // sim ticks counted by stormTick(); the ash fade's time base
+int stormStrikeIn = -1;        // ticks until this storm's one strike; -1 = none pending
+int lightningFrames = 0;       // > 0 while the flash and bolt show (drawn frames)
+Vector2f lightningAt;          // bolt foot (world px): the struck canopy's top centre
+uint32_t lightningSeed = 0;    // jag hash seed, so the bolt keeps its shape over both frames
+
+int treeIndexById(const vector<tree>& trees, int id) {
+    for (int i = 0; i < (int)trees.size(); i++) if (trees[i].id == id) return i;
+    return -1;
+}
+
+// Tier k of the canopy drawn for a tree at pos (offset from its top-left), the same sums drawTrees() makes
+FloatRect treeTierRect(Vector2f pos, int k) {
+    const treeKindDef& kd = treeKinds[treeKindAt(pos)];
+    const int last = treeTiers - 1;
+    float canopy = round(treeTierTop[last] * kd.heightFactor) + round(treeTierSize[last].y * kd.heightFactor);
+    float offset = treeCanopyBottom - canopy;
+    Vector2f s(2 * round(treeTierSize[k].x * kd.widthFactor / 2), round(treeTierSize[k].y * kd.heightFactor));
+    return FloatRect(Vector2f(floor((treeFootprint - s.x) / 2), offset + round(treeTierTop[k] * kd.heightFactor)), s);
+}
+
+uint32_t fireHash(uint32_t a, uint32_t b) {
+    uint32_t h = a * 73856093u ^ b * 19349663u;
+    h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+    return h;
+}
+
+// The storm's one bolt: a random wild tree beyond zoneCoreRadius + kFireSafeMargin catches fire. A tree already being
+// chopped (dying) or alight is never picked; after kStrikeTries misses the bolt hits open ground.
+void lightningStrike(vector<tree>& trees) {
+    if (trees.empty()) return;
+    uniform_int_distribution<int> pick(0, (int)trees.size() - 1);
+    const float minD = zoneCoreRadius + kFireSafeMargin;
+    for (int k = 0; k < kStrikeTries; k++) {
+        tree& t = trees[pick(gen)];
+        if (t.dying || t.burnLeft > 0) continue;
+        Vector2f d = Vector2f(t.x + treeFootprint / 2, t.y + treeFootprint / 2) - villageCenter;
+        if (d.x * d.x + d.y * d.y <= minD * minD) continue;
+        if (t.id < 0) t.id = nextTreeId++;
+        t.dying = true;   // no new chopper; one already walking to it drops the target on arrival
+        t.burnLeft = kBurnTicks;
+        burningIds.push_back(t.id);
+        lightningAt = Vector2f(t.x + treeFootprint / 2, t.y + treeTierRect(Vector2f(t.x, t.y), 0).position.y);
+        lightningSeed = (uint32_t)gen();
+        lightningFrames = kLightningFlashFrames;
+        printf("LIGHTNING - tree %d at (%d,%d) catches fire\n", t.id, t.x, t.y);
+        logEvent(string("Lightning sets a tree ablaze to the ") + compassName(d), kLightningTickerColor);
+        return;
+    }
+    printf("LIGHTNING - the bolt struck open ground\n");
+}
+
+// Once per sim tick, after weatherTick(): schedules the one strike when a summer rain starts, burns the alight trees down
+// (trees/tris/stumps removed together, in reverse index order) into ash stumps, and ages the ash stumps out.
+void stormTick(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<barb>& barbs) {
+    static bool wasRaining = false;
+    stormClock++;
+    if (raining && !wasRaining && seasonOf(game_day) == seasonSummer) {
+        stormStrikeIn = uniform_int_distribution<int>((int)(kStormStrikeMinFrac * rainWeatherTicks),
+                                                      (int)(kStormStrikeMaxFrac * rainWeatherTicks))(gen);
+        printf("STORM - summer thunderstorm, strike in %d ticks\n", stormStrikeIn);
+    }
+    if (!raining) stormStrikeIn = -1;
+    wasRaining = raining;
+    if (stormStrikeIn > 0 && --stormStrikeIn == 0) { stormStrikeIn = -1; lightningStrike(trees); }
+
+    if (!burningIds.empty()) {
+        vector<int> done;   // tree indices burnt out this tick
+        for (int k = (int)burningIds.size() - 1; k >= 0; k--) {
+            int i = treeIndexById(trees, burningIds[k]);
+            if (i < 0) { swapRemove(burningIds, k); continue; }   // removed by other code (cleared or built over)
+            if (--trees[i].burnLeft > 0) continue;
+            done.push_back(i);
+            swapRemove(burningIds, k);
+        }
+        sort(done.begin(), done.end(), greater<int>());   // highest first, so each swapRemove leaves the rest valid
+        for (int i : done) {
+            Vector2f wp = tris[i].getPosition() + treeWorkOffset;
+            int tix = (int)wp.x, tiy = (int)wp.y;
+            for (auto& b : barbs)
+                if (b.activity != actShelter && b.target != targetBush && b.targetx == tix && b.targety == tiy) {
+                    b.moving = b.chopping = false; clearRoute(b);
+                    b.timer = 0;
+                    b.targetx = b.targety = -1;
+                }
+            ashStumps.push_back(ashStump{stumps[i].getPosition(), stormClock});
+            printf("TREE BURNT - tree %d falls to an ash stump at (%d,%d)\n", trees[i].id, trees[i].x, trees[i].y);
+            swapRemove(trees, i); swapRemove(tris, i); swapRemove(stumps, i);
+            treeGrid.stale = true;   // R47-F1: indices moved; the next lookup rebuilds
+        }
+    }
+    for (int k = (int)ashStumps.size() - 1; k >= 0; k--)
+        if (stormClock - ashStumps[k].burntAt >= (long long)kAshTintTicks + kAshStumpHoldTicks + kAshStumpFadeTicks)
+            swapRemove(ashStumps, k);
+}
+
+// Ash stumps: kAshStumpColor smoothstepped to stumpColor over kAshTintTicks, held, then faded out. Same 4x4 as every stump.
+void drawAshStumps(RenderWindow& window, VertexArray& va, const FloatRect& view) {
+    if (ashStumps.empty()) return;
+    const Vector2f sz(4.0f, 4.0f);
+    va.clear();
+    for (auto& s : ashStumps) {
+        Vector2f p = snapPx(s.pos);
+        if (!view.findIntersection(FloatRect(p, sz))) continue;
+        long long age = stormClock - s.burntAt;
+        float t = smooth01(0.0f, (float)kAshTintTicks, (float)age);
+        auto mix = [t](uint8_t a, uint8_t b) { return (uint8_t)round(a + (b - a) * t); };
+        Color c(mix(kAshStumpColor.r, stumpColor.r), mix(kAshStumpColor.g, stumpColor.g), mix(kAshStumpColor.b, stumpColor.b));
+        long long fadeAge = age - kAshTintTicks - kAshStumpHoldTicks;
+        if (fadeAge > 0) c.a = (uint8_t)round(255.0f * (1.0f - clamp((float)fadeAge / kAshStumpFadeTicks, 0.0f, 1.0f)));
+        if (c.a > 0) pushQuad(va, p, sz, c);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// Flames (1x1 / 1x2 tongues inside the canopy tiers, flickering, at most kMaxFlames in all, thinning over the last
+// quarter of the burn) and a faint kFireSmokePuffs-puff smoke column. Above the trees, under the day/night overlay.
+void drawFires(RenderWindow& window, const vector<tree>& trees, VertexArray& va, const FloatRect& view, int frame) {
+    if (burningIds.empty()) return;
+    va.clear();
+    int flames = 0;
+    uint32_t cyc = (uint32_t)(frame / kFlameFlickerFrames);
+    for (int id : burningIds) {
+        int i = treeIndexById(trees, id);
+        if (i < 0) continue;
+        const tree& t = trees[i];
+        Vector2f p((float)t.x, (float)t.y);
+        FloatRect reach(p - Vector2f(0.0f, kFireSmokeRisePx + treeFootprint), Vector2f(treeFootprint + kFireSmokeDriftPx, 2 * treeFootprint + kFireSmokeRisePx));
+        if (!view.findIntersection(reach)) continue;
+        float burnt = 1.0f - (float)t.burnLeft / kBurnTicks;
+        int n = burnt < 0.75f ? kFlamesPerTree : max(1, (int)ceil(kFlamesPerTree * (1.0f - burnt) / 0.25f));
+        for (int k = 0; k < n && flames < kMaxFlames; k++, flames++) {
+            uint32_t h = fireHash(cyc * 31u + (uint32_t)k, (uint32_t)id);
+            FloatRect tier = treeTierRect(p, (int)(h % treeTiers));
+            float fh = (h >> 4) % 3 == 0 ? 2.0f : 1.0f;
+            int spanX = max(1, (int)tier.size.x), spanY = max(1, (int)(tier.size.y - fh + 1));
+            Vector2f at = p + tier.position + Vector2f((float)((h >> 8) % (uint32_t)spanX), (float)((h >> 16) % (uint32_t)spanY));
+            pushQuad(va, at, Vector2f(1.0f, fh), kFlameColors[(h >> 24) & 1]);
+        }
+        Vector2f src = p + Vector2f(treeFootprint / 2 - 1, treeTierRect(p, 0).position.y - 2);
+        for (int k = 0; k < kFireSmokePuffs; k++) {
+            int age = (frame + k * kFireSmokeLifeFrames / kFireSmokePuffs) % kFireSmokeLifeFrames;
+            float u = (float)age / kFireSmokeLifeFrames;
+            float sz = u < 0.5f ? 2.0f : 1.0f;
+            Color c = smokeColor;
+            c.a = (uint8_t)(kFireSmokeAlpha * (1.0f - u));
+            pushQuad(va, Vector2f(floor(src.x + kFireSmokeDriftPx * u), floor(src.y - kFireSmokeRisePx * u)), Vector2f(sz, sz), c);
+        }
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// The strike: a translucent screen flash for kLightningFlashFrames drawn frames (fainter when the strike is out of view),
+// plus a 1px jagged bolt from the canopy up to the view top (at most kBoltMaxPx) when it is in view. Drawn above the
+// day/night and rain overlays so it reads at night; leaves the world view set.
+void drawLightning(RenderWindow& window, const View& worldView, RectangleShape& overlay, const FloatRect& view, VertexArray& va, bool paused) {
+    if (lightningFrames <= 0) return;
+    bool seen = view.contains(lightningAt);
+    Color fc = kLightningFlashColor;
+    if (!seen) fc.a = kLightningFarFlashAlpha;
+    drawOverlay(window, overlay, fc);
+    window.setView(worldView);
+    if (seen) {
+        va.clear();
+        float topY = max(view.position.y, lightningAt.y - kBoltMaxPx);
+        Vector2f p = snapPx(lightningAt);
+        for (uint32_t s = 0; p.y > topY; s++) {
+            float run = min((float)kBoltSegPx, p.y - topY);
+            pushQuad(va, Vector2f(p.x, p.y - run), Vector2f(1.0f, run), kLightningBoltColor);
+            p.y -= run;
+            int jag = (int)(fireHash(lightningSeed, s) % (uint32_t)(2 * kBoltJagPx + 1)) - kBoltJagPx;
+            if (jag != 0 && p.y > topY) {   // 1px step on the segment's top row, joining the next segment's foot
+                pushQuad(va, Vector2f(min(p.x, p.x + jag), p.y), Vector2f((float)abs(jag) + 1.0f, 1.0f), kLightningBoltColor);
+                p.x += jag;
+            }
+        }
+        if (va.getVertexCount() > 0) window.draw(va);
+    }
+    if (!paused) lightningFrames--;
+}
+
 // lakeCountMin-Max ponds (2-3 per 800x800 of map) away from the village, apart from each other. Startup trees (trees/tris/stumps) and rocks (rocks/octs)
 // in or touching a lake are removed together. Fixed village spots (stall, forge) are inside the
 // lakeVillageMinDist ring, and the race smokehouses sit inside the dry quarters, so they never need a lake check. Shore points are cached here for angling.
@@ -14691,6 +14908,7 @@ int main() {
     VertexArray treeVerts(PrimitiveType::Triangles);
     VertexArray rockVerts(PrimitiveType::Triangles), bushVerts(PrimitiveType::Triangles), stumpVerts(PrimitiveType::Triangles);   // rebuilt every frame
     VertexArray rainVerts(PrimitiveType::Triangles); // scratch buffer for drawRain, rebuilt every frame
+    VertexArray ashVerts(PrimitiveType::Triangles), fireVerts(PrimitiveType::Triangles), boltVerts(PrimitiveType::Triangles);   // R57-F3
     VertexArray minimapVerts(PrimitiveType::Triangles); // UIO-F1: scratch buffer for drawMinimap's dots, rebuilt every frame
 
     RectangleShape dnc({windowSize, windowSize});   // screen-space overlay, drawn in the default view
@@ -14851,6 +15069,7 @@ int main() {
                     }
                 }
                 weatherTick();
+                stormTick(trees, tris, stumps, barbs);   // R57-F3: after weatherTick, so a summer rain's first tick schedules its strike
                 relationTick();   // R51-F4: drift to neutral and clash cooldowns, before the trader prices a visit
                 traderTick(activeTrader, barbs, stores);
                 graveTick(barbs, squares);   // R47-F9: morale term per race, before hungerTick() reads it
@@ -14969,6 +15188,7 @@ int main() {
 	for (auto& p : prowlers) if (p.flashFrames > 0 && !paused) p.flashFrames--;   // R51-F1: the hit flash lasts 2 drawn frames
 
         drawStumps(window, stumps, stumpVerts, camRect);   // R45-F1a: ~12k stumps (R47-F1), only those touching the view
+        drawAshStumps(window, ashVerts, camRect);   // R57-F3: burnt-out stumps, same layer as the living trees' stumps
 
         drawOmenAuras(window, shrines);   // R53-F3: faint aura round a shrine while its race's omen holds
         drawRiteRings(window, shrines);   // R52-F3: faint ring round each rite shrine, under the kneelers
@@ -14978,6 +15198,7 @@ int main() {
         for (auto& b : barbs) if (b.raidFlash > 0 && !paused) b.raidFlash--;   // R52-F1: the hit flash lasts 2 drawn frames
 	if (activeTrader) drawSnapped(window, activeTrader->shape);
 	drawTrees(window, tris, treeVerts, camRect);
+	drawFires(window, trees, fireVerts, camRect, frameCount);   // R57-F3: flames on the burning canopy + faint smoke, under the overlay
 	drawSmoke(window, smoke, paused);   // INBOX2-F1: per-race puffs, only after own smoked kills
 	drawMillPuffs(window);   // FARM-F2: above the trees, under the overlay
 	drawForgeSparks(window, paused);   // POL-F5b: above barbs and trees so the sparks read, under the overlay
@@ -15017,6 +15238,7 @@ int main() {
         else                            dncColor = Color(255, 178, 127, 50);  // Evening
         drawOverlay(window, dnc, dncColor);
         if (raining) drawOverlay(window, dnc, rainOverlayColor);
+        drawLightning(window, worldView, dnc, camRect, boltVerts, paused);   // R57-F3: flash + bolt over both overlays
         if (t >= eveningStartHour && t < nightStartHour) drawRuinGlow(window, worldView, frameCount);   // R45-F1b: dusk only
         drawPoiGlow(window, worldView, camRect, frameCount);   // R47-F4: found sites, any hour
         if (isNightHour(t)) drawCampfireGlow(window, worldView, fire, frameCount);
