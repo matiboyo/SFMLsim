@@ -224,6 +224,17 @@ const float raceTraitLike[raceCount][traitCount] = {
 const float crownMinZoom = 1.0f;          // the crown shows at every zoom (minZoom is 1)
 const Vector2f crownSize(2.0f, 1.0f);     // 2x1 band sitting on the head (or on top of the hat)
 const Color crownColor(250, 208, 64);     // bright gold: off the body, so it never meets a task stripe or the sash
+// R58-F2 Named Dynasties, phase 1: barbs know their parents (by stable id); a lost leader's eldest living child of the
+// race is offered the crown at once (crownHeir); no child, or a vote the heir loses, leaves the race to the dawn election.
+// A crowned barb without a house founds one from this table; children take a parent's house in makeBarb().
+const char* const kDynastyNames[] = {
+    "Ardent", "Blackmoor", "Corrin", "Dunhallow", "Everly", "Fenwick",
+    "Greywater", "Holt", "Ironside", "Marrow", "Thorne", "Vale",
+};
+const int kDynastyCount = (int)(sizeof(kDynastyNames) / sizeof(kDynastyNames[0]));   // 12
+const float kHeirBloodBonus = 0.15f;      // added to raceTraitLike for the heir's vote; a majority is still needed
+const Vector2f kCircletSize(3.0f, 1.0f);  // heir's 3x1 band on the crown row (centred, so it shows 1px wider than the crown)
+const Color kCircletColor(178, 120, 28);  // deep antique gold: darker/redder than the crown and the pale-lemon vassal flag
 // Leader shortage weights (R30-F2): at dawn a race's leader names its top shortage; that race's matching job weight tilts
 enum leaderNeed { needWood, needStone, needFood, needCount, needNone = needCount };
 const char* const leaderNeedNames[needCount] = {"wood", "stone", "food"};
@@ -317,7 +328,8 @@ const char* const kChroniclePath = "chronicle.sav";
 const char* const kChronicleTmpPath = "chronicle.sav.tmp";
 const int32_t kChronicleMagic = 0x4C524843;         // "CHRL" little-endian
 const int32_t kChronicleEndMark = 0x444E4543;       // "CEND": trailer, so a truncated file is rejected
-const int32_t kChronicleVersion = 3;                // R55-F4: v3 adds tagged blocks (named barbs first) after the houses
+const int32_t kChronicleVersion = 4;                // R58-F2: v4 widens each BARB entry with parents and dynasty
+const int32_t kChronicleVersionBlocks = 3;          // R55-F4: v3 adds tagged blocks (named barbs first) after the houses; still loads
 const int32_t kChronicleVersionEras = 2;            // R54-F4: v2 adds the per-race era array after the relations; still loads
 const int32_t kChronicleVersionNoEras = 1;          // v1 files (no eras) still load, with every race back at Camp
 const int kChronicleMaxHouses = 600;                // a load with more houses than this is rejected outright
@@ -330,7 +342,8 @@ const int kChronicleMaxPurse = 1000000;             // per-race purse bound on l
 const int kChronicleMaxBlocks = 32;                // blocks per file; more is rejected
 const int kChronicleMaxBlockWords = 1 << 20;        // int32 words in one block; more is rejected
 const int kChronicleMaxBarbs = 2000;                // a load with more barbs than this is rejected; a save writes at most this many
-const int kChronicleBarbWords = 8;                  // per barb: name, race, birthRace, trait, leader, hunger, age, home
+const int kChronicleBarbWordsV3 = 8;                // v3, per barb: name, race, birthRace, trait, leader, hunger, age, home
+const int kChronicleBarbWords = 11;                 // R58-F2 (v4): + parentA, parentB (file barb indices, -1 = none), dynasty
 const int kChronicleMaxHungerMult = 4;              // hunger saved clamped to hungerThreshold * this; a larger value is rejected
 const int kChronicleReturnNames = 2;                // barbs named on the restore line ("Hild, Orm and 6 more return")
 const int kChronicleMaxDay = 1000000;               // game_day bound on load
@@ -3386,6 +3399,9 @@ struct barb {
     int renown = 0;              // R56-F3: deeds; moves with the struct on swapRemove; written only by addRenown()
     char title[kTitleLen] = "";  // R56-F3: "" = untitled; written only by addRenown() via snprintf
     bool oldAgeDeath = false;    // R57-F1: set only by ageDeathTick() with health 0; read by starveDeathTick() for the log
+    int parentAId = -1;          // R58-F2: barb.id of each parent (stable ids, looked up with findBarbById); -1 = none/unknown.
+    int parentBId = -1;          //         set only in makeBarb() (and remapped once by chronicleRestoreBarbs())
+    int dynastyIdx = -1;         // R58-F2: kDynastyNames index, -1 = no house; from a parent in makeBarb(), or crownBarb()/crownHeir
 };
 // R57-F1: age and stage from bornHour on the live clock (same hour count as chronicleNowHour())
 enum lifeStageKind { stageChild, stageAdult, stageElder };
@@ -3687,6 +3703,14 @@ int findBarbById(const vector<barb>& barbs, int id) {
 }
 bool isLeader(const barb& b) {
     return b.race >= 0 && b.race < raceCount && raceElected[b.race] && raceLeaderId[b.race] >= 0 && raceLeaderId[b.race] == b.id;
+}
+// R58-F2: kept beside raceLeaderId so a leader already removed from barbs can still be named and its house passed on
+const char* raceLeaderName[raceCount] = {"", "", ""};   // points into barbNames/shinobiName, like barb::name
+int raceLeaderDynasty[raceCount] = {-1, -1, -1};
+int raceHeirId[raceCount] = {-1, -1, -1};   // barb.id of the leader's heir (circlet); refreshed by leaderTick()/loseLeader(), resolved by id
+bool isHeir(const barb& b) {
+    return b.race >= 0 && b.race < raceCount && raceElected[b.race] && raceHeirId[b.race] >= 0 && raceHeirId[b.race] == b.id
+        && !isLeader(b);
 }
 int mineTicks(const barb& b) {   // R47-F7: / the tool tier snapshotted at job start (b.jobTier), never looked up per tick
     return (int)(rockMineTicks / raceOf(b).mineSpeed / (knows(b.race, techPickwork) ? pickworkMineSpeed : 1.0f)   // R55-F2
@@ -5733,6 +5757,12 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             stripe.setFillColor(crownColor);
             stripe.setPosition(Vector2f(base.x + floor((bodySize.x - crownSize.x) / 2.0f), headTop - crownSize.y));
             window.draw(stripe);
+        } else if (zoom >= crownMinZoom && isHeir(b)) {   // R58-F2: the heir's darker 3x1 circlet on the same crown row
+            float headTop = bodyTop - rd.hatSize.y - rd.hatTipSize.y;
+            stripe.setSize(kCircletSize);
+            stripe.setFillColor(kCircletColor);
+            stripe.setPosition(Vector2f(base.x + floor((bodySize.x - kCircletSize.x) / 2.0f), headTop - kCircletSize.y));
+            window.draw(stripe);
         }
         if (b.title[0] != '\0') {   // R56-F3: centred over the head, the crown row (worn or not) plus 1px of air below it; bobs
             float headTop = bodyTop - rd.hatSize.y - rd.hatTipSize.y;
@@ -7561,7 +7591,8 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
 // never saved and starts clean.
 struct chronicleHouse { int race, dx, dy; bool foundation; };
 // R55-F4 (v3 "BARB" block): one named barb. name = barbNames index, -1 = Sasuke; home = index into the file's house list, -1 = none
-struct chronicleBarb { int name = -1, race = 0, birthRace = 0, trait = 0, leader = 0, hunger = 0, ageHours = 0, home = -1; };
+struct chronicleBarb { int name = -1, race = 0, birthRace = 0, trait = 0, leader = 0, hunger = 0, ageHours = 0, home = -1;
+                       int parentA = -1, parentB = -1, dynasty = -1; };   // R58-F2 (v4): file barb indices; all -1 from a v3 file
 struct chronicleData {
     int day = 0, hour = 0;
     raceStock stocks[raceCount];
@@ -7604,6 +7635,10 @@ bool chronicleSaveBarbs(FILE* f, const vector<barb>& barbs, const vector<house>&
     int n = (int)keep.size();
     bool ok = chronPut(f, kChronicleBlockBarbs) && chronPut(f, 1 + n * kChronicleBarbWords) && chronPut(f, n);
     const int hungerCap = hungerThreshold * kChronicleMaxHungerMult, now = chronicleNowHour();
+    auto fileIndex = [&](int id) {   // R58-F2: a parent's index in this block; -1 when it is dead or not written
+        for (int k = 0; id >= 0 && k < n; k++) if (keep[k]->id == id) return k;
+        return -1;
+    };
     for (int i = 0; ok && i < n; i++) {
         const barb& b = *keep[i];
         int home = -1;
@@ -7611,7 +7646,9 @@ bool chronicleSaveBarbs(FILE* f, const vector<barb>& barbs, const vector<house>&
         ok = chronPut(f, chronicleNameIndex(b)) && chronPut(f, clampRace(b.race)) && chronPut(f, clampRace(b.birthRace))
           && chronPut(f, clamp((int)b.trait, 0, traitCount - 1)) && chronPut(f, isLeader(b) ? 1 : 0)
           && chronPut(f, clamp(b.hunger, 0, hungerCap)) && chronPut(f, clamp(now - b.bornHour, 0, kChronicleMaxDay * 24))
-          && chronPut(f, home);
+          && chronPut(f, home)
+          && chronPut(f, fileIndex(b.parentAId)) && chronPut(f, fileIndex(b.parentBId))   // R58-F2 (v4)
+          && chronPut(f, b.dynastyIdx >= 0 && b.dynastyIdx < kDynastyCount ? b.dynastyIdx : -1);
     }
     return ok;
 }
@@ -7676,10 +7713,12 @@ bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
 
 // R55-F4: the "BARB" block, words long, into d.barbs (d.houses is already read, so home indices are checked against it).
 // At most one Sasuke and one leader per race; anything else out of range rejects the whole file.
-bool chronicleReadBarbs(FILE* f, int words, chronicleData& d, const char*& why) {
+// R58-F2: a v4 entry adds parentA, parentB and dynasty; a v3 entry has none, so those stay -1 (no parents, no house).
+bool chronicleReadBarbs(FILE* f, int words, int version, chronicleData& d, const char*& why) {
     int n = 0;
+    const int perBarb = version >= kChronicleVersion ? kChronicleBarbWords : kChronicleBarbWordsV3;
     if (words < 1 || !chronGetIn(f, 0, kChronicleMaxBarbs, n)) { why = "barb count over the cap"; return false; }
-    if (words != 1 + n * kChronicleBarbWords) { why = "barb block size differs"; return false; }
+    if (words != 1 + n * perBarb) { why = "barb block size differs"; return false; }
     const int hungerCap = hungerThreshold * kChronicleMaxHungerMult;
     bool leader[raceCount] = {}, sasuke = false;
     d.barbs.reserve(n);
@@ -7689,7 +7728,12 @@ bool chronicleReadBarbs(FILE* f, int words, chronicleData& d, const char*& why) 
                && chronGetIn(f, 0, raceCount - 1, c.birthRace) && chronGetIn(f, 0, traitCount - 1, c.trait)
                && chronGetIn(f, 0, 1, c.leader) && chronGetIn(f, 0, hungerCap, c.hunger)
                && chronGetIn(f, 0, kChronicleMaxDay * 24, c.ageHours) && chronGetIn(f, -1, (int)d.houses.size() - 1, c.home);
+        if (ok && perBarb == kChronicleBarbWords)   // R58-F2 (v4)
+            ok = chronGetIn(f, -1, n - 1, c.parentA) && chronGetIn(f, -1, n - 1, c.parentB)
+              && chronGetIn(f, -1, kDynastyCount - 1, c.dynasty);
         if (!ok) { why = "barb out of range"; return false; }
+        if (c.parentA == i) c.parentA = -1;   // nobody is their own parent
+        if (c.parentB == i) c.parentB = -1;
         if (c.name < 0) { if (sasuke) { why = "two Sasukes"; return false; } sasuke = true; }
         if (c.leader) { if (leader[c.race]) { why = "two leaders of one race"; return false; } leader[c.race] = true; }
         d.barbs.push_back(c);
@@ -7737,7 +7781,8 @@ bool chronicleRead(chronicleData& out, const char*& why) {
     const int offMax = (int)worldSize;
     do {
         if (!chronGet(f, v) || v != kChronicleMagic) { why = "not a chronicle file"; break; }
-        if (!chronGet(f, v) || (v != kChronicleVersion && v != kChronicleVersionEras && v != kChronicleVersionNoEras)) {
+        if (!chronGet(f, v) || (v != kChronicleVersion && v != kChronicleVersionBlocks && v != kChronicleVersionEras
+                                && v != kChronicleVersionNoEras)) {
             why = "unknown version"; break;
         }
         int version = v;
@@ -7783,7 +7828,7 @@ bool chronicleRead(chronicleData& out, const char*& why) {
                 if (tag == kChronicleBlockBarbs) {
                     if (haveBarbs) { why = "two barb blocks"; break; }
                     haveBarbs = true;
-                    if (!chronicleReadBarbs(f, words, d, why)) break;
+                    if (!chronicleReadBarbs(f, words, version, d, why)) break;
                 } else if (tag == kChronicleBlockKnow) {   // R55-F2
                     if (d.haveKnow) { why = "two know blocks"; break; }
                     if (!chronicleReadKnow(f, words, d, why)) break;
@@ -9115,6 +9160,30 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
             b.name = barbNames[k];
         }
     }
+    // R58-F2: a house birth's parents are the two nearest grown, living barbs of its race, house-mates first; founders and
+    // returners get none here (chronicleRestoreBarbs() remaps a returner's saved parents once every returner exists)
+    b.parentAId = b.parentBId = -1;
+    b.dynastyIdx = saved ? (saved->dynasty >= 0 && saved->dynasty < kDynastyCount ? saved->dynasty : -1) : -1;
+    if (!saved && homeHouse >= 0) {
+        int best[2] = {-1, -1};
+        long long key[2] = {0, 0};
+        for (int k = 0; k < (int)barbs.size(); k++) {
+            const barb& p = barbs[k];
+            if (p.race != b.race || p.health <= 0 || lifeStage(p) == stageChild) continue;
+            long long dx = p.x - b.x, dy = p.y - b.y;
+            long long kk = (p.homeHouse == homeHouse ? 0LL : (1LL << 40)) + dx * dx + dy * dy;
+            if (best[0] < 0 || kk < key[0]) { best[1] = best[0]; key[1] = key[0]; best[0] = k; key[0] = kk; }
+            else if (best[1] < 0 || kk < key[1]) { best[1] = k; key[1] = kk; }
+        }
+        if (best[0] >= 0) b.parentAId = barbs[best[0]].id;
+        if (best[1] >= 0) b.parentBId = barbs[best[1]].id;
+        for (int k : best)   // the house passes down from parent A first, then parent B
+            if (k >= 0 && b.dynastyIdx < 0 && barbs[k].dynastyIdx >= 0) b.dynastyIdx = barbs[k].dynastyIdx;
+        if (best[0] >= 0)
+            printf("LINEAGE - %s born to %s%s%s%s%s\n", b.name, barbs[best[0]].name, best[1] >= 0 ? " and " : "",
+                   best[1] >= 0 ? barbs[best[1]].name : "", b.dynastyIdx >= 0 ? ", House " : "",
+                   b.dynastyIdx >= 0 ? kDynastyNames[b.dynastyIdx] : "");
+    }
     barbs.push_back(b);
     Vector2f bodySize = raceOf(b).bodySize;   // hitbox = drawn body, so hover/collision match what you see
     RectangleShape sq;
@@ -9124,6 +9193,47 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     squares.push_back(sq);
     rings.push_back({Vector2f(b.x, b.y) + bodySize / 2.0f}); // centred on the body
     printf("%s - %s the %s (%s)%s\n", saved ? "BARB RETURNS" : "BARB BORN", b.name, traitOf(b).name, raceOf(b).name, b.shinobi ? " - shinobi" : "");
+}
+
+// R58-F2: the one heir lookup, shared by loseLeader() (succession) and leaderTick() (the circlet, via refreshHeir()).
+// Index of the eldest living child of parentId (either parent slot) in race r, or -1. Looked up by id every call.
+int crownHeir(const vector<barb>& barbs, int r, int parentId) {
+    if (parentId < 0 || r < 0 || r >= raceCount) return -1;
+    int pick = -1;
+    for (int i = 0; i < (int)barbs.size(); i++) {
+        const barb& c = barbs[i];
+        if (c.id == parentId || c.race != r || c.health <= 0) continue;   // health 0 = dying this tick
+        if (c.parentAId != parentId && c.parentBId != parentId) continue;
+        if (pick < 0 || c.bornHour < barbs[pick].bornHour || (c.bornHour == barbs[pick].bornHour && c.id < barbs[pick].id)) pick = i;
+    }
+    return pick;
+}
+void refreshHeir(const vector<barb>& barbs, int r) {
+    int h = raceElected[r] ? crownHeir(barbs, r, raceLeaderId[r]) : -1;
+    raceHeirId[r] = h >= 0 ? barbs[h].id : -1;
+}
+
+// R58-F2: every crowning (election, inheritance, chronicle return) goes through here. A leader with no house founds one
+// (first name no living barb holds, else any), and its living children of the race join it.
+void crownBarb(vector<barb>& barbs, int i, int r) {
+    if (i < 0 || i >= (int)barbs.size() || r < 0 || r >= raceCount) return;
+    barb& b = barbs[i];
+    raceElected[r] = true;
+    raceLeaderId[r] = b.id;
+    raceLeaderName[r] = b.name;
+    if (b.dynastyIdx < 0 || b.dynastyIdx >= kDynastyCount) {
+        bool used[kDynastyCount] = {};
+        for (auto& o : barbs) if (o.dynastyIdx >= 0 && o.dynastyIdx < kDynastyCount) used[o.dynastyIdx] = true;
+        int pick = -1;
+        for (int k = 0; k < kDynastyCount && pick < 0; k++) if (!used[k]) pick = k;
+        if (pick < 0) pick = uniform_int_distribution<int>(0, kDynastyCount - 1)(gen);
+        b.dynastyIdx = pick;
+        for (auto& o : barbs)
+            if (o.race == r && o.dynastyIdx < 0 && (o.parentAId == b.id || o.parentBId == b.id)) o.dynastyIdx = pick;
+        printf("DYNASTY - %s founds the House of %s (%s)\n", b.name, kDynastyNames[pick], racePlurals[r]);
+    }
+    raceLeaderDynasty[r] = b.dynastyIdx;
+    refreshHeir(barbs, r);
 }
 
 // R55-F4: right after chronicleRestore() (houses are back, so d.houseNewId is filled). A v3 file's barbs replace this run's
@@ -9142,7 +9252,10 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
     rings.clear();
     for (auto& u : barbNameUsed) u = false;
     sasukeTaken = true;   // a Sasuke comes back only from the file; nobody else may roll the name
-    for (int r = 0; r < raceCount; r++) { raceLeaderId[r] = -1; raceElected[r] = false; raceNeed[r] = needNone; }
+    for (int r = 0; r < raceCount; r++) {
+        raceLeaderId[r] = -1; raceElected[r] = false; raceNeed[r] = needNone;
+        raceLeaderName[r] = ""; raceLeaderDynasty[r] = -1; raceHeirId[r] = -1;   // R58-F2
+    }
     uniform_int_distribution<int> spread(-30, 30);
     int homeless = 0;
     for (auto& c : d.barbs) {
@@ -9150,8 +9263,16 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
         if (c.home >= 0 && home < 0) homeless++;
         Vector2f qc = quarterCentre(c.race);
         makeBarb(Vector2i((int)qc.x + spread(gen), (int)qc.y + spread(gen)), barbs, squares, rings, home, c.race, &c);
-        if (c.leader) { raceElected[c.race] = true; raceLeaderId[c.race] = barbs.back().id; }
     }
+    // R58-F2: barbs[k] is file barb k (cleared above, made in file order), so saved parent indices become this run's ids.
+    // A v3 file has every parent at -1.
+    for (int k = 0; k < (int)d.barbs.size() && k < (int)barbs.size(); k++) {
+        const chronicleBarb& c = d.barbs[k];
+        barbs[k].parentAId = c.parentA >= 0 && c.parentA < (int)barbs.size() ? barbs[c.parentA].id : -1;
+        barbs[k].parentBId = c.parentB >= 0 && c.parentB < (int)barbs.size() ? barbs[c.parentB].id : -1;
+    }
+    for (int k = 0; k < (int)d.barbs.size() && k < (int)barbs.size(); k++)
+        if (d.barbs[k].leader) crownBarb(barbs, k, d.barbs[k].race);   // crowned again directly (no election line)
     vector<int> order((int)barbs.size());
     for (int i = 0; i < (int)order.size(); i++) order[i] = i;
     stable_sort(order.begin(), order.end(), [&](int a, int b) { return barbs[a].bornHour < barbs[b].bornHour; });   // oldest first
@@ -9574,18 +9695,54 @@ void drawTitlePips(RenderWindow& window, const FloatRect& camRect, float zoom) {
 // R28-F2: dawn elections. Each leaderless race with enough members puts up its best-liked member;
 // every other member approves with raceTraitLike odds. More than half wins the crown, else retry next dawn.
 // R30-F2: the only place a leader is cleared, so the race drops back to global weights the same tick
-void loseLeader(int r) {
+void rankRaceNeed(const vector<barb>& barbs, int r);   // defined with leaderTick()
+// R58-F2: then offers the crown to crownHeir() at once. The race votes on the heir (raceTraitLike + kHeirBloodBonus, the
+// heir approves itself); a majority crowns it, otherwise (or with no heir) the race waits for the dawn election.
+// Safe from removeBarb(): the dying leader is skipped by id, other barbs dying this tick by health.
+void loseLeader(vector<barb>& barbs, int r) {
+    int deadId = raceLeaderId[r];
+    const char* deadName = raceLeaderName[r];
+    int deadDynasty = raceLeaderDynasty[r];
     printf("LEADER LOST - %s leader id %d is gone, %s back to global weights\n", racePlurals[r], raceLeaderId[r], racePlurals[r]);
     logEvent(string(racePlurals[r]) + " lost their leader");
     raceElected[r] = false;
     raceLeaderId[r] = -1;
     raceNeed[r] = needNone;
+    raceLeaderName[r] = "";
+    raceLeaderDynasty[r] = -1;
+    raceHeirId[r] = -1;
+    int h = crownHeir(barbs, r, deadId);
+    if (h < 0) {
+        printf("SUCCESSION - %s: %s left no living heir, the crown goes to the dawn election\n", racePlurals[r], deadName);
+        return;
+    }
+    const barb& heir = barbs[h];
+    bernoulli_distribution approve(min(1.0f, raceTraitLike[r][heir.trait] + kHeirBloodBonus));
+    int members = 0, yes = 0;
+    for (auto& m : barbs) {
+        if (m.race != r || m.health <= 0 || m.id == deadId) continue;
+        members++;
+        yes += (m.id == heir.id || approve(gen)) ? 1 : 0;
+    }
+    string tally = to_string(yes) + " of " + to_string(members);
+    if (yes * 2 <= members) {
+        printf("SUCCESSION - %s pass over %s, child of %s (%s approve): the crown goes to the dawn election\n", racePlurals[r],
+               heir.name, deadName, tally.c_str());
+        logEvent(string(racePlurals[r]) + " pass over " + heir.name + " - the crown goes to a vote");
+        return;
+    }
+    if (deadDynasty >= 0 && deadDynasty < kDynastyCount) barbs[h].dynastyIdx = deadDynasty;   // the crown's house goes with it
+    crownBarb(barbs, h, r);
+    rankRaceNeed(barbs, r);   // the need is named at once; orders wait for dawn
+    printf("SUCCESSION - %s, child of %s, inherits the %s crown, House of %s (%s approve)\n", barbs[h].name, deadName,
+           raceDefs[r].name, kDynastyNames[clamp(barbs[h].dynastyIdx, 0, kDynastyCount - 1)], tally.c_str());
+    logEvent(string(barbs[h].name) + ", child of " + deadName + ", inherits the crown");
 }
 
 // R30-F2: every tick, so a dead leader's need never outlives them
-void leaderWatchTick(const vector<barb>& barbs) {
+void leaderWatchTick(vector<barb>& barbs) {
     for (int r = 0; r < raceCount; r++)
-        if (raceElected[r] && findBarbById(barbs, raceLeaderId[r]) < 0) loseLeader(r);
+        if (raceElected[r] && findBarbById(barbs, raceLeaderId[r]) < 0) loseLeader(barbs, r);
 }
 
 // R31-F1: the one undo for a queued keep: refunds the reserved stone to the race and clears the guard with it, so the
@@ -10141,7 +10298,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     endActivity(b, actEnvoy);
     clearSick(b);                                 // R52-F4
     clearKneel(b);                                // R52-F3: explicit, though releaseBarbWork()'s clearTraining() already did it
-    if (isLeader(b)) loseLeader(b.race);
+    if (isLeader(b)) loseLeader(barbs, b.race);   // R58-F2: may crown the heir; b stays valid (no barb is added or moved)
     printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
     addGrave(b, squares[i]);   // R47-F9: copied out by value; nothing in graves points back at barbs
@@ -11120,8 +11277,11 @@ void orderTick(vector<barb>& barbs) {
 
 void leaderTick(vector<barb>& barbs) {
     for (int r = 0; r < raceCount; r++) {
-        if (raceElected[r] && findBarbById(barbs, raceLeaderId[r]) < 0) loseLeader(r);   // leader gone: no leader, may elect again
-        if (raceElected[r]) { rankRaceNeed(barbs, r); issueOrders(barbs, r); continue; }   // INBOX-F2b
+        if (raceElected[r] && findBarbById(barbs, raceLeaderId[r]) < 0) loseLeader(barbs, r);   // leader gone: heir, else may elect again
+        if (raceElected[r]) {
+            refreshHeir(barbs, r);   // R58-F2: crownHeir() names the circlet wearer for the day (children born since, deaths)
+            rankRaceNeed(barbs, r); issueOrders(barbs, r); continue;   // INBOX-F2b
+        }
         vector<int> members;
         for (int i = 0; i < (int)barbs.size(); i++) if (barbs[i].race == r) members.push_back(i);
         if ((int)members.size() < electionThreshold) continue;
@@ -11132,7 +11292,8 @@ void leaderTick(vector<barb>& barbs) {
             if (like > best) { best = like; picks.clear(); }
             if (like == best) picks.push_back(i);
         }
-        const barb& cand = barbs[picks[uniform_int_distribution<int>(0, (int)picks.size() - 1)(gen)]];
+        int candIdx = picks[uniform_int_distribution<int>(0, (int)picks.size() - 1)(gen)];
+        const barb& cand = barbs[candIdx];
         bernoulli_distribution approve(best);
         int yes = 0;
         for (int i : members) yes += (barbs[i].id == cand.id || approve(gen)) ? 1 : 0;
@@ -11140,8 +11301,7 @@ void leaderTick(vector<barb>& barbs) {
         string who = string(cand.name) + " the " + traitOf(cand).name;
         string tally = to_string(yes) + " of " + to_string(n);
         if (yes * 2 > n) {
-            raceElected[r] = true;
-            raceLeaderId[r] = cand.id;
+            crownBarb(barbs, candIdx, r);   // R58-F2: may found a house; sets the heir
             printf("ELECTION - %s crown %s, barb %d (%s approve)\n", racePlurals[r], who.c_str(), cand.id, tally.c_str());
             logEvent(string(racePlurals[r]) + " crown " + who + " (" + tally + " approve)");
             rankRaceNeed(barbs, r);   // R30-F2: the new leader names a need this same dawn
