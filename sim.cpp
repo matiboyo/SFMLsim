@@ -836,6 +836,28 @@ const Vector2f kSiegeBarSize(14.0f, 2.0f);    // health bar centred over the gat
 const float kSiegeBarGapPx = 4.0f;            // between the bar and the higher tower's pole top (clears rammers' spears)
 const Color kSiegeBarBackColor(24, 20, 20, 170);   // dark translucent track
 const Color kSiegeBarColor(204, 62, 50);      // muted red fill, in the raid red family
+// R58-F1 Vassal Crown, phase 1: a raid that broke the gate (Siege) and then won the crate fight binds the defender to the
+// attacker as its vassal (vassalOf[def].lord = att). Cycles are rejected, a bond is never changed in the season it was
+// made, and every link touching a race is cleared once that race has nobody left. Once per season leanSeasonTick() moves
+// a capped tribute vassal -> lord through transferCoin() (paidSeason makes it idempotent). Visuals: a thin translucent
+// gold chain between the two crates, a bright two-tone pennant on the vassal's gate tower, a coin pip at the lord's crate
+// on payday. Rebellion is phase 2 (a vassal beating its lord only gets a ticker line).
+const float kTributeFrac = 0.25f;             // share of the vassal's purse paid each season...
+const int kVassalTributeMax = 8;              // ...capped here, and never above the purse itself
+const float kVassalChainStepPx = 4.0f;        // one 2x2 link every this many px along the crate-to-crate line
+const float kVassalChainLinkPx = 2.0f;
+const float kVassalChainInsetPx = 9.0f;       // the chain starts/ends this far from each crate centre (off the lids)
+const Color kVassalChainColor(226, 192, 98, 110);      // translucent gold link
+const Color kVassalChainDimColor(170, 138, 70, 80);    // every other link a shade darker, so it reads as a chain
+const float kVassalPennantPoleH = 4.0f;       // left corner merlon pole, 1px taller than the race pennant pole (towerPoleH 3)
+const Vector2f kVassalFlagSize(3.0f, 2.0f);   // flies right from the pole top, clear of the race flag on the right pole
+const Color kVassalFlagColor(255, 234, 120);  // pale lemon gold on top: lighter/greener than the crown (250,208,64)...
+const Color kVassalFlagHemColor(196, 148, 40);   // ...over a deep ochre hem row, so it never reads as a solid crown pip
+const Vector2f kVassalCoinPipSize(2.0f, 2.0f);
+const float kVassalCoinPipGapPx = 1.0f;       // right of the crate lid by this gap, top row, above the trader's spot
+const Color kVassalCoinPipColor(240, 214, 112);
+const int kVassalCoinPipFrames = 180;         // drawn frames the payday pip shows (~3s at 60fps)
+const Color kVassalTickerTint(232, 204, 120); // pale gold: apart from the raid reds and the envoy tribute gold
 // R53-F1 Plunder, raid phase 2: on a won raid each unbeaten raider lifts one capped pack from the rival race's stock,
 // deducted at pickup, and carries it home as a 2px bundle at 0.8x walk. settleLoot() is the one way a pack ends: deposited
 // at the home crate, or dropped (abort, release away from home, death), in which case it goes back to the robbed race.
@@ -3481,12 +3503,30 @@ struct raidParty {
     int fightTicks = 0, holdTicks = 0, scanTimer = 0;
     int defendersBeaten = 0;
     bool won = false;                       // outcome, for the walk home
+    bool gateBroken = false;                // R58-F1: the Siege broke the gate (a won raid then makes a vassal)
 };
 raidParty raid;
 // R57-F2: per-race gate strength, lowered only by the Siege rams and restored by resetSiege() whenever a raid ends;
 // gateFlash[r] = drawn frames left of the white flash across race r's gate gap
 int gateHp[raceCount] = {kGateHpMax, kGateHpMax, kGateHpMax};
 int gateFlash[raceCount] = {0, 0, 0};
+// R58-F1: vassalOf[r].lord = the race r pays tribute to (-1 = free). paidSeason = absolute season (game_day /
+// daysPerSeason) of the last payday; it is set to the binding season too, so the first tribute falls next season.
+// boundSeason = season the bond was made or cleared: no re-vassalizing within it. Not touched by resetSiege().
+struct vassalage {
+    int lord = -1;
+    int paidSeason = -1;
+    int boundSeason = -1;
+};
+vassalage vassalOf[raceCount];
+int vassalCoinPip[raceCount] = {0, 0, 0};   // R58-F1: drawn frames left of the payday pip at lord race r's crate
+int absSeason() { return game_day / daysPerSeason; }
+// true if `lord` is `r` or (transitively) one of r's vassals' vassals: binding r under lord would close a cycle
+bool vassalCycle(int r, int lord) {
+    for (int k = 0, x = lord; k <= raceCount && x >= 0 && x < raceCount; k++, x = vassalOf[x].lord)
+        if (x == r) return true;
+    return false;
+}
 void resetSiege() {
     for (auto& h : gateHp) h = kGateHpMax;
     for (auto& f : gateFlash) f = 0;
@@ -9914,6 +9954,20 @@ void drawGateTowers(RenderWindow& window) {
             s.setSize(towerFlagSize);
             s.setPosition(o + towerPolePos + Vector2f(1.0f, 0.0f));
             window.draw(s);
+            if (vassalOf[r].lord >= 0 && &t == &towers[r][0]) {   // R58-F1: vassal pennant on the left corner merlon
+                s.setFillColor(keepPoleColor);
+                s.setSize(Vector2f(1.0f, kVassalPennantPoleH));
+                s.setPosition(o + Vector2f(0.0f, -kVassalPennantPoleH));
+                window.draw(s);
+                s.setFillColor(kVassalFlagColor);
+                s.setSize(Vector2f(kVassalFlagSize.x, kVassalFlagSize.y - 1.0f));
+                s.setPosition(o + Vector2f(1.0f, -kVassalPennantPoleH));
+                window.draw(s);
+                s.setFillColor(kVassalFlagHemColor);
+                s.setSize(Vector2f(kVassalFlagSize.x, 1.0f));
+                s.setPosition(o + Vector2f(1.0f, -kVassalPennantPoleH + kVassalFlagSize.y - 1.0f));
+                window.draw(s);
+            }
         }
     }
 }
@@ -11760,6 +11814,112 @@ void raidPlunder(vector<barb>& barbs, const int (&ri)[kRaidPartySize]) {
     setRelation(att, def, raceRelation[att][def] - kLootRelationDelta);
 }
 
+// R58-F1: the one way a bond is made, after a raid that broke def's gate and won the crate fight. Rejected (with a
+// printf, and a ticker line for a vassal beating its own lord) when it would close a cycle, when def already serves att,
+// or when def's bond already changed this season. Re-binding an older vassal to a new lord replaces the old link.
+void bindVassal(int att, int def) {
+    if (att < 0 || att >= raceCount || def < 0 || def >= raceCount || att == def) return;
+    vassalage& v = vassalOf[def];
+    int season = absSeason();
+    if (v.lord == att) { printf("VASSAL KEPT - %s already serve the %s\n", racePlurals[def], racePlurals[att]); return; }
+    if (vassalCycle(def, att)) {
+        printf("VASSAL REJECTED - %s over %s would close a cycle\n", racePlurals[att], racePlurals[def]);
+        if (vassalOf[att].lord == def)   // the vassal beat its own lord: phase 2 turns this into a rebellion
+            logEvent(string(racePlurals[att]) + " humble their lords the " + racePlurals[def] + ", but their oath still binds",
+                     kVassalTickerTint);
+        return;
+    }
+    if (v.boundSeason == season) {
+        printf("VASSAL REJECTED - %s bond already changed this season (%d)\n", racePlurals[def], season);
+        return;
+    }
+    int oldLord = v.lord;
+    v.lord = att;
+    v.paidSeason = season;   // no payday in the season of conquest
+    v.boundSeason = season;
+    string line = string(racePlurals[def]) + " bend the knee: vassals of the " + racePlurals[att]
+                  + (oldLord >= 0 ? string(" (no longer the ") + racePlurals[oldLord] + "')" : string(""));
+    printf("---VASSALAGE--- %s, season %d\n", line.c_str(), season);
+    logEvent(line, kVassalTickerTint);
+}
+
+// R58-F1: clears every link touching a race with nobody left (as vassal and as lord), so no tribute or chain outlives it
+void vassalWatchTick(const vector<barb>& barbs) {
+    bool any = false;
+    for (auto& v : vassalOf) any = any || v.lord >= 0;
+    if (!any) return;
+    int living[raceCount] = {};
+    for (auto& b : barbs) if (b.health > 0) living[clampRace(b.race)]++;
+    for (int r = 0; r < raceCount; r++) {
+        if (living[r] > 0) continue;
+        int season = absSeason();
+        if (vassalOf[r].lord >= 0) {
+            printf("VASSAL CLEARED - %s gone, bond to the %s dropped\n", racePlurals[r], racePlurals[vassalOf[r].lord]);
+            vassalOf[r].lord = -1;
+            vassalOf[r].boundSeason = season;
+        }
+        for (int v = 0; v < raceCount; v++) {
+            if (vassalOf[v].lord != r) continue;
+            vassalOf[v].lord = -1;
+            vassalOf[v].boundSeason = season;
+            string line = string(racePlurals[v]) + " are freed: their lords the " + racePlurals[r] + " are no more";
+            printf("---VASSAL FREED--- %s\n", line.c_str());
+            logEvent(line, kVassalTickerTint);
+        }
+    }
+}
+
+// R58-F1: called from leanSeasonTick(). Each bound vassal pays once per absolute season: kTributeFrac of its purse,
+// capped at kVassalTributeMax and at the purse itself, through transferCoin(). paidSeason is set whether or not any coin
+// moved, so a payday is never retried (or paid twice) within the season.
+void vassalTributeTick() {
+    int season = absSeason();
+    for (int v = 0; v < raceCount; v++) {
+        vassalage& vs = vassalOf[v];
+        int lord = vs.lord;
+        if (lord < 0 || lord >= raceCount || lord == v || vs.paidSeason == season) continue;
+        vs.paidSeason = season;
+        int amount = min(min(kVassalTributeMax, (int)(purse[v] * kTributeFrac)), purse[v]);
+        if (amount <= 0 || !transferCoin(v, lord, amount)) {
+            printf("VASSAL TRIBUTE - %s purse too thin (%d), nothing paid to the %s\n", racePlurals[v], purse[v], racePlurals[lord]);
+            logEvent(string(racePlurals[v]) + " have no coin to spare for their lords the " + racePlurals[lord], kVassalTickerTint);
+            continue;
+        }
+        vassalCoinPip[lord] = kVassalCoinPipFrames;
+        string line = string(racePlurals[v]) + " pay " + to_string(amount) + "c tribute to their lords the " + racePlurals[lord];
+        printf("---VASSAL TRIBUTE--- %s (purses %d / %d), season %d\n", line.c_str(), purse[v], purse[lord], season);
+        logEvent(line, kVassalTickerTint);
+    }
+}
+
+// R58-F1: world layer with the crate markers (under barbs and trees). One chain per bond, rebuilt every frame from
+// vassalOf: 2x2 translucent gold links every kVassalChainStepPx along the line between the two crate centres,
+// alternating two shades, inset off both lids. Then the coin pip right of each lord crate on payday.
+void drawVassalChains(RenderWindow& window, bool paused) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (int v = 0; v < raceCount; v++) {
+        int lord = vassalOf[v].lord;
+        if (lord < 0 || lord >= raceCount || lord == v) continue;
+        Vector2f a = quarterCentre(v), b = quarterCentre(lord), d = b - a;
+        float len = sqrt(d.x * d.x + d.y * d.y);
+        if (len <= 2.0f * kVassalChainInsetPx) continue;
+        Vector2f u = d / len;
+        int k = 0;
+        for (float t = kVassalChainInsetPx; t <= len - kVassalChainInsetPx; t += kVassalChainStepPx, k++) {
+            Vector2f p = a + u * t - Vector2f(kVassalChainLinkPx, kVassalChainLinkPx) / 2.0f;
+            pushQuad(va, Vector2f(floor(p.x), floor(p.y)), Vector2f(kVassalChainLinkPx, kVassalChainLinkPx),
+                 k % 2 == 0 ? kVassalChainColor : kVassalChainDimColor);
+        }
+    }
+    for (int r = 0; r < raceCount; r++) {
+        if (vassalCoinPip[r] <= 0) continue;
+        pushQuad(va, snapPx(storehousePos[r]) + Vector2f(storehouseSize.x + kVassalCoinPipGapPx, 0.0f), kVassalCoinPipSize, kVassalCoinPipColor);
+        if (!paused) vassalCoinPip[r]--;
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
 // R52-F1: runs after watchTick() and before bellTick() (which reads raidThreat[]). Owns every raider's and defender's
 // movement. Re-resolves every id each tick and drops a missing or dead member (its flags restored if it is still
 // there); under kRaidMinMembers raiders the raid breaks up. March: the column walks to the rival crate. Fight: inside
@@ -11892,6 +12052,7 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
         printf("---RAID SIEGE ENDS--- %s gate %s after %d ticks (%d hp)\n", racePlurals[def],
                broken ? "broken" : timedOut ? "held" : "gone", raid.siegeTicks, gateHp[def]);
         if (!line.empty()) logEvent(line, kRaidTickerTint);
+        raid.gateBroken = broken;   // R58-F1: only a broken gate can lead to vassalage
         for (int k = 0; k < kRaidPartySize; k++) if (ri[k] >= 0) { barbs[ri[k]].raidCooldown = 0; barbs[ri[k]].raidPreyId = -1; }
         raid.phase = raidParty::Fight;   // the crate walk; gateHp stays down until the raid ends
         raid.fightTicks = raid.holdTicks = raid.scanTimer = 0;
@@ -11987,6 +12148,7 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
             for (int k = 0; k < kRaidDefenderMax; k++) if (holders[k] >= 0) addRenown(barbs, holders[k], kRenownDefend, deedDefend);
         }
         if (won) raidPlunder(barbs, ri);   // R53-F1
+        if (won && raid.gateBroken) bindVassal(att, def);   // R58-F1
         return;
     }
 
@@ -14921,6 +15083,7 @@ void leanSeasonTick(const vector<barb>& barbs, vector<bush>& bushes, vector<Circ
         logEvent("Frost withers " + to_string(withered) + " berry bushes - no regrowth till spring", seasonDefs[seasonWinter].ticker);
     }
     wasWinter = winter;
+    vassalTributeTick();   // R58-F1: once per absolute season per vassal (paidSeason guards it)
 
     static int refresh = 0;
     if (refresh > 0) { refresh--; return; }
@@ -15235,6 +15398,7 @@ int main() {
                 orderTick(barbs);   // INBOX-F2b: after leaderWatchTick, so a dead leader's orders lapse the same tick
                 starveDeathTick(barbs, squares, smoke, dwarfForge, stores, fields);   // R30-F5: last, once per tick
                 stockShortageTick(barbs);   // RACE-F1: after deaths, so an emptied race never announces
+                vassalWatchTick(barbs);   // R58-F1: after deaths, a race with nobody left loses every bond both ways
                 checkWorldSync(wd);   // R56-F4: parallel pairs equal-sized after every tick (no-op unless SIM_DEBUG)
             }
         }
@@ -15314,6 +15478,7 @@ int main() {
 	drawHerbHut(window);    // R53-F2: herb hut + bed, above-right of the elf crate, under barbs
 	drawGarrison(window, barbs, houses, houseshapes, stores);   // INBOX-F1: bell marker, sheltering roof tint + pips
 	drawRaidMarker(window, frameCount);   // R52-F1: pulsing red marker on the raided crate, opposite corner to the bell
+	drawVassalChains(window, paused);   // R58-F1: translucent gold chain lord<->vassal crates + payday coin pip, under barbs
 	for (auto& st : stores) if (st.flashFrames > 0 && !paused) st.flashFrames--;
 	for (int r = 0; r < raceCount; r++)
 	    for (auto& fp : fields[r]) drawField(window, fp, r, frameCount);
