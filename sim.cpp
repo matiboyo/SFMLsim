@@ -818,6 +818,24 @@ const Color kRaidMarkerColor(222, 54, 46);    // alpha pulses between kRaidMarke
 const int kRaidMarkerAlphaMin = 90;
 const float kRaidMarkerPulseRate = 0.12f;     // radians per drawn frame (~0.9s period at 60fps)
 const Color kRaidTickerTint(222, 120, 104);   // launch and outcome ticker lines
+// R57-F2 Siege of the Gate, phase 1: a raid on a race whose keep, finished curtain wall and both gatehouse towers stand
+// stops at the gate first (Siege sub-phase between March and Fight). Raiders ram it from just outside the gap until
+// gateHp[def] runs out or kSiegeMaxTicks passes; either way they then make for the crate as before. gateHp is restored
+// whenever the raid ends (endRaid(), every exit). One red bar over the gatehouse while it is rammed, a 2-frame white
+// flash across the gap per blow, and a 1px ram lunge (visual-only frame counter, no particles). Towers fire in phase 2.
+const int kGateHpMax = 120;                   // three rams break it in ~15s, two in ~22s
+const int kSiegeRamDamage = 4;                // per blow
+const int kSiegeRamCooldownTicks = 90;        // ticks between blows per raider (~1.5s at 1x)
+const int kSiegeMaxTicks = 30 * 60;           // the gate holds after ~30s: the raiders go round to the crate
+const float kSiegeStandOutPx = 5.0f;          // ram spot: body centre this far outside the ring, on the gate bearing
+const float kSiegeRamSpreadPx = 4.0f;         // raiders side by side across the gap (2px gap between 2px bodies)
+const int kSiegeLungeFrames = 2;              // drawn frames the body steps 1px toward the gate on a blow
+const int kSiegeFlashFrames = 2;              // drawn frames of the white flash across the gap
+const Color kSiegeFlashColor(236, 236, 228);  // opaque like the wall blocks (overlapping samples never stack alpha); 2 frames only
+const Vector2f kSiegeBarSize(14.0f, 2.0f);    // health bar centred over the gate, above both towers' pennants
+const float kSiegeBarGapPx = 4.0f;            // between the bar and the higher tower's pole top (clears rammers' spears)
+const Color kSiegeBarBackColor(24, 20, 20, 170);   // dark translucent track
+const Color kSiegeBarColor(204, 62, 50);      // muted red fill, in the raid red family
 // R53-F1 Plunder, raid phase 2: on a won raid each unbeaten raider lifts one capped pack from the rival race's stock,
 // deducted at pickup, and carries it home as a 2px bundle at 0.8x walk. settleLoot() is the one way a pack ends: deposited
 // at the home crate, or dropped (abort, release away from home, death), in which case it goes back to the robbed race.
@@ -3334,6 +3352,7 @@ struct barb {
     int raidCooldown = 0;        // R52-F1: ticks until the next strike
     bool raidBeaten = false;     // R52-F1: knocked down to kRaidHealthFloor; out of the fight
     int raidFlash = 0;           // R52-F1: hit flash, drawn frames left (counted down in main after drawBarbs())
+    int siegeLunge = 0;          // R57-F2: ram lunge, drawn frames left (visual only; counted down in main after drawBarbs())
     int sick = 0;                // R52-F4: ticks of cough left (0 = well); set only by catchCough(), cleared by clearSick()
     int sickImmune = 0;          // R52-F4: ticks of immunity left after a recovery
     int cure = 0;                // R52-F4: reserved for phase 2 (herb hut remedy); unused in phase 1
@@ -3452,9 +3471,10 @@ int relicCarrierId() {
 // R52-F1: the one raid. Raiders and defenders are held by barb id (never an index) and re-resolved by raidTick() every
 // tick; a missing id is dropped there, and removeBarb() invalidates a dying member's id through raidMemberLost().
 struct raidParty {
-    enum Phase {March, Fight, Home} phase = March;
+    enum Phase {March, Siege, Fight, Home} phase = March;   // R57-F2: Siege only when siegeReady(def) at the alarm
     bool active = false;
     int att = -1, def = -1;                 // aggressor and target race
+    int siegeTicks = 0;                     // R57-F2: ticks at the gate (kSiegeMaxTicks timeout)
     int raiderIds[kRaidPartySize] = {-1, -1, -1};
     int defenderIds[kRaidDefenderMax] = {-1, -1, -1};
     int ticks = 0;                          // since launch (kRaidMaxTicks backstop)
@@ -3463,6 +3483,30 @@ struct raidParty {
     bool won = false;                       // outcome, for the walk home
 };
 raidParty raid;
+// R57-F2: per-race gate strength, lowered only by the Siege rams and restored by resetSiege() whenever a raid ends;
+// gateFlash[r] = drawn frames left of the white flash across race r's gate gap
+int gateHp[raceCount] = {kGateHpMax, kGateHpMax, kGateHpMax};
+int gateFlash[raceCount] = {0, 0, 0};
+void resetSiege() {
+    for (auto& h : gateHp) h = kGateHpMax;
+    for (auto& f : gateFlash) f = 0;
+    raid.siegeTicks = 0;
+}
+// R57-F2: the siege needs the whole gatehouse: keep standing, the curtain wall finished and both towers built
+bool siegeReady(int r) {
+    if (r < 0 || r >= raceCount || !keeps[r].built || wallNextOrder[r] < wallSegMax) return false;
+    for (auto& t : towers[r]) if (t.race < 0 || !t.built) return false;
+    return true;
+}
+// R57-F2: unit bearing from the keep centre out through the gate (slot 0 faces the campfire), and the gap's ring point
+Vector2f gateBearing(int r) {
+    Vector2f kc = Vector2f((float)keeps[r].x, (float)keeps[r].y) + keepSize / 2.0f;   // same centre as wallCentre()
+    float a = atan2(villageCenter.y - kc.y, villageCenter.x - kc.x);
+    return Vector2f(cos(a), sin(a));
+}
+Vector2f gatePoint(int r) {
+    return Vector2f((float)keeps[r].x, (float)keeps[r].y) + keepSize / 2.0f + gateBearing(r) * wallRingRadius;
+}
 bool raidThreat[raceCount] = {};            // R52-F1: set by raidTick() (runs first), read by bellTick() like a wolf at the crate
 int raidPairCooldown[raceCount][raceCount] = {
     {kRaidPairCooldownTicks, kRaidPairCooldownTicks, kRaidPairCooldownTicks},
@@ -3636,6 +3680,7 @@ void endActivity(barb& b) {
             b.raidPreyId = -1;
             b.raidCooldown = 0;
             b.raidBeaten = false;
+            b.siegeLunge = 0;    // R57-F2
             break;
         case actTemper:      // R41-F2: refund the stone if still owed (the finish path clears temperPaid first)
             if (b.temperPaid) {
@@ -4254,6 +4299,7 @@ const char* barbTaskName(const barb& b) {
         return raid.phase == raidParty::Home ? (lootLaden(b) ? "raiding: carrying plunder home" : "raiding: heading home")   // R53-F1
              : b.raidBeaten ? "raiding: beaten"
              : raid.phase == raidParty::Fight ? (b.raidPreyId >= 0 ? "raiding: fighting" : "raiding: at the crate")
+             : raid.phase == raidParty::Siege ? "raiding: ramming the gate"   // R57-F2
              : "raiding: on the march";
     if (b.activity == actCaravan)   // R54-F1
         return caravan.phase == caravanTrip::Trade ? "caravan: trading at the crate"
@@ -5534,6 +5580,12 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
         bool walking = b.moving && !working;
 
         Vector2f base = snapPx(squares[i].getPosition());
+        if (b.siegeLunge > 0 && raid.active && raid.phase == raidParty::Siege && raid.def >= 0 && raid.def < raceCount) {
+            // R57-F2: the whole sprite steps 1px toward the gate on a blow (draw-only; the hitbox stays put)
+            Vector2f d = gatePoint(raid.def) - (squares[i].getPosition() + squares[i].getSize() / 2.0f);
+            float len = sqrt(d.x * d.x + d.y * d.y);
+            if (len > 0.5f) base += Vector2f(round(d.x / len), round(d.y / len));
+        }
         float feet = base.y + squares[i].getSize().y;    // bottom edge of the hitbox
         float bob = (walking && (phase / barbBobFrames) % 2 == 1) ? -barbBobPx : 0.0f;
         float bodyH = bodySize.y;   // R57-F1: droop (and stoop) come from barbDrawnBody(), same as fishPoseOf()
@@ -11451,7 +11503,15 @@ void endRaid(vector<barb>& barbs, bool home = false) {
     for (int id : raid.raiderIds) { int i = findBarbById(barbs, id); if (i >= 0) releaseRaidBarb(barbs[i], home); }
     for (int id : raid.defenderIds) { int i = findBarbById(barbs, id); if (i >= 0) releaseRaidBarb(barbs[i]); }
     raid = raidParty{};
+    resetSiege();   // R57-F2: every exit (home, broken/wiped party, abandoned) restores the gates and drops the siege state
     for (auto& t : raidThreat) t = false;
+}
+
+// R57-F2: raider k's ram spot at race r's gate (hitbox top-left for a body of `size`): just outside the gap, side by side
+Vector2f siegeRamSpot(int r, int k, Vector2f size) {
+    Vector2f u = gateBearing(r), across(-u.y, u.x);
+    Vector2f c = gatePoint(r) + u * kSiegeStandOutPx + across * (kSiegeRamSpreadPx * (k - (kRaidPartySize - 1) / 2.0f));
+    return snapPx(c - size / 2.0f);
 }
 
 Vector2f raidCentre(const RectangleShape& sq) { return sq.getPosition() + sq.getSize() / 2.0f; }
@@ -11532,6 +11592,7 @@ void tryLaunchRaid(vector<barb>& barbs, vector<RectangleShape>& squares, const s
         if (!ok) continue;
         if (trySendEnvoy(barbs, att, def)) return;   // R56-F2: the column stays home while the envoy walks
         raid = raidParty{};
+        resetSiege();   // R57-F2: every launch starts at full gates (endRaid() already did; defensive)
         raid.active = true;
         raid.att = att;
         raid.def = def;
@@ -11777,6 +11838,14 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
             if (ri[k] < 0) continue;
             Vector2f d = raidCentre(squares[ri[k]]) - quarterCentre(def);
             if (d.x * d.x + d.y * d.y < kRaidAlarmPx * kRaidAlarmPx) {
+                if (siegeReady(def)) {   // R57-F2: keep, finished wall and both towers stand: the gate first
+                    raid.phase = raidParty::Siege;
+                    raid.siegeTicks = 0;
+                    gateHp[def] = kGateHpMax;
+                    printf("RAID SIEGE - %s reach the %s gate (%d hp)\n", racePlurals[att], racePlurals[def], gateHp[def]);
+                    logEvent(string(racePlurals[att]) + " lay siege to the " + racePlurals[def] + "' gate", kRaidTickerTint);
+                    break;
+                }
                 raid.phase = raidParty::Fight;
                 raid.fightTicks = raid.holdTicks = raid.scanTimer = 0;
                 printf("RAID AT THE GATES - %s reach the %s crate\n", racePlurals[att], racePlurals[def]);
@@ -11784,6 +11853,49 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
             }
         }
         if (raid.phase == raidParty::March) return;
+    }
+
+    // R57-F2: Siege. The bell stays silent here (it rings when the fight starts, so defenders are called up before the
+    // shelter takes them in, as before). Each raider walks to its ram spot outside the gap and rams on its own cooldown;
+    // the gate breaking or kSiegeMaxTicks running out both fall back to the old crate walk (Fight). A gatehouse that is
+    // somehow no longer whole drops straight to the old path too.
+    if (raid.phase == raidParty::Siege) {
+        raid.siegeTicks++;
+        bool broken = false;
+        for (int k = 0; k < kRaidPartySize && siegeReady(def); k++) {
+            int i = ri[k];
+            if (i < 0) continue;
+            barb& b = barbs[i];
+            auto& sq = squares[i];
+            if (b.raidCooldown > 0) b.raidCooldown--;
+            Vector2f spot = siegeRamSpot(def, k, sq.getSize());
+            b.targetx = (int)spot.x;
+            b.targety = (int)spot.y;
+            Vector2f diff = spot - sq.getPosition();
+            if (diff.x * diff.x + diff.y * diff.y >= 1.0f) { b.moving = true; walkStep(b, sq); continue; }
+            sq.setPosition(spot);
+            if (b.moving) { b.moving = false; clearRoute(b); b.stepTimer = 0; }
+            if (b.raidCooldown > 0 || gateHp[def] <= 0) continue;
+            b.raidCooldown = kSiegeRamCooldownTicks;
+            b.siegeLunge = kSiegeLungeFrames;
+            gateFlash[def] = kSiegeFlashFrames;
+            gateHp[def] = max(0, gateHp[def] - kSiegeRamDamage);
+            printf("GATE RAMMED - %s (id %d) rams the %s gate, %d hp left\n", b.name, b.id, racePlurals[def], gateHp[def]);
+            if (gateHp[def] <= 0) broken = true;
+        }
+        bool timedOut = raid.siegeTicks > kSiegeMaxTicks;
+        bool gone = !siegeReady(def);
+        if (!broken && !timedOut && !gone) return;
+        string line = broken ? string(racePlurals[att]) + " break the " + racePlurals[def] + "' gate"
+                    : timedOut ? string("The ") + racePlurals[def] + "' gate holds; the " + racePlurals[att] + " go round to the crate"
+                    : string("");
+        printf("---RAID SIEGE ENDS--- %s gate %s after %d ticks (%d hp)\n", racePlurals[def],
+               broken ? "broken" : timedOut ? "held" : "gone", raid.siegeTicks, gateHp[def]);
+        if (!line.empty()) logEvent(line, kRaidTickerTint);
+        for (int k = 0; k < kRaidPartySize; k++) if (ri[k] >= 0) { barbs[ri[k]].raidCooldown = 0; barbs[ri[k]].raidPreyId = -1; }
+        raid.phase = raidParty::Fight;   // the crate walk; gateHp stays down until the raid ends
+        raid.fightTicks = raid.holdTicks = raid.scanTimer = 0;
+        return;   // the fight (bell, defenders) starts next tick
     }
 
     if (raid.phase == raidParty::Fight) {
@@ -11895,6 +12007,36 @@ void drawRaidMarker(RenderWindow& window, int frame) {
     m.setFillColor(c);
     m.setPosition(snapPx(storehousePos[raid.def]) + kRaidMarkerOffset);
     window.draw(m);
+}
+
+// R57-F2: world layer, after the barbs and before the trees and overlays. The white flash lies across the open 2px gate
+// arc (slot 0) for kSiegeFlashFrames after a blow; one red bar, centred on the gate and above the higher tower's pennant
+// pole, shows the gate's strength only while it is being rammed.
+void drawSiegeGate(RenderWindow& window) {
+    static vector<Vector2f> blocks;
+    RectangleShape s;
+    for (int r = 0; r < raceCount; r++) {
+        if (gateFlash[r] <= 0 || !siegeReady(r)) continue;
+        wallArcBlocks(r, 0, blocks);
+        s.setFillColor(kSiegeFlashColor);
+        s.setSize(Vector2f(wallThickPx, wallThickPx));
+        for (auto& bp : blocks) { s.setPosition(bp); window.draw(s); }   // opaque, so overlapping samples read as one arc
+    }
+    if (!raid.active || raid.phase != raidParty::Siege || raid.def < 0 || raid.def >= raceCount || !siegeReady(raid.def)) return;
+    int r = raid.def;
+    float top = (float)min(towers[r][0].y, towers[r][1].y) - towerPoleH;
+    Vector2f pos = snapPx(Vector2f(gatePoint(r).x - kSiegeBarSize.x / 2.0f, top - kSiegeBarGapPx - kSiegeBarSize.y));
+    s.setFillColor(kSiegeBarBackColor);
+    s.setSize(kSiegeBarSize);
+    s.setPosition(pos);
+    window.draw(s);
+    float w = floor(kSiegeBarSize.x * clamp(gateHp[r], 0, kGateHpMax) / (float)kGateHpMax);
+    if (w < 1.0f && gateHp[r] > 0) w = 1.0f;
+    if (w <= 0.0f) return;
+    s.setFillColor(kSiegeBarColor);
+    s.setSize(Vector2f(w, kSiegeBarSize.y));
+    s.setPosition(pos);
+    window.draw(s);
 }
 
 // R54-F1: one stock kind by index (0 food, 1 wood, 2 stone, like the plunder packs)
@@ -15196,6 +15338,9 @@ int main() {
         drawBarbs(window, barbs, squares, frameCount, zoom);
         drawTitlePips(window, camRect, zoom);   // R56-F3: pale 1px pip over titled barbs, capped
         for (auto& b : barbs) if (b.raidFlash > 0 && !paused) b.raidFlash--;   // R52-F1: the hit flash lasts 2 drawn frames
+        for (auto& b : barbs) if (b.siegeLunge > 0 && !paused) b.siegeLunge--;   // R57-F2: the ram lunge lasts 2 drawn frames
+        drawSiegeGate(window);   // R57-F2: gate flash + one red bar over the gatehouse, over the barbs, under trees and overlays
+        for (auto& f : gateFlash) if (f > 0 && !paused) f--;
 	if (activeTrader) drawSnapped(window, activeTrader->shape);
 	drawTrees(window, tris, treeVerts, camRect);
 	drawFires(window, trees, fireVerts, camRect, frameCount);   // R57-F3: flames on the burning canopy + faint smoke, under the overlay
