@@ -474,6 +474,25 @@ const Vector2f kTitlePipSize(1.0f, 1.0f);         // 1px mark over the head, one
 const Color kTitlePipColor(226, 218, 186, 200);   // pale parchment, softer than the body white, far from crown gold
 const int kTitlePipMax = 6;                       // pips on screen at once, highest renown first
 const Color kTitleTickerTint(206, 196, 160);      // muted parchment for the one "hailed" ticker line
+// R57-F1 Life Stages (phase 1): lifeStage(b) is derived from bornHour (no stored stage). Children draw at kChildScale
+// with a faint 1px rim; elders keep full width, a grey hair row on the top body row and a 1px stoop (shape and value
+// cues, not hue alone). Draw-only: the hitbox square never changes. Past kOldAgeHours, ageDeathTick() sets health 0 on
+// the oldest such barb (removed by starveDeathTick()/removeBarb()), at most one a game day and never at or under
+// kOldAgeMinPop living (or kOldAgeMinRacePop of its race). Births run ~5 per house per game hour below the cap, so one
+// death a day cannot collapse a village. Parent ids, hover lineage and the chronicle are phase 2.
+const int kChildHours = 12;                       // half a game day a child (2 real hours at 1x)
+const int kElderHours = 96;                       // 4 game days (half a year): grey hair and the stoop
+const int kOldAgeHours = 144;                     // 6 game days: may die of old age from here on
+const int kFounderAgeMaxHours = 72;               // founders arrive adults, aged kChildHours..this, so they grey apart
+const int kOldAgeMinPop = numbarbs;               // no old-age death at or under the founding headcount (15)
+const int kOldAgeMinRacePop = foundersPerRace;    // ...nor in a race at or under its founding clan (5)
+const float kChildScale = 0.6f;                   // drawn body size; whole px, at least 1 wide and 2 tall
+const float kChildMinH = 2.0f;                    // two rows keep the task stripe (row 1) on the body
+const Color kChildOutlineColor(226, 224, 214, 56);   // body white at ~22% alpha: a faint rim, under the body
+const Color kElderHairColor(156, 156, 150);       // mid grey: well apart from the off-white body and the gold sash
+const float kElderStoopPx = 1.0f;                 // elders stand 1px shorter (never under 2 rows)
+const Color kElderGraveColor(158, 158, 154);      // an elder's stone: plain pale grey, no race tint
+const Color kOldAgeTickerTint(178, 178, 170);     // soft grey "died of old age" line, readable on the black strip
 // Morale: one term per race per tick, graveMoralePerStone per own stone up to graveMoraleMax. The race's hunger grows
 // that much slower (a rest tick every 1/term ticks), so 4 stones = 4% longer between meals at most.
 const float graveMoralePerStone = 0.01f;
@@ -3295,7 +3314,16 @@ struct barb {
     int bornHour = 0;            // R55-F4: game hour of birth (game_day * 24 + game_time); set only in makeBarb(), age = now - this
     int renown = 0;              // R56-F3: deeds; moves with the struct on swapRemove; written only by addRenown()
     char title[kTitleLen] = "";  // R56-F3: "" = untitled; written only by addRenown() via snprintf
+    bool oldAgeDeath = false;    // R57-F1: set only by ageDeathTick() with health 0; read by starveDeathTick() for the log
 };
+// R57-F1: age and stage from bornHour on the live clock (same hour count as chronicleNowHour())
+enum lifeStageKind { stageChild, stageAdult, stageElder };
+int barbAgeHours(const barb& b) { return max(0, game_day * 24 + game_time - b.bornHour); }
+lifeStageKind lifeStage(const barb& b) {
+    int age = barbAgeHours(b);
+    return age < kChildHours ? stageChild : age >= kElderHours ? stageElder : stageAdult;
+}
+int founderAgeHours() { return uniform_int_distribution<int>(kChildHours, kFounderAgeMaxHours)(gen); }
 // R53-F4: the only writer of barb.activity on the way in. Starting a second activity over a live one is a bug: a debug
 // build aborts; a release build ends the old one (with its cleanup) first so no state is left half-set.
 void endActivity(barb& b);
@@ -4994,6 +5022,8 @@ struct grave {
     int age = 0;         // sim ticks since it was raised
     int glow = 0;        // ticks of brightening left (refreshed while a same-race barb is near)
     bool hero = false;   // R56-F3: the barb held a title; stone is kHeroGraveH tall, growing up from the same base
+    Color tint = graveStoneColor;   // R57-F1: stone colour, set once in addGrave() (race-tinted, or kElderGraveColor for
+                                    // an elder); a plain field, so it moves with the stone on every erase/eviction
 };
 vector<grave> graves;                      // oldest first, at most graveMax
 float graveMorale[raceCount] = {};          // the one morale term per race, recomputed by graveTick() every tick
@@ -5199,6 +5229,8 @@ void veilOmenTick() {
     }
 }
 
+Color lerpColor(Color a, Color b, float t);   // R57-F1: defined with the other colour helpers below
+
 // Called from removeBarb() only. The stone stands where the barb's feet were, nudged off any stone already there.
 void addGrave(const barb& b, const RectangleShape& sq) {
     Vector2f p(floor(sq.getPosition().x + sq.getSize().x / 2.0f - 1.0f), floor(sq.getPosition().y + sq.getSize().y) - graveSize.y);
@@ -5217,9 +5249,11 @@ void addGrave(const barb& b, const RectangleShape& sq) {
     g.pos = p;
     g.race = clampRace(b.race);
     g.hero = hero;
+    bool elder = lifeStage(b) == stageElder;   // R57-F1: an elder's stone is plain grey
+    g.tint = elder ? kElderGraveColor : lerpColor(graveStoneColor, raceEventColors[g.race], graveRaceTint);
     graves.push_back(g);
-    printf("GRAVE - stone raised for %s (%s)%s%s at %d,%d - %d stones\n", b.name, raceOf(b).name, hero ? " " : "", b.title,
-           (int)p.x, (int)p.y, (int)graves.size());
+    printf("GRAVE - stone raised for %s (%s)%s%s%s at %d,%d - %d stones\n", b.name, raceOf(b).name, hero ? " " : "", b.title,
+           elder ? ", grey elder stone" : "", (int)p.x, (int)p.y, (int)graves.size());
 }
 
 // Ages the stones, lights the ones a same-race barb is beside, and computes each race's morale term once.
@@ -5410,13 +5444,26 @@ Vector2f shoreStandSpot(int k, Vector2f bodySize) {
 
 // Rod and line of a fishing barb, from its snapped hitbox (same body top drawBarbs uses; no bob while working).
 // The hand is the pixel beside the body on the water side; the rod steps diagonally out over the water.
+// R57-F1: drawn body (width, height after hunger droop and elder stoop), feet on the hitbox bottom, left-aligned.
+// A child is kChildScale in whole px (at least 1 wide, kChildMinH tall); droop and stoop never take a body under 2 rows
+// (or under its own height when it is already that short).
+Vector2f barbDrawnBody(const barb& b) {
+    Vector2f s = raceOf(b).bodySize;
+    lifeStageKind st = lifeStage(b);
+    if (st == stageChild) s = Vector2f(max(1.0f, round(s.x * kChildScale)), max(kChildMinH, round(s.y * kChildScale)));
+    float lower = (isHungry(b) ? barbHungryDroopPx : 0.0f) + (st == stageElder ? kElderStoopPx : 0.0f);
+    s.y = max(min(s.y, 2.0f), s.y - lower);
+    return s;
+}
+
 struct fishPose {Vector2f hand, step, tip, lineEnd;};
 fishPose fishPoseOf(const barb& b, const RectangleShape& sq) {
     Vector2f base = snapPx(sq.getPosition()), size = sq.getSize();
-    float bodyTop = base.y + (isHungry(b) ? barbHungryDroopPx : 0.0f);
+    Vector2f drawn = barbDrawnBody(b);   // R57-F1: the hand sits beside the drawn body (child, stoop, droop)
+    float bodyTop = base.y + size.y - drawn.y;
     Vector2f w = shoreWaterDir(b.targetShore);
     fishPose f;
-    f.hand = Vector2f(w.x < 0.0f ? base.x - 1.0f : base.x + size.x, bodyTop + 1.0f);
+    f.hand = Vector2f(w.x < 0.0f ? base.x - 1.0f : base.x + drawn.x, bodyTop + 1.0f);
     f.step = w.x != 0.0f ? Vector2f(w.x, -1.0f) : Vector2f(1.0f, w.y);   // side casts lift the rod; up/down casts reach over
     f.tip = f.hand + f.step * fishRodPx;
     f.lineEnd = f.tip + w * fishLineReach + (w.x != 0.0f ? Vector2f(0.0f, fishLineDrop) : Vector2f(0.0f, 0.0f));
@@ -5448,7 +5495,9 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
         const barb& b = barbs[i];
         if (barbHidden(b) || barbUnderground(b)) continue;   // INBOX-F1: indoors; R40-F1: down the shaft
         const raceDef& rd = raceOf(b);
-        Vector2f bodySize = rd.bodySize;
+        lifeStageKind stage = lifeStage(b);   // R57-F1
+        Vector2f drawnBody = barbDrawnBody(b);
+        Vector2f bodySize = drawnBody;        // child scale, hunger droop and elder stoop already applied
         bool hungry = isHungry(b);
         int phase = frame + b.id * 3;   // desync barbs so they don't animate in lockstep
         bool working = b.chopping || (b.building && b.timer > 0);
@@ -5457,14 +5506,18 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
         Vector2f base = snapPx(squares[i].getPosition());
         float feet = base.y + squares[i].getSize().y;    // bottom edge of the hitbox
         float bob = (walking && (phase / barbBobFrames) % 2 == 1) ? -barbBobPx : 0.0f;
-        float droop = hungry ? barbHungryDroopPx : 0.0f;
-
-        float bodyH = bodySize.y - droop;
+        float bodyH = bodySize.y;   // R57-F1: droop (and stoop) come from barbDrawnBody(), same as fishPoseOf()
         float bodyTop = feet - bodyH + bob;
 
         Color tc = barbColor(b);                         // task colour; barbIdleColor means no task
         bool idle = tc == barbIdleColor;
         if (hungry) tc = hungryTint(tc);
+        if (stage == stageChild) {   // R57-F1: faint 1px rim under the small body, so a child reads as one at a glance
+            body.setSize(Vector2f(bodySize.x + 2.0f, bodyH + 2.0f));
+            body.setFillColor(kChildOutlineColor);
+            body.setPosition(Vector2f(base.x - 1.0f, bodyTop - 1.0f));
+            window.draw(body);
+        }
         if (b.shinobi) {   // R25-F2: faint pale rim one px around the body, drawn underneath it
             body.setSize(Vector2f(bodySize.x + 2.0f, bodyH + 2.0f));
             body.setFillColor(shinobiOutlineColor);
@@ -5501,6 +5554,12 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             stripe.setPosition(Vector2f(base.x, bodyTop + sashTop));
             window.draw(stripe);
         }
+        if (stage == stageElder) {   // R57-F1: grey hair on the top body row (over a 2-row dwarf's row-0 sash; the stoop
+            stripe.setSize(Vector2f(bodySize.x, 1.0f));   // still shows); under the shinobi band, sick dot and race marks
+            stripe.setFillColor(kElderHairColor);
+            stripe.setPosition(Vector2f(base.x, bodyTop));
+            window.draw(stripe);
+        }
         if (b.shinobi) {   // R25-F2: 1px headband on the top body row (stripe is row 1, sash row 2)
             stripe.setSize(Vector2f(bodySize.x, 1.0f));
             stripe.setFillColor(shinobiBandColor);
@@ -5522,7 +5581,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
         }
         if (rd.hatSize.x > 0.0f) {                       // race mark above the head, never on the body
             float hatTop = bodyTop - rd.hatSize.y;
-            hat.setSize(rd.hatSize);
+            hat.setSize(Vector2f(min(rd.hatSize.x, bodySize.x), rd.hatSize.y));   // R57-F1: a child's cap fits its head
             hat.setFillColor(rd.hatColor);
             hat.setPosition(Vector2f(base.x, hatTop));
             window.draw(hat);
@@ -6009,6 +6068,8 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
                 label += ", of house " + to_string(b.homeHouse + 1) + ", " + to_string(kin) + " kin";
             }
             if (b.sick > 0) label += ", coughing";   // R52-F4
+            lifeStageKind ls = lifeStage(b);         // R57-F1
+            if (ls != stageAdult) label += ls == stageChild ? ", child" : ", elder";
             if (b.birthRace != b.race) label += string(", born ") + raceDefs[clampRace(b.birthRace)].name;   // R54-F3
             if (b.title[0] != '\0') label += string("\nHailed ") + b.title + ", renown " + to_string(b.renown);   // R56-F3
             else if (b.renown > 0) label += ", renown " + to_string(b.renown);
@@ -8912,6 +8973,7 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
             b.name = barbNames[saved->name];
         }
     } else {
+        if (homeHouse < 0) b.bornHour -= founderAgeHours();   // R57-F1: founders arrive grown, at staggered ages
         b.trait =(barbTrait)uniform_int_distribution<int>(0, traitCount - 1)(gen);   // R25-F1
         if (!sasukeTaken && homeHouse < 0) {   // R25-F2: the first founder is Sasuke (no table name is spent)
             sasukeTaken = true;
@@ -8948,7 +9010,7 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
 // always fires on a load: the oldest returners by name, or the founders when the file had no barbs (v1/v2).
 void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<RectangleShape>& squares, vector<birthRing>& rings) {
     if (d.barbs.empty()) {
-        for (auto& b : barbs) b.bornHour = chronicleNowHour();   // founders arrive on the restored clock, age 0
+        for (auto& b : barbs) b.bornHour = chronicleNowHour() - founderAgeHours();   // founders arrive on the restored clock (R57-F1: grown)
         printf("CHRONICLE - no barbs saved: the %d founders stay\n", (int)barbs.size());
         logEvent("No one returns - " + to_string(barbs.size()) + " founders arrive", kChronicleRestoreTint);
         return;
@@ -9862,7 +9924,7 @@ void drawGraves(RenderWindow& window, const FloatRect& camRect) {
         float lit = (float)g.glow / graveGlowTicks;
         float a = 255.0f + (graveOldAlpha - 255.0f) * old;
         a += (255.0f - a) * lit;
-        Color c = lerpColor(lerpColor(graveStoneColor, raceEventColors[clampRace(g.race)], graveRaceTint), graveGlowColor, graveGlowMix * lit);
+        Color c = lerpColor(g.tint, graveGlowColor, graveGlowMix * lit);   // R57-F1: tint stored per stone
         c.a = (uint8_t)a;
         Color base = shade(c, graveBaseShade);
         pushQuad(va, g.pos + Vector2f(1.0f, -extra), Vector2f(1.0f, 1.0f), c);          // rounded cap
@@ -9967,9 +10029,37 @@ void starveDeathTick(vector<barb>& barbs, vector<RectangleShape>& squares,
     sort(dead.begin(), dead.end(), [](int a, int b) { return a > b; });
     for (int i : dead) {
         if (i >= (int)barbs.size() || i >= (int)squares.size()) continue;
-        printf(barbs[i].sick > 0 ? "COUGHED - " : "STARVED - ");   // R52-F4
+        printf(barbs[i].oldAgeDeath ? "OLD AGE - " : barbs[i].sick > 0 ? "COUGHED - " : "STARVED - ");   // R52-F4, R57-F1
         removeBarb(barbs, squares, i, sh, fg, stores, fields);
     }
+}
+
+// R57-F1: once a game hour, the oldest barb past kOldAgeHours dies of old age (health 0; starveDeathTick() removes it
+// through removeBarb() at the end of this tick). At most one a game day; skipped while the village is at or under
+// kOldAgeMinPop living, and for a barb whose race is at or under kOldAgeMinRacePop. Runs before starveDeathTick().
+int oldAgeDeathDay = -1;   // game_day of the last old-age death
+void ageDeathTick(vector<barb>& barbs) {
+    static int lastHour = -1;
+    int now = game_day * 24 + game_time;
+    if (now == lastHour) return;
+    lastHour = now;
+    if (oldAgeDeathDay == game_day) return;
+    int living = 0, raceLiving[raceCount] = {};
+    for (auto& b : barbs) if (b.health > 0) { living++; raceLiving[clampRace(b.race)]++; }
+    if (living <= kOldAgeMinPop) return;
+    int pick = -1;
+    for (int i = 0; i < (int)barbs.size(); i++) {
+        const barb& b = barbs[i];
+        if (b.health <= 0 || barbAgeHours(b) < kOldAgeHours || raceLiving[clampRace(b.race)] <= kOldAgeMinRacePop) continue;
+        if (pick < 0 || b.bornHour < barbs[pick].bornHour) pick = i;
+    }
+    if (pick < 0) return;
+    barb& b = barbs[pick];
+    b.health = 0;
+    b.oldAgeDeath = true;
+    oldAgeDeathDay = game_day;
+    printf("AGE DEATH - %s (%s, id %d) at %d hours - %d living\n", b.name, racePlurals[clampRace(b.race)], b.id, barbAgeHours(b), living - 1);
+    logEvent(string(b.name) + " the " + traitOf(b).name + " died of old age", kOldAgeTickerTint);
 }
 
 // INBOX-F1: town bell. raceBell[r] = ticks left before race r's bell falls silent (0 = silent); refreshed while a wolf is near.
@@ -14769,6 +14859,7 @@ int main() {
                 faithShrineTick(shrines);   // R51-F2: shrine motes at a faith-scaled rate (faith itself eases in veilTick)
                 hungerTick(barbs);
                 sickTick(barbs);   // R52-F4: after meals heal, before starveDeathTick() removes the fallen
+                ageDeathTick(barbs);   // R57-F1: old age, likewise before starveDeathTick()
                 trailTick();
                 birdTick(birds, birdHeading, squares, barbs);
                 bushTick(bushes, bushshapes);
