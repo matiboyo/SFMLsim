@@ -1734,6 +1734,54 @@ const Color herbFlowerColor(194, 164, 222);      // ripe: light purple, two pixe
 const Color herbBloomColor(228, 204, 246);       // harvest-day bloom: paler and brighter, with a third pixel on top
 const Color herbBrownColor(108, 80, 50);         // winter: browned leaves, no flower
 const Color herbStockColor(196, 168, 222);       // HUD herb count tint (the flower purple, lifted for the text)
+// R59-F3 Lore Hall (phase 1): once a race's crate stands, it is a Hamlet and it knows a tier-1 tech, a barb of that race
+// builds one 10x8 hall left of the keep (buildOneOff, jobLoreHall). Idle elders nearby sit at one of kStudySeats benches
+// below it (activity actStudy, walked by studyTick(), ended through clearTraining() like the drill); each finished
+// session adds one study point (practice()) to the race's best learnable tier-2 tech. A seated scholar lights a candle in
+// the window above its bench. Fixed per-race array (no vectors). The spot is reserved from the start (forgeClear).
+const int loreHallWoodCost = 14;                 // from the race's own stock, with a house's wood and stone kept back
+const int loreHallStoneCost = 4;
+const int loreHallBuildTicks = houseBuildTicks;
+const Vector2f loreHallSize(10.0f, 8.0f);
+const Vector2f loreHallCrateOffset(-17.0f, 21.0f); // hall top-left relative to the crate: left of the keep, below the drill yard,
+                                                   // well inside the curtain-wall ring (~25px from the keep centre at most)
+const float loreHallRoofH = 3.0f;                // top 3 rows: roof, the top row inset 1px each side, the 3rd an eave
+const Vector2f loreHallDoorPos(4.0f, 5.0f);      // dark 2x3 door centred on the 10px front, on the ground line
+const Vector2f loreHallDoorSize(2.0f, 3.0f);
+const int kStudySeats = 2;                       // scholars per race at once, one bench each side of the door
+const Vector2f loreHallWindowPos[kStudySeats] = {{1.0f, 4.0f}, {7.0f, 4.0f}};   // 2x1 windows; window s lights for seat s
+const Vector2f loreHallWindowSize(2.0f, 1.0f);
+const Vector2f studySeatOffset[kStudySeats] = {{1.0f, 10.0f}, {7.0f, 10.0f}};  // scholar hitbox top-left relative to the hall:
+                                                 // under its window, 1px of grass below the shadow row
+const Vector2f loreHallStandOffset(4.0f, 9.0f);  // builder hitbox top-left: just below the door
+const Vector2f loreHallZoneSize(11.0f, 16.0f);   // hall + shadow + both benches (elf height)
+const float loreHallClearPx = 3.0f;              // houses, plots, mills, walls and towers keep this far from the zone
+const float loreHallRoadPadPx = 1.0f;            // quarter roads keep this far from the zone
+const float kStudyJoinRadius = 90.0f;            // idle elders within this of their hall may come to study...
+const int kStudyJoinOneIn = 240;                 // ...each idle tick with chance 1 in this (~4 s at 1x)
+const int kStudySessionTicks = 1200;             // work ticks seated (~20 s at 1x) per study point
+const Color loreHallWallColor(170, 160, 136);    // pale limestone: lighter than the barracks timber, warmer than the keep
+const Color loreHallRoofColor(104, 80, 98);      // muted plum slate, clear of the grey, sage and slate roofs
+const Color loreHallEaveColor(82, 62, 78);       // eave row, one step darker
+const Color loreHallDoorColor(36, 28, 26);
+const Color loreHallWindowColor(46, 40, 38);     // dark glass when nobody reads at that bench
+const Color loreCandleDimColor(206, 140, 62);    // candle flicker runs between these two (loreCandleLevel)
+const Color loreCandleBrightColor(252, 214, 132);
+const Color loreCandleGlowColor(70, 46, 16, 255); // additive 1px halo at night only, gentler than a house window
+// R59-F3 tier-2 world effects (draw-only, offsets from the 4x4 house shape / the plot soil top-left)
+const Vector2f masonryCoursePos(-2.0f, 5.0f);    // Masonry: 8x1 dressed-stone course under the 6px walls (over the shadow row)
+const Vector2f masonryCourseSize(8.0f, 1.0f);
+const Color masonryCourseColor(142, 138, 126);   // pale dressed stone: lighter than the slab, darker than dwarf ashlar
+const Vector2f woodpilePos(5.0f, 3.0f);          // Carpentry: 2x2 stacked log ends against the right wall
+const Color woodpileEndColor(194, 156, 104);     // sawn log ends (checkerboard with the bark)
+const Color woodpileBarkColor(104, 72, 42);
+const float irrigationRowY = 7.0f;               // Irrigation: 1px channel on the plot's bottom soil-margin row, inside the frame
+const Color irrigationColor(78, 118, 150);       // muted water blue, darker than the lakes so it reads as a ditch
+const Vector2f lanternPostPos(-2.0f, 3.0f);      // Lamplight: 1x2 post left of the walls, lamp head 1px above it
+const Color lanternPostColor(70, 56, 40);
+const Color lanternUnlitColor(98, 88, 66);       // by day: a dull brass head
+const Color lanternLitColor(250, 206, 120);      // at night, drawn after the overlay
+const Color lanternGlowColor(80, 52, 16, 255);   // additive 1px halo, like the windows
 
 // UI red (UIO-F1/F2/F3): one muted brick red for every "starving" mark in the UI (minimap dots, inspect panel, hunger lens)
 const Color uiStarvingRed = healthBarFillColor;
@@ -2303,6 +2351,13 @@ const float kKnowFavouredMult = 0.8f;         // humans Hand Axe 32, dwarves Pic
 const int kChronicleMaxKnowCount = 1000000;   // saved practice counters are clamped to this on load
 const int kChronicleMaxKnowTechs = 64;        // "KNOW" block tech count bound
 const Color steelToolColor(178, 186, 198);    // Hand Axe head: cool pale steel, clear of chop green and bird blue-white
+// R59-F3 tier-2 techs: study points (finished Lore Hall sessions) to learn each; prereqs and era live in techDefs
+const int masonryStudy = 10;
+const int carpentryStudy = 10;
+const int irrigationStudy = 10;
+const int lamplightStudy = 16;                // the Town-era tech: needs two tier-1 techs and takes longest
+const float knowTierGap = 4.0f;               // extra px between the tier-1 and tier-2 pips in each row
+const float knowLockedRimDim = 0.5f;          // a tier-2 pip whose prereqs/era are not met: rim eased this far toward the bar
 
 // Flint spears (R20-F3): an idle barb walks to the campfire and knaps a spear; spear holders hit game animals harder
 const int spearWoodCost = 2;                  // POL-F3: paid up front at claim from the crafter's race stock
@@ -2336,8 +2391,8 @@ static_assert(weaponTierBonus[0] == 0, "an untiered weapon hits for its base dam
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
 // jobPave (R20-F2) is run by paveTick(): movingbspot while walking, building/timer while laying the cobbles.
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, jobHerbHut, buildJobCount};
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks, herbHutBuildTicks};
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, jobHerbHut, jobLoreHall, buildJobCount};
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks, herbHutBuildTicks, loreHallBuildTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -2764,6 +2819,27 @@ bool herbClear(const FloatRect& rect) {
     return !rect.findIntersection(zone).has_value();
 }
 
+// R59-F3: one per race (index = barbRace), at storehousePos + loreHallCrateOffset. The build claim is not stored ("a barb
+// of this race holds jobLoreHall"). seatId[s] = barb id studying at bench s (never an index), -1 = free; set only by
+// startStudy(), freed by endActivity() and studyTick()'s per-tick validation. Fixed arrays, no vectors, so nothing to
+// swapRemove; addLoreHall() is the one place a hall is registered. Reset in placeQuarters().
+struct loreHall {bool built = false; int seatId[kStudySeats] = {-1, -1};};
+loreHall loreHalls[raceCount];
+int loreClock = 0;   // R59-F3: sim ticks counted by studyTick(); the candle flicker is a pure function of it
+Vector2f loreHallPos(int r) { return storehousePos[r] + loreHallCrateOffset; }
+Vector2f studySeatSpot(int r, int s) { return loreHallPos(r) + studySeatOffset[clamp(s, 0, kStudySeats - 1)]; }
+FloatRect loreHallZone(int r) { return FloatRect(loreHallPos(r), loreHallZoneSize); }
+bool loreHallBuilt(int r) { return r >= 0 && r < raceCount && loreHalls[r].built; }
+// False if rect comes within loreHallClearPx of any race's hall zone (reserved from the start, built or not)
+bool loreHallClear(const FloatRect& rect) {
+    for (int k = 0; k < raceCount; k++) {
+        FloatRect z = loreHallZone(k);
+        FloatRect zone(z.position - Vector2f(loreHallClearPx, loreHallClearPx), z.size + Vector2f(2 * loreHallClearPx, 2 * loreHallClearPx));
+        if (rect.findIntersection(zone).has_value()) return false;
+    }
+    return true;
+}
+
 // False if r comes within storehouseClearPx of any race's crate or its stand spot (reserved from the start, built or not)
 bool storehouseClear(const FloatRect& r) {
     for (int k = 0; k < raceCount; k++) {
@@ -2863,7 +2939,8 @@ bool forgeClear(const FloatRect& r) {
     return !r.findIntersection(zone).has_value() && storehouseClear(r) && smokehouseClear(r) && keepClear(r) && towerClear(r)
         && shaftClear(r)   // R34-F1
         && barracksClear(r)   // R47-F6
-        && herbClear(r);      // R53-F2
+        && herbClear(r)       // R53-F2
+        && loreHallClear(r);  // R59-F3
 }
 
 // R30-F1: race quarters
@@ -2991,6 +3068,7 @@ void placeQuarters() {
             halls[k] = barracksHall{};                                     // R47-F6: unbuilt, slots free
             herbGardens[k] = herbGarden{};                                 // R53-F2: unbuilt, bare bed, no tender
             raceHerbs[k] = 0;
+            loreHalls[k] = loreHall{};                                     // R59-F3: unbuilt, benches free
         }
         wallsegs.clear();
     };
@@ -3042,12 +3120,21 @@ void placeQuarters() {
 }
 
 // Know-how (R20-F1): every counter, learned flag and pip pulse lives here; reset as a whole with resetKnowHow()
-enum techId {techHandAxe, techPickwork, techSeedSelection, techCount};
-struct techDef {const char* name; int threshold; const char* effect; Color pip;};
+// R59-F3: tier 1 is learned by practice; tier 2 by study at the Lore Hall, once every prereq is learned and the race's
+// era is at least minEra. prereq slots past the last real one hold techCount. Tier-1 techs come first (kTier1TechCount).
+enum techId {techHandAxe, techPickwork, techSeedSelection, techMasonry, techCarpentry, techIrrigation, techLamplight, techCount};
+const int kTier1TechCount = 3;
+const int kTechMaxPrereq = 2;
+struct techDef {const char* name; int threshold; const char* effect; Color pip;
+                int tier; techId prereq[kTechMaxPrereq]; settlementEra minEra;};
 const techDef techDefs[techCount] = {
-    {"Hand Axe",       handAxeTrees,          "chopping 20% faster", steelToolColor},
-    {"Pickwork",       pickworkRocks,         "mining 20% faster",   Color(215, 145, 55)},   // muted mine orange (pal.barMine)
-    {"Seed Selection", seedSelectionHarvests, "wheat grows 20% faster", Color(200, 165, 70)}, // muted wheat gold (fieldBarColor)
+    {"Hand Axe",       handAxeTrees,          "chopping 20% faster", steelToolColor, 1, {techCount, techCount}, eraCamp},
+    {"Pickwork",       pickworkRocks,         "mining 20% faster",   Color(215, 145, 55), 1, {techCount, techCount}, eraCamp},   // muted mine orange (pal.barMine)
+    {"Seed Selection", seedSelectionHarvests, "wheat grows 20% faster", Color(200, 165, 70), 1, {techCount, techCount}, eraCamp}, // muted wheat gold (fieldBarColor)
+    {"Masonry",    masonryStudy,    "stone footings under every house",  Color(150, 146, 134), 2, {techPickwork, techCount}, eraHamlet},       // dressed stone
+    {"Carpentry",  carpentryStudy,  "a woodpile stacked by every house", Color(160, 108, 60),  2, {techHandAxe, techCount}, eraHamlet},        // sawn timber brown
+    {"Irrigation", irrigationStudy, "water channels in every plot",      Color(86, 138, 174),  2, {techSeedSelection, techCount}, eraHamlet},  // ditch blue
+    {"Lamplight",  lamplightStudy,  "lanterns lit by every door at night", Color(244, 224, 166), 2, {techHandAxe, techPickwork}, eraTown},     // pale lamp cream
 };
 struct knowHow {
     int count[techCount] = {};       // trees felled, rocks mined, wheat harvests
@@ -3063,8 +3150,27 @@ int knowThreshold(int race, techId t) {
     float mult = raceFavouredTech[knowRace(race)] == t ? kKnowFavouredMult : 1.0f;
     return max(1, (int)ceil(techDefs[t].threshold * mult - 0.001f));
 }
-bool canLearn(int race, techId t) { (void)race; (void)t; return true; }   // R55-F2: phase 2 adds prereqs and era gates here
+// R59-F3: every prereq already learned by this race (know[]) and the race's own era at least the tech's minEra
+bool canLearn(int race, techId t) {
+    int r = knowRace(race);
+    for (int p = 0; p < kTechMaxPrereq; p++) {
+        techId q = techDefs[t].prereq[p];
+        if (q < techCount && !know[r].learned[q]) return false;
+    }
+    return raceEra[r] >= techDefs[t].minEra;
+}
 bool knows(int race, techId t) { return know[knowRace(race)].learned[t]; }
+// R59-F3: the tier-2 tech a finished study session goes to: the learnable unlearned one with the most study, ties to the
+// earlier; techCount = nothing to study
+techId studyTarget(int race) {
+    int r = knowRace(race);
+    techId best = techCount;
+    for (int t = kTier1TechCount; t < techCount; t++) {
+        if (know[r].learned[t] || !canLearn(r, (techId)t)) continue;
+        if (best == techCount || know[r].count[t] > know[r].count[best]) best = (techId)t;
+    }
+    return best;
+}
 
 int chopTicks(int race) { return knows(race, techHandAxe) ? handAxeChopTicks : treeChopTicks; }
 int wheatGrowTicks(int race) { return knows(race, techSeedSelection) ? (int)(fieldGrowTicks / seedSelectionGrowSpeed) : fieldGrowTicks; }
@@ -3371,7 +3477,7 @@ enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
 // R53-F4: the one exclusive state a barb is in (work flags like chopping/building stay separate). Set only by
 // beginActivity(), cleared only by endActivity(), which also runs the activity's cleanup.
 enum barbActivity { actNone, actShelter, actExpedition, actRaidAttack, actRaidDefend, actTemper, actSmelt, actDrill, actWatch,
-                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, activityCount };   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
+                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, activityCount };   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
 struct activityDef {
     const char* name;
     bool ownsBarb;    // its tick owns the barb outright: every job selector skips it (barbAvailable() false)
@@ -3394,6 +3500,7 @@ const activityDef activityDefs[activityCount] = {
     {"emigrate",      true,  false, false},  // R54-F3: exileTick() owns the migrant until it joins or is called back
     {"envoy",         true,  false, false},  // R56-F2: envoyTick() owns the leader for the whole trip
     {"procession",    true,  false, false},  // R59-F1: marriageTick() owns the bride and escorts for the whole trip
+    {"study",         false, false, true},   // R59-F3: any claim outranks study, like the drill; studyTick() walks the scholar
 };
 
 struct barb {
@@ -3476,6 +3583,8 @@ struct barb {
     int parentAId = -1;          // R58-F2: barb.id of each parent (stable ids, looked up with findBarbById); -1 = none/unknown.
     int parentBId = -1;          //         set only in makeBarb() (and remapped once by chronicleRestoreBarbs())
     int dynastyIdx = -1;         // R58-F2: kDynastyNames index, -1 = no house; from a parent in makeBarb(), or crownBarb()/crownHeir
+    int studySeat = -1;          // R59-F3: bench index in its race's loreHalls[].seatId while studying; -1 otherwise
+    int studyTimer = 0;          // R59-F3: work ticks seated this session (separate from timer); reset by endActivity()
 };
 // R57-F1: age and stage from bornHour on the live clock (same hour count as chronicleNowHour())
 enum lifeStageKind { stageChild, stageAdult, stageElder };
@@ -3905,7 +4014,13 @@ void endActivity(barb& b) {
             if (b.race >= 0 && b.race < raceCount && herbGardens[b.race].tenderId == b.id) herbGardens[b.race].tenderId = -1;
             b.herbTimer = 0;
             break;
-        case actKneel:       // R52-F3: nothing else to reset
+        case actStudy:       // R59-F3: free the bench if still held; study points already earned stay
+            if (b.race >= 0 && b.race < raceCount && b.studySeat >= 0 && b.studySeat < kStudySeats && loreHalls[b.race].seatId[b.studySeat] == b.id)
+                loreHalls[b.race].seatId[b.studySeat] = -1;
+            b.studySeat = -1;
+            b.studyTimer = 0;
+            break;
+        case actKneel:      // R52-F3: nothing else to reset
         case actCaravan:     // R54-F1: the cart's goods live on the caravan entry, not the barb
         case actExile:       // R54-F3: the trip lives on the exile entry; exileTick() resets the walk
         case actEnvoy:       // R56-F2: the coin stays in the purse until arrival; envoyTick() resets the walk
@@ -4200,7 +4315,8 @@ void practice(int race, techId t) {
     k.learned[t] = true;
     k.pulseFrames[t] = knowPulseFrames;
     printf("---KNOW-HOW--- %s learned %s after %d (%s)\n", racePlurals[race], techDefs[t].name, k.count[t], techDefs[t].effect);
-    if (first) logRaceEvent(string(racePlurals[race]) + " learn " + techDefs[t].name + ": " + techDefs[t].effect, race);
+    if (techDefs[t].tier >= 2) logRaceEvent(string(racePlurals[race]) + " master " + techDefs[t].name + " at the Lore Hall: " + techDefs[t].effect, race);   // R59-F3
+    else if (first) logRaceEvent(string(racePlurals[race]) + " learn " + techDefs[t].name + ": " + techDefs[t].effect, race);
 }
 
 // Ages ticker lines once per rendered frame so fade time is real-time regardless of sim speed
@@ -4509,6 +4625,7 @@ const char* barbTaskName(const barb& b) {
     if (b.activity == actWatch) return b.watchPreyId >= 0 ? "on watch: fighting" : "on watch";   // R51-F1: no stripe either, just the torch
     if (b.activity == actKneel) return b.moving ? "going to the Rite" : "kneeling at the Rite";   // R52-F3
     if (b.activity == actHerb) return b.moving ? "going to the herb patch" : "tending herbs";      // R53-F2: no stripe either
+    if (b.activity == actStudy) return b.moving ? "going to the Lore Hall" : "studying";         // R59-F3: no stripe; the candle shows it
     if (b.chopping && b.target == targetBush) return "picking";
     if (b.chopping && b.target == targetField) return "harvesting";
     if (b.chopping && b.target == targetLake) return "fishing";
@@ -6066,6 +6183,18 @@ void drawHouses(RenderWindow& window, const vector<house>& houses, const vector<
             roof[k] = {Vector2f(st.left[k], st.top + k), Vector2f(st.width[k], 1.0f), k == st.rows - 1 ? partRampMid : partRampLight};
         drawParts(va, roof, st.rows, o, st.roof);
         drawParts(va, partRange{st.bodyFirst, st.bodyCount}, o, Color::White);   // R41-F1: race walls/door/window
+        int hr = houses[i].race;   // R59-F3: the builder race's tier-2 marks, each 1-2px on the slab round the walls
+        if (knows(hr, techMasonry)) pushQuad(va, o + masonryCoursePos, masonryCourseSize, masonryCourseColor);
+        if (knows(hr, techCarpentry)) {   // 2x2 log stack: sawn ends on the diagonal, bark between
+            pushQuad(va, o + woodpilePos, Vector2f(1.0f, 1.0f), woodpileEndColor);
+            pushQuad(va, o + woodpilePos + Vector2f(1.0f, 0.0f), Vector2f(1.0f, 1.0f), woodpileBarkColor);
+            pushQuad(va, o + woodpilePos + Vector2f(0.0f, 1.0f), Vector2f(1.0f, 1.0f), woodpileBarkColor);
+            pushQuad(va, o + woodpilePos + Vector2f(1.0f, 1.0f), Vector2f(1.0f, 1.0f), woodpileEndColor);
+        }
+        if (knows(hr, techLamplight)) {   // post + unlit head; drawHouseLights() lights the head at night
+            pushQuad(va, o + lanternPostPos, Vector2f(1.0f, 2.0f), lanternPostColor);
+            pushQuad(va, o + lanternPostPos - Vector2f(0.0f, 1.0f), Vector2f(1.0f, 1.0f), lanternUnlitColor);
+        }
     }
     if (va.getVertexCount() > 0) window.draw(va);
 }
@@ -6087,6 +6216,17 @@ void drawHouseLights(RenderWindow& window, const View& worldView, const vector<h
         lamp.setPosition(w);
         lamp.setFillColor(st.windowNight);
         window.draw(lamp);
+        if (knows(houses[i].race, techLamplight)) {   // R59-F3: the door lantern head, lit, with the same faint halo
+            Vector2f l = snapPx(houseshapes[i].getPosition()) + lanternPostPos - Vector2f(0.0f, 1.0f);
+            glow.setSize(Vector2f(1.0f, 1.0f) + 2.0f * halo);
+            glow.setPosition(l - halo);
+            glow.setFillColor(lanternGlowColor);
+            window.draw(glow, BlendAdd);
+            lamp.setSize({1.0f, 1.0f});
+            lamp.setPosition(l);
+            lamp.setFillColor(lanternLitColor);
+            window.draw(lamp);
+        }
     }
 }
 
@@ -6863,6 +7003,7 @@ struct hudValues {
     const char* era;         // settlement rank: Camp / Hamlet / Town / Fourth Age (R54-F4: the leading race's)
     bool learned[raceCount][techCount]; // know-how pips (R20-F1), R55-F2: one row per race
     int pulse[raceCount][techCount];    // frames of white pulse left per pip
+    bool learnable[raceCount][techCount]; // R59-F3: canLearn() now (prereqs + era); an unlearned locked tier-2 pip is drawn dimmer
     int gold;                // R46-F1a: nuggets; R55-F3: goldTotal(), the sum of the purses (per race: tooltip only)
     bool goldFound;          // R46-F1a: gold cell hidden until the first nugget
     int day;                 // R51-F3: game_day; the season comes from seasonOf()
@@ -6917,7 +7058,7 @@ string hudDetailText(const hudValues& v) {
     s += "\nKnow-how (strip rows: humans, dwarves, elves):";   // R55-F2: per race, learned or progress toward each
     for (int r = 0; r < raceCount; r++) {
         s += string("\n  ") + racePlurals[r] + ":";
-        for (int t = 0; t < techCount; t++) {
+        for (int t = 0; t < kTier1TechCount; t++) {   // R59-F3: tier-2 tooltip lines are phase 2
             int need = knowThreshold(r, (techId)t);
             s += string(t ? ", " : " ") + techDefs[t].name + " "
                  + (v.learned[r][t] ? string("learned") : to_string(min(know[r].count[t], need)) + "/" + to_string(need))
@@ -6994,7 +7135,9 @@ FloatRect drawHud(RenderWindow& window, const Font& font, const hudValues& v) {
     // R55-F2: one slim row per race (humans top), led by a 2px tick in the race's crate colour; the three rows together are
     // exactly one icon tall. Unlearned: hollow rim tinted toward the race colour. Learned: solid tech colour. Newly learned:
     // flashes white, fading over ~1s. A race with no living barbs keeps its row, dimmed.
-    float pipsW = knowSwatchW + knowSwatchGap + techCount * knowPipPx + (techCount - 1) * knowPipGap;
+    // R59-F3: the tier-2 pips follow the tier-1 ones after an extra knowTierGap, same size and rows (still one icon tall);
+    // a tier-2 pip the race can't study yet (prereqs or era missing) has its rim eased toward the bar.
+    float pipsW = knowSwatchW + knowSwatchGap + techCount * knowPipPx + (techCount - 1) * knowPipGap + knowTierGap;
     float rowsH = raceCount * knowPipPx + (raceCount - 1) * knowRowGap;
     float pipX = round(eraX - knowPipEraGap - pipsW);
     float rowsY = round((inner - rowsH) / 2);
@@ -7012,14 +7155,16 @@ FloatRect drawHud(RenderWindow& window, const Font& font, const hudValues& v) {
             auto tint = [&](uint8_t a, uint8_t b) { return (uint8_t)(a + (int)round((b - a) * knowRimRaceTint)); };
             Color rim(tint(knowPipEmptyColor.r, raceC.r), tint(knowPipEmptyColor.g, raceC.g), tint(knowPipEmptyColor.b, raceC.b));
             float x0 = pipX + knowSwatchW + knowSwatchGap;
+            auto dimTo = [&](uint8_t a, uint8_t b) { return (uint8_t)(a + (int)round((b - a) * knowLockedRimDim)); };
+            Color lockedRim(dimTo(rim.r, pal.hudBar.r), dimTo(rim.g, pal.hudBar.g), dimTo(rim.b, pal.hudBar.b));
             for (int t = 0; t < techCount; t++) {
-                pip.setPosition({x0 + t * (knowPipPx + knowPipGap), rowY});
+                pip.setPosition({x0 + t * (knowPipPx + knowPipGap) + (t >= kTier1TechCount ? knowTierGap : 0.0f), rowY});
                 if (!v.learned[r][t]) {
                     pip.setSize({knowPipPx - 2 * knowPipRimPx, knowPipPx - 2 * knowPipRimPx});
                     pip.setPosition(pip.getPosition() + Vector2f(knowPipRimPx, knowPipRimPx));
                     pip.setFillColor(Color::Transparent);
                     pip.setOutlineThickness(knowPipRimPx);   // outline grows outward: 4x4 overall
-                    pip.setOutlineColor(rim);
+                    pip.setOutlineColor(t >= kTier1TechCount && !v.learnable[r][t] ? lockedRim : rim);
                 } else {
                     Color c = empty ? stockEmptyRaceColor : techDefs[t].pip;
                     if (v.pulse[r][t] > 0) {
@@ -7584,6 +7729,11 @@ bool houseSpotOk(const vector<barb>& barbs, const vector<house>& houses, const f
     if (race == kHerbRace) {   // R53-F2: nor the herb hut and bed
         FloatRect z = herbZone(race);
         FloatRect pad(z.position - Vector2f(herbRoadPadPx, herbRoadPadPx), z.size + Vector2f(2 * herbRoadPadPx, 2 * herbRoadPadPx));
+        if (segmentHitsRect(qc, door, pad)) return false;
+    }
+    {   // R59-F3: nor its own race's Lore Hall and benches
+        FloatRect z = loreHallZone(race);
+        FloatRect pad(z.position - Vector2f(loreHallRoadPadPx, loreHallRoadPadPx), z.size + Vector2f(2 * loreHallRoadPadPx, 2 * loreHallRoadPadPx));
         if (segmentHitsRect(qc, door, pad)) return false;
     }
     return true;
@@ -9198,6 +9348,13 @@ void drawField(RenderWindow& window, const plot& fp, int race, int frame) {
     r.setFillColor(fieldRaceTints[race]);
     r.setPosition(snapPx(fieldWorkSpot(fp)));
     window.draw(r);
+    if (knows(race, techIrrigation)) {   // R59-F3: 1px water channel along the bottom soil row, fallow or not
+        r.setSize(Vector2f(rowW, 1.0f));
+        r.setFillColor(irrigationColor);
+        r.setPosition(o + Vector2f(1.0f, irrigationRowY));
+        window.draw(r);
+        r.setSize(Vector2f(1.0f, 1.0f));
+    }
     if (fp.fallow > 0) return;   // R32-F1: fallow plot is bare soil in its frame
     for (int row = 0; row < 3; row++) {
         float stalkY = 2.0f + 2.0f * row, headY = stalkY - 1.0f;
@@ -9326,6 +9483,8 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.jobTier = 0;
     b.drillSlot = -1;      // R47-F6: not drilling, no slot, counter at 0
     b.drillTimer = b.drillHits = b.drillCount = 0;
+    b.studySeat = -1;      // R59-F3: not studying
+    b.studyTimer = 0;
     b.watchStop = b.watchCooldown = 0;
     b.watchPreyId = -1;
     for (auto& m : b.mem) m = workMem{};   // INBOX-F2: a newborn remembers no spots
@@ -9537,7 +9696,7 @@ void shinobiTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
         barb& b = barbs[i];
         if (!b.shinobi) continue;
         if (!barbAvailable(b) || b.moving || b.chopping || b.building || b.movingbspot || b.deertargeting || b.timer > 0 || b.jobKind != jobNone
-            || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb) continue;   // R47-F6: no blinking off the drill slot (R51-F1: or the watch; R52-F3: or the rite; R53-F2: or the herb bed)
+            || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb || b.activity == actStudy) continue;   // R47-F6: no blinking off the drill slot (R51-F1: or the watch; R52-F3: or the rite; R53-F2: or the herb bed; R59-F3: or the bench)
         if (blinkChance(gen) != 0) continue;
         Vector2f from = squares[i].getPosition(), size = squares[i].getSize();
         for (int t = 0; t < shinobiBlinkTries; t++) {
@@ -11683,7 +11842,8 @@ bool orderIdle(const barb& b) {
     return barbAvailable(b) && !b.chopping && !b.building && !b.movingbspot && !b.deertargeting && b.jobKind == jobNone && b.carryKind == carryNone && !atForgeTask(b)   // R47-F7
         && b.activity != actDrill     // R47-F6: drillers take no orders and join no party (expedition preference deferred)
         && b.activity != actWatch     // R51-F1: nor do watchmen (and so they never start a drill)
-        && b.activity != actHerb;     // R53-F2: nor do herb tenders (the bed visit is short)
+        && b.activity != actHerb      // R53-F2: nor do herb tenders (the bed visit is short)
+        && b.activity != actStudy;    // R59-F3: nor do scholars
 }
 
 // INBOX-F2b: right after the leader names its need, it hands that need as an individual order to idle members (not
@@ -13661,16 +13821,114 @@ void herbTendTick(barb& b, RectangleShape& sq) {
     release();
 }
 
+// R59-F3: a free bench at race r's built Lore Hall, or -1
+int freeStudySeat(int r) {
+    if (!loreHallBuilt(r)) return -1;
+    for (int s = 0; s < kStudySeats; s++) if (loreHalls[r].seatId[s] < 0) return s;
+    return -1;
+}
+
+// R59-F3: may this idle, standing elder (top-left pos) come and study at its race's Lore Hall? Called from barbmove()
+// only, like herbWanted(). Only when there is a tier-2 tech the race can learn now (studyTarget).
+bool studyWanted(const barb& b, Vector2f pos) {
+    if (b.activity != actNone || b.moving || b.timer > 0 || b.inMine || b.target != targetNone || b.order != needNone || !orderIdle(b)) return false;
+    if (lifeStage(b) != stageElder || freeStudySeat(b.race) < 0 || studyTarget(b.race) == techCount) return false;
+    Vector2f d = loreHallPos(b.race) + loreHallSize / 2.0f - pos;
+    return d.x * d.x + d.y * d.y < kStudyJoinRadius * kStudyJoinRadius;
+}
+
+// R59-F3: the only place the study state is set. The bench is held by barb id from here until endActivity().
+void startStudy(barb& b, int s) {
+    if (s < 0 || s >= kStudySeats || !loreHallBuilt(b.race)) return;
+    loreHalls[b.race].seatId[s] = b.id;
+    beginActivity(b, actStudy);
+    b.studySeat = s;
+    b.studyTimer = 0;
+    Vector2f spot = studySeatSpot(b.race, s);
+    b.target = targetNone;
+    b.targetx = (int)spot.x;
+    b.targety = (int)spot.y;
+    b.wanderX = b.wanderY = -1;
+    b.moving = true;
+    b.stepTimer = 0;
+    printf("STUDY STARTED - barb %d (%s), bench %d, toward %s\n", b.id, racePlurals[clampRace(b.race)], s, techDefs[studyTarget(b.race)].name);
+}
+
+// R59-F3: runs after barbmove(), once per sim tick. Advances loreClock, frees any bench whose holder is no longer a
+// scholar of that race at that bench, then walks each scholar to its bench; seated, kStudySessionTicks work ticks earn
+// one study point (practice()) toward the race's studyTarget(), and the elder goes back to looking for work. A lost hall,
+// a lost bench or nothing left to learn ends the session. minematerials() ends it if any other state was set.
+void studyTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
+    loreClock++;
+    for (int r = 0; r < raceCount; r++)
+        for (int s = 0; s < kStudySeats; s++) {
+            int id = loreHalls[r].seatId[s];
+            if (id < 0) continue;
+            int j = findBarbById(barbs, id);
+            if (j < 0 || barbs[j].activity != actStudy || barbs[j].studySeat != s || barbs[j].race != r) {
+                printf("STUDY BENCH FREED - %s bench %d, barb %d\n", racePlurals[r], s, id);
+                loreHalls[r].seatId[s] = -1;
+            }
+        }
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (int i = 0; i < n; i++) {
+        barb& b = barbs[i];
+        if (b.activity != actStudy) continue;
+        auto release = [&]() {
+            b.moving = false; clearRoute(b);
+            b.stepTimer = 0;
+            b.targetx = b.targety = -1;
+        };
+        int r = b.race;
+        techId t = studyTarget(r);
+        if (!loreHallBuilt(r) || b.studySeat < 0 || b.studySeat >= kStudySeats || loreHalls[r].seatId[b.studySeat] != b.id || t == techCount) {
+            printf("STUDY ABORTED - barb %d, %s\n", b.id, t == techCount ? "nothing to learn" : "bench lost");
+            endActivity(b, actStudy);
+            release();
+            continue;
+        }
+        Vector2f spot = studySeatSpot(r, b.studySeat);
+        b.targetx = (int)spot.x;
+        b.targety = (int)spot.y;
+        Vector2f diff = spot - squares[i].getPosition();
+        if (diff.x * diff.x + diff.y * diff.y >= 1.0f) {
+            b.moving = true;
+            walkStep(b, squares[i]);
+            continue;
+        }
+        b.moving = false; clearRoute(b);   // seated under the window
+        if (!workTick(b)) continue;
+        if (++b.studyTimer < kStudySessionTicks) continue;
+        practice(r, t);
+        printf("STUDY DONE - barb %d (%s) +1 %s (%d/%d)\n", b.id, racePlurals[r], techDefs[t].name, know[r].count[t], knowThreshold(r, t));
+        endActivity(b, actStudy);
+        release();
+    }
+}
+
+// R59-F3: the one place a Lore Hall is registered as standing (fixed per-race array: no shapes or vectors to keep in sync)
+void addLoreHall(int r) {
+    loreHalls[r] = loreHall{};
+    loreHalls[r].built = true;
+    printf("---LORE HALL BUILT--- %s (%d wood, %d stone), %d benches\n", raceDefs[r].name, loreHallWoodCost, loreHallStoneCost, kStudySeats);
+    logRaceEvent(string(racePlurals[r]) + " raise a Lore Hall: their elders will study there", r);
+}
+
 void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
     static uniform_int_distribution<int> drillJoin(0, kDrillJoinOneIn - 1);   // R47-F6
     static uniform_int_distribution<int> herbJoin(0, kHerbJoinOneIn - 1);     // R53-F2
+    static uniform_int_distribution<int> studyJoin(0, kStudyJoinOneIn - 1);   // R59-F3
     for (int i = 0; i < (int)squares.size(); i++) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
         if (!barbAvailable(b) || b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone || atForgeTask(b)) continue;   // R29-F1: haulTick() walks haulers; INBOX-F1: bellTick() walks garrisoned; R41-F2: temperTick() walks temperers (R47-F7: smeltTick() smelters); R45-F2: expeditionTick() walks parties
-        if (b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb) continue;   // R47-F6: drillTick() walks drillers; R51-F1: watchTick() walks watchmen; R52-F3: riteTick() kneelers; R53-F2: herbTendTick() tenders
+        if (b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb || b.activity == actStudy) continue;   // R47-F6: drillTick() walks drillers; R51-F1: watchTick() walks watchmen; R52-F3: riteTick() kneelers; R53-F2: herbTendTick() tenders; R59-F3: studyTick() scholars
         Vector2f pos = sq.getPosition();
         if (!b.moving) {
+            if (studyWanted(b, pos) && studyJoin(gen) == 0) {   // R59-F3: an idle elder near its Lore Hall sits to study
+                startStudy(b, freeStudySeat(b.race));
+                continue;
+            }
             if (herbWanted(b, pos) && herbJoin(gen) == 0) {   // R53-F2: an idle elf near ripe herbs tends them (before the drill: it fills a stock)
                 startHerbTend(b);
                 continue;
@@ -13716,7 +13974,7 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
     for (int j = 0; j < (int)barbs.size(); j++) {
         const barb& b = barbs[j];
         if (!barbAvailable(b) || b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.target == targetDepot || b.deertargeting || b.movingbspot || b.building
-            || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb) continue;   // R47-F6: a drill slot is not a tree spot (R51-F1: nor a patrol stop; R52-F3: nor a kneel slot; R53-F2: nor the herb bed)
+            || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb || b.activity == actStudy) continue;   // R47-F6: a drill slot is not a tree spot (R51-F1: nor a patrol stop; R52-F3: nor a kneel slot; R53-F2: nor the herb bed; R59-F3: nor a bench)
         (b.target == targetRock ? rockSpots : treeSpots).emplace(workSpotKey(b.targetx, b.targety), j); // first claimant kept
     }
     treeClaim.assign(tris.size(), -1);
@@ -14153,6 +14411,13 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 printf("HERBS INTERRUPTED - barb %d\n", b.id);
                 endActivity(b, actHerb);
             } else { herbTendTick(b, sq); continue; }   // no work search at the bed: the visit is short
+        }
+        if (b.activity == actStudy) {   // R59-F3: backstop: study is exclusive with work, builds, timers, hunts and hauls
+            if (b.movingbspot || b.building || b.deertargeting || b.chopping || b.timer > 0 || b.jobKind != jobNone
+                || b.carryKind != carryNone || atForgeTask(b) || b.target != targetNone || b.inMine) {
+                printf("STUDY INTERRUPTED - barb %d\n", b.id);
+                endActivity(b, actStudy);
+            } else continue;   // studyTick() walks the scholar to its bench; no work search while studying
         }
         if (b.carryKind != carryNone) {   // R29-F1: any other state taken over the haul drops the load
             if (b.target != targetDepot || b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone) dropCarry(b);
@@ -15830,6 +16095,87 @@ void drawHerbHut(RenderWindow& window) {
     if (va.getVertexCount() > 0) window.draw(va);
 }
 
+// R59-F3: runs after buildherbhut(). Each race whose crate stands, that is at least a Hamlet and knows a tier-1 tech
+// builds one Lore Hall at its fixed spot left of the keep through buildOneOff (jobLoreHall), paid at claim with a house's
+// wood and stone kept back. The claim is not stored ("a barb of this race holds jobLoreHall"), so a lost builder frees it
+// through releaseBarbWork(). Completion registers the hall through addLoreHall().
+void buildlorehall(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount],
+                   const vector<CircleShape>& bushshapes) {
+    for (int r = 0; r < raceCount; r++) {
+        if (loreHalls[r].built || !stores[r].built || raceEra[r] < eraHamlet) continue;
+        bool anyTier1 = false;
+        for (int t = 0; t < kTier1TechCount; t++) if (know[r].learned[t]) anyTier1 = true;
+        if (!anyTier1) continue;
+        bool claimed = false;
+        for (auto& b : barbs) if (b.jobKind == jobLoreHall && b.race == r) claimed = true;
+        bool done = buildOneOff(barbs, squares, claimed, jobLoreHall, loreHallPos(r) + loreHallStandOffset, "LORE HALL",
+            [&](const barb&) {
+                FloatRect z = loreHallZone(r);
+                if (!lakeClear(z)) return -1;   // fixed spot: a lake or bush on it means no hall for this race
+                for (auto& bs : bushshapes) if (z.findIntersection(bs.getGlobalBounds())) return -1;
+                if (!canAfford(stock[r], loreHallWoodCost + houseWoodCost, loreHallStoneCost + houseStoneCost)) return -1;
+                spend(stock[r], loreHallWoodCost, loreHallStoneCost);
+                return 1;
+            }, r);
+        if (done) addLoreHall(r);
+    }
+}
+
+// R59-F3: candle brightness 0..1 for bench s, a pure function of loreClock (no state, no RNG): two slow beats and a
+// fast one, so the flame wavers without a regular pulse; frozen while paused because loreClock only moves on sim ticks
+float loreCandleLevel(int clock, int s) {
+    float t = (float)clock;
+    float v = 0.6f + 0.25f * sin(t * 0.071f + s * 2.3f) + 0.15f * sin(t * 0.23f + s * 1.1f) * sin(t * 0.017f + 0.5f);
+    return clamp(v, 0.0f, 1.0f);
+}
+
+// R59-F3: 10x8 hall (inset plum roof row, full roof row, darker eave, limestone walls, 2x3 door, two dark 2x1 windows)
+// with a 1px ground shadow. One vertex array; world layer with the other buildings, under barbs and trees. The candles
+// are drawn later by drawLoreCandles(), over the overlays.
+void drawLoreHall(RenderWindow& window) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (int r = 0; r < raceCount; r++) {
+        if (!loreHalls[r].built) continue;
+        Vector2f o = snapPx(loreHallPos(r));
+        pushQuad(va, o + Vector2f(1.0f, loreHallSize.y), Vector2f(loreHallSize.x, 1.0f), buildingShadowColor);
+        pushQuad(va, o + Vector2f(0.0f, loreHallRoofH), Vector2f(loreHallSize.x, loreHallSize.y - loreHallRoofH), loreHallWallColor);
+        pushQuad(va, o + Vector2f(1.0f, 0.0f), Vector2f(loreHallSize.x - 2.0f, 1.0f), loreHallRoofColor);
+        pushQuad(va, o + Vector2f(0.0f, 1.0f), Vector2f(loreHallSize.x, loreHallRoofH - 2.0f), loreHallRoofColor);
+        pushQuad(va, o + Vector2f(0.0f, loreHallRoofH - 1.0f), Vector2f(loreHallSize.x, 1.0f), loreHallEaveColor);
+        pushQuad(va, o + loreHallDoorPos, loreHallDoorSize, loreHallDoorColor);
+        for (auto& w : loreHallWindowPos) pushQuad(va, o + w, loreHallWindowSize, loreHallWindowColor);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R59-F3: a lit window over each bench whose scholar is seated (not still walking), colour eased between the dim and
+// bright candle by loreCandleLevel(); at night a faint additive 1px halo. Drawn after the overlays (like the house
+// lights) so the flame reads at any hour; sets the world view.
+void drawLoreCandles(RenderWindow& window, const View& worldView, const vector<barb>& barbs, bool night) {
+    window.setView(worldView);
+    static VertexArray va(PrimitiveType::Triangles), glow(PrimitiveType::Triangles);
+    va.clear();
+    glow.clear();
+    for (int r = 0; r < raceCount; r++) {
+        if (!loreHalls[r].built) continue;
+        Vector2f o = snapPx(loreHallPos(r));
+        for (int s = 0; s < kStudySeats; s++) {
+            int j = findBarbById(barbs, loreHalls[r].seatId[s]);
+            if (j < 0 || barbs[j].activity != actStudy || barbs[j].moving) continue;
+            float k = loreCandleLevel(loreClock, s);
+            auto mix = [&](uint8_t a, uint8_t b) { return (uint8_t)(a + (int)round((b - a) * k)); };
+            Color c(mix(loreCandleDimColor.r, loreCandleBrightColor.r), mix(loreCandleDimColor.g, loreCandleBrightColor.g),
+                    mix(loreCandleDimColor.b, loreCandleBrightColor.b));
+            Vector2f w = o + loreHallWindowPos[s];
+            if (night) pushQuad(glow, w - Vector2f(1.0f, 1.0f), loreHallWindowSize + Vector2f(2.0f, 2.0f), loreCandleGlowColor);
+            pushQuad(va, w, loreHallWindowSize, c);
+        }
+    }
+    if (glow.getVertexCount() > 0) window.draw(glow, BlendAdd);
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
 // R45-F1b: pale stones, one vertex array: body, 1px weathered cap (broken stones: a 4px stub, the corner knocked off),
 // 1px shaded right column, moss at the foot of every other stone. Drawn with the buildings, under barbs and trees.
 void drawRuins(RenderWindow& window) {
@@ -16266,6 +16612,7 @@ int main() {
                 buildkeeps(barbs, squares, stores);   // R31-F1: Town era
                 buildbarracks(barbs, squares, stores, bushshapes);   // R47-F6: once the keep stands; drill slot upkeep
                 buildherbhut(barbs, squares, houses, stores, bushshapes);   // R53-F2: elf herb hut and bed
+                buildlorehall(barbs, squares, stores, bushshapes);   // R59-F3: Hamlet races with a tier-1 tech raise a Lore Hall
                 wallTick(barbs, trees, tris, stumps, octs, bushshapes, houseshapes, shrines, fields);   // R31-F2: cosmetic curtain walls
                 towerTick(barbs, squares);   // R33-F2: gatehouse towers, after the wall completes
                 causewayTick();   // R33-F3: keep -> crate stone road
@@ -16273,6 +16620,7 @@ int main() {
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, rockGold, bushes, bushshapes, catchRings, fields, stores, dwarfForge);
                 barbmove(squares, barbs);
                 riteTick(barbs, squares, shrines);   // R52-F3: after the work search, so a barb between jobs is caught idle
+                studyTick(barbs, squares);   // R59-F3: bench upkeep, scholars' walk and study points; loreClock for the candles
                 shaftTick(barbs);   // R40-F1: dust puffs and lintel flash
                 shinobiTick(barbs, squares, houseshapes, octs, shinobiPuffs);
                 treespawn(trees, tris, stumps, fields, houses, barbs);
@@ -16412,6 +16760,7 @@ int main() {
 	drawMineShafts(window, barbs, squares);   // R34-F1: beside the crates, under barbs
 	drawBarracks(window);   // R47-F6: hall + straw dummy, left of the crates, under barbs
 	drawHerbHut(window);    // R53-F2: herb hut + bed, above-right of the elf crate, under barbs
+	drawLoreHall(window);   // R59-F3: hall left of the keep, under barbs (candles come after the overlays)
 	drawGarrison(window, barbs, houses, houseshapes, stores);   // INBOX-F1: bell marker, sheltering roof tint + pips
 	drawPlagueHouses(window, barbs, houses, houseshapes, camRect);   // R59-F2: faint outline round stricken houses, under barbs
 	drawRaidMarker(window, frameCount);   // R52-F1: pulsing red marker on the raided crate, opposite corner to the bell
@@ -16490,6 +16839,7 @@ int main() {
         drawPoiGlow(window, worldView, camRect, frameCount);   // R47-F4: found sites, any hour
         if (isNightHour(t)) drawCampfireGlow(window, worldView, fire, frameCount);
         if (isNightHour(t)) drawHouseLights(window, worldView, houses, houseshapes);
+        drawLoreCandles(window, worldView, barbs, isNightHour(t));   // R59-F3: study candles at any hour, halo at night
         drawProwlerOverlay(window, worldView, prowlers, fire);   // R48-F1: red eyes + safe-zone ring, above the night overlay
         drawWatchTorches(window, worldView, frameCount);   // R51-F1: torches glow above the overlay (prowler hp bars are drawn in the call above)
         drawBallots(window, worldView, zoom, barbs, squares); // above the overlays so the pips read true; under hover marks
@@ -16558,7 +16908,11 @@ int main() {
             hv.goldFound = goldFound;
             hv.day = game_day;           // R51-F3
             for (int r = 0; r < raceCount; r++)   // R55-F2: one pip row per race
-                for (int k = 0; k < techCount; k++) { hv.learned[r][k] = know[r].learned[k]; hv.pulse[r][k] = know[r].pulseFrames[k]; }
+                for (int k = 0; k < techCount; k++) {
+                    hv.learned[r][k] = know[r].learned[k];
+                    hv.pulse[r][k] = know[r].pulseFrames[k];
+                    hv.learnable[r][k] = canLearn(r, (techId)k);   // R59-F3
+                }
             hudRect = drawHud(window, hudFont, hv);
             tickerRect = drawEvents(window, hudFont);
             drawMinimap(window, minimapVerts, worldView, barbs, squares, houses, houseshapes, stores);   // UIO-F1: after the HUD, under tooltips
