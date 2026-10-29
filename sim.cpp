@@ -1777,6 +1777,26 @@ const Color herbFlowerColor(194, 164, 222);      // ripe: light purple, two pixe
 const Color herbBloomColor(228, 204, 246);       // harvest-day bloom: paler and brighter, with a third pixel on top
 const Color herbBrownColor(108, 80, 50);         // winter: browned leaves, no flower
 const Color herbStockColor(196, 168, 222);       // HUD herb count tint (the flower purple, lifted for the text)
+// R60-F2 The Herb Wardens, phase 1: an idle grown elf, while the elves hold at least one herb, walks to a sick elf (cough
+// or plague) and cures it, spending exactly one herb in the same step. healTick() (after sickTick()) owns the walk; the
+// patient is held by barb id on the healer only (healPatientId, re-resolved every tick and again on arrival), so the
+// reservation never outlives the healer. Every exit runs through endActivity() -> releaseHealPatient(). Patients are
+// found through house buckets (founders by race), never a barbs x barbs scan. A cured barb is immune until healClock
+// reaches healImmuneUntil (a tick field, not saved: 0 after any load). Herb trade and quarantine are phase 2.
+const int kHealJoinOneIn = 120;                  // an idle elf takes a patient with chance 1 in this per tick (~2 s at 1x)
+const int kHealMaxHealers = 2;                   // healers out at once per race (never more than herbs in stock)
+const float kHealSearchRadius = 220.0f;          // patients' houses farther than this from the healer are left alone
+const float kHealTouchPx = 3.0f;                 // within this of the patient the cure lands
+const float kHealRetargetPx = 6.0f;              // the walk replans only once the patient has drifted this far
+const int kHealMaxWalkTicks = 40 * 60;           // gives up on a patient it can't reach in ~40 s
+const int kHealImmuneTicks = 3 * ticksPerMinute; // short immunity after a cure (the cough's own is 15 min, the plague's 60)
+const int kHealRingTicks = 90;                   // the green pulse ring: ~1.5 s at 1x...
+const int kHealRingGapTicks = 20 * 60;           // ...and no new ring for ~20 s after one, so a plague isn't all rings
+const float kHealRingMinR = 2.0f;                // ring radius grows from this...
+const float kHealRingMaxR = 5.0f;                // ...to this (small: about two barb widths)
+const Color kHealRingColor(132, 178, 116);       // muted sage green, lighter than the grass, duller than chop green
+const uint8_t kHealRingAlpha = 150;              // fading to 0 over the ring
+const int kHealTickerGapTicks = 2 * ticksPerMinute; // at most one cure ticker line per race per ~2 real min
 // R59-F3 Lore Hall (phase 1): once a race's crate stands, it is a Hamlet and it knows a tier-1 tech, a barb of that race
 // builds one 10x8 hall left of the keep (buildOneOff, jobLoreHall). Idle elders nearby sit at one of kStudySeats benches
 // below it (activity actStudy, walked by studyTick(), ended through clearTraining() like the drill); each finished
@@ -2848,6 +2868,9 @@ struct herbGarden {bool built = false; herbPlant plants[kHerbPlants]; int ripe =
                    int lastSeason = -1; int bloomDay = -1; int spoilTicks = 0; int storedLineDay = -1; bool bareSaid = false;};
 herbGarden herbGardens[raceCount];
 int raceHerbs[raceCount] = {0, 0, 0};   // R53-F2: herb stock per race (0..kHerbStockMax); phase 2b spends it on cures
+int healClock = 0;                      // R60-F2: sim ticks counted by healTick(); base of healImmuneUntil and the ring (not saved)
+int healRingId = -1;                    // R60-F2: barb.id showing the green pulse ring, -1 = none (visual only)
+int healRingStart = 0;                  // R60-F2: healClock when that ring started
 Vector2f herbHutPos(int r) { return storehousePos[r] + herbHutCrateOffset; }
 Vector2f herbBedPos(int r) { return herbHutPos(r) + herbBedOffset; }
 Vector2f herbTendSpot(int r) { return herbBedPos(r) + herbTendOffset; }
@@ -3520,7 +3543,7 @@ enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
 // R53-F4: the one exclusive state a barb is in (work flags like chopping/building stay separate). Set only by
 // beginActivity(), cleared only by endActivity(), which also runs the activity's cleanup.
 enum barbActivity { actNone, actShelter, actExpedition, actRaidAttack, actRaidDefend, actTemper, actSmelt, actDrill, actWatch,
-                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, activityCount };   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
+                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, actHeal, activityCount };   // R60-F2: actHeal = an elf walking to cure a patient   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
 struct activityDef {
     const char* name;
     bool ownsBarb;    // its tick owns the barb outright: every job selector skips it (barbAvailable() false)
@@ -3544,6 +3567,7 @@ const activityDef activityDefs[activityCount] = {
     {"envoy",         true,  false, false},  // R56-F2: envoyTick() owns the leader for the whole trip
     {"procession",    true,  false, false},  // R59-F1: marriageTick() owns the bride and escorts for the whole trip
     {"study",         false, false, true},   // R59-F3: any claim outranks study, like the drill; studyTick() walks the scholar
+    {"heal",          false, false, true},   // R60-F2: any claim outranks the visit; healTick() walks the healer
 };
 
 struct barb {
@@ -3628,6 +3652,10 @@ struct barb {
     int dynastyIdx = -1;         // R58-F2: kDynastyNames index, -1 = no house; from a parent in makeBarb(), or crownBarb()/crownHeir
     int studySeat = -1;          // R59-F3: bench index in its race's loreHalls[].seatId while studying; -1 otherwise
     int studyTimer = 0;          // R59-F3: work ticks seated this session (separate from timer); reset by endActivity()
+    int healPatientId = -1;      // R60-F2: barb.id of the patient this healer walks to (never an index); -1 = none.
+                                 //         set only by startHeal(), cleared only by releaseHealPatient()
+    int healWalkTicks = 0;       // R60-F2: ticks since the visit began; reset by releaseHealPatient()
+    int healImmuneUntil = 0;     // R60-F2: healClock tick a cure's immunity runs to (0 = none); 0 after makeBarb() and any load
 };
 // R57-F1: age and stage from bornHour on the live clock (same hour count as chronicleNowHour())
 enum lifeStageKind { stageChild, stageAdult, stageElder };
@@ -3973,6 +4001,8 @@ void clearPlague(barb& b) {
     b.plagueTimer = 0;
     b.plagueImmune = 0;
 }
+// R60-F2: a herb cure's short immunity, to both the cough and the plague; the field expires on its own (no countdown)
+bool healImmune(const barb& b) { return b.healImmuneUntil > healClock; }
 // R59-F2: off on the road (party, raid column, caravan, exile, envoy, procession): neither spreads nor catches at home
 bool plagueAway(const barb& b) {
     return b.activity == actExpedition || b.activity == actRaidAttack || b.activity == actCaravan || b.activity == actExile
@@ -3987,6 +4017,13 @@ void resetPlague(vector<barb>& barbs) {
     for (auto& b : barbs) clearPlague(b);
     plagueActive = false;
     plagueDeaths = plagueCooldown = plagueSpreadTimer = 0;
+}
+// R60-F2: nothing of a cure survives a load: the clock restarts and every expiry goes back to 0
+void resetHeal(vector<barb>& barbs) {
+    for (auto& b : barbs) b.healImmuneUntil = 0;
+    healClock = 0;
+    healRingId = -1;
+    healRingStart = 0;
 }
 bool lootLaden(const barb& b) { return b.loot.food + b.loot.wood + b.loot.stone > 0; }   // R53-F1
 void raidMemberLost(const barb& b) {
@@ -4066,6 +4103,14 @@ void dropCarry(barb& b) {
     if (b.target == targetDepot) b.target = targetNone;
 }
 
+// R60-F2: the one place a healer's patient reservation is released. The reservation lives only on the healer (patients
+// are never marked), so clearing these fields is the whole release. Called only from endActivity()'s actHeal case.
+void releaseHealPatient(barb& b) {
+    if (b.healPatientId >= 0) printf("HEAL RELEASED - barb %d lets go of patient %d\n", b.id, b.healPatientId);
+    b.healPatientId = -1;
+    b.healWalkTicks = 0;
+}
+
 // R53-F4: the only writer of barb.activity on the way out. Runs the live activity's cleanup (what clearTraining(),
 // clearWatch(), clearKneel(), clearRaid(), clearTemper() and clearSmelt() used to do) and leaves movement alone, so a
 // task assigned right after keeps its walk; each tick stops the walk on its own exits. Safe on a barb with no activity.
@@ -4122,7 +4167,10 @@ void endActivity(barb& b) {
             b.studySeat = -1;
             b.studyTimer = 0;
             break;
-        case actKneel:      // R52-F3: nothing else to reset
+        case actHeal:        // R60-F2: the one reservation release (cure, abort, claim, backstop, death all end here)
+            releaseHealPatient(b);
+            break;
+        case actKneel:     // R52-F3: nothing else to reset
         case actCaravan:     // R54-F1: the cart's goods live on the caravan entry, not the barb
         case actExile:       // R54-F3: the trip lives on the exile entry; exileTick() resets the walk
         case actEnvoy:       // R56-F2: the coin stays in the purse until arrival; envoyTick() resets the walk
@@ -4728,6 +4776,7 @@ const char* barbTaskName(const barb& b) {
     if (b.activity == actKneel) return b.moving ? "going to the Rite" : "kneeling at the Rite";   // R52-F3
     if (b.activity == actHerb) return b.moving ? "going to the herb patch" : "tending herbs";      // R53-F2: no stripe either
     if (b.activity == actStudy) return b.moving ? "going to the Lore Hall" : "studying";         // R59-F3: no stripe; the candle shows it
+    if (b.activity == actHeal) return "going to heal";                                           // R60-F2: no stripe; the cure ring shows it
     if (b.chopping && b.target == targetBush) return "picking";
     if (b.chopping && b.target == targetField) return "harvesting";
     if (b.chopping && b.target == targetLake) return "fishing";
@@ -5861,7 +5910,7 @@ void sickTick(vector<barb>& barbs) {
     // Seed: a new outbreak only once the last one has burnt out, so each outbreak gets exactly one ticker line
     if (anySick == 0 && !barbs.empty() && roll(gen) * sickSeedOneIn < winter) {
         vector<int> open;
-        for (auto& kv : buckets) for (int i : kv.second) if (barbs[i].sickImmune <= 0 && barbs[i].health > 0) open.push_back(i);
+        for (auto& kv : buckets) for (int i : kv.second) if (barbs[i].sickImmune <= 0 && !healImmune(barbs[i]) && barbs[i].health > 0) open.push_back(i);   // R60-F2
         if (!open.empty()) {
             barb& p = barbs[open[uniform_int_distribution<int>(0, (int)open.size() - 1)(gen)]];
             int r = clampRace(p.race);
@@ -5886,7 +5935,7 @@ void sickTick(vector<barb>& barbs) {
         float chance = sickSpreadPerKin * sickHere * winter * ((int)m.size() >= sickCrowdSize ? sickCrowdMult : 1.0f);
         for (int i : m) {
             barb& b = barbs[i];
-            if (b.sick > 0 || b.sickImmune > 0 || b.health <= 0) continue;
+            if (b.sick > 0 || b.sickImmune > 0 || healImmune(b) || b.health <= 0) continue;   // R60-F2: a fresh cure holds
             // R53-F3: the race's omen scales the catch rate
             if (roll(gen) < chance * omenMult(clampRace(b.race), omenCough)) { catchCough(b); printf("COUGH SPREADS - %s (house %d)\n", b.name, kv.first); }
         }
@@ -6024,6 +6073,23 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             ring.setOutlineColor(rc);
             ring.setOutlineThickness(1.0f);   // outside the rect: the frame sits 2px out, leaving a 1px gap round the sprite
             window.draw(ring);
+        }
+        int healAge = healClock - healRingStart;   // R60-F2: sim ticks since this barb's herb cure (only the ring holder)
+        if (b.id == healRingId && healAge >= 0 && healAge < kHealRingTicks) {
+            // R60-F2: green pulse ring, under the sprite: a 1px sage circle round the body centre, growing from
+            // kHealRingMinR to kHealRingMaxR and fading out. Round, so it never reads as the square survivor frame.
+            static CircleShape pulse(kHealRingMinR, 16);
+            float t = (float)healAge / kHealRingTicks;
+            float rad = kHealRingMinR + (kHealRingMaxR - kHealRingMinR) * t;
+            Color pc = kHealRingColor;
+            pc.a = (uint8_t)(kHealRingAlpha * (1.0f - t));
+            pulse.setRadius(rad);
+            pulse.setOrigin(Vector2f(rad, rad));
+            pulse.setPosition(Vector2f(base.x + bodySize.x / 2.0f, feet - bodyH / 2.0f));   // unbobbed body centre
+            pulse.setFillColor(Color::Transparent);
+            pulse.setOutlineColor(pc);
+            pulse.setOutlineThickness(1.0f);
+            window.draw(pulse);
         }
         if (stage == stageChild) {   // R57-F1: faint 1px rim under the small body, so a child reads as one at a glance
             body.setSize(Vector2f(bodySize.x + 2.0f, bodyH + 2.0f));
@@ -7500,11 +7566,14 @@ FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues
     if (toolTierSeen) innerW += stockCellGap + tierIconW;
     if (veil.faithSeen) innerW += stockCellGap + faithTickW;   // R51-F2: faith tick
     // R53-F2: herb count (icon + number), last in the row, shown only once a race has a herb hut and only in that row
-    bool herbCol = anyHerbHut();
+    // R60-F2: and only while that race holds at least one herb (the column goes when every stock is empty)
+    auto herbShown = [](int r) { return herbHutBuilt(r) && raceHerbs[r] > 0; };
+    bool herbCol = false;
+    for (int r = 0; r < raceCount; r++) herbCol = herbCol || herbShown(r);
     float herbNumW = Text(font, stockMinNumber, stockFontSize).getLocalBounds().size.x;
     if (herbCol) {
         for (int r = 0; r < raceCount; r++)
-            if (herbHutBuilt(r)) herbNumW = max(herbNumW, Text(font, to_string(raceHerbs[r]), stockFontSize).getLocalBounds().size.x);
+            if (herbShown(r)) herbNumW = max(herbNumW, Text(font, to_string(raceHerbs[r]), stockFontSize).getLocalBounds().size.x);
         innerW += stockCellGap + iconSize + stockIconGap + herbNumW;
     }
     // R60-F1: WAR chip, last in the row, the column shown only while some race is at war and the chip only in its rows
@@ -7606,11 +7675,11 @@ FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues
             window.draw(tick);
             x += faithTickW;
         }
-        if (herbCol && herbHutBuilt(r)) {   // R53-F2: sprig icon + herb stock, purple; dim when the race is empty or the store bare
+        if (herbCol && herbShown(r)) {   // R53-F2: sprig icon + herb stock, purple; dim when the race is empty (R60-F2: hidden at 0)
             x += stockCellGap;
             drawIcon(window, iconHerb, Vector2f(x, round(y + (rowH - iconSize) / 2.0f)), stockIconPx);
             Text t(font, to_string(raceHerbs[r]), stockFontSize);
-            t.setFillColor(empty ? stockEmptyRaceColor : raceHerbs[r] <= 0 ? stockShortColor : herbStockColor);
+            t.setFillColor(empty ? stockEmptyRaceColor : herbStockColor);
             t.setPosition(Vector2f(round(x + iconSize + stockIconGap - t.getLocalBounds().position.x), textY));
             window.draw(t);
         }
@@ -9664,6 +9733,9 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.order = needNone;   // INBOX-F2b: a newborn holds no order
     b.orderTicks = 0;
     clearPlague(b);       // R59-F2: no case and no immunity, for a newborn and a chronicle returner alike
+    b.healPatientId = -1; // R60-F2: no visit and no cure immunity either
+    b.healWalkTicks = 0;
+    b.healImmuneUntil = 0;
     b.bornHour = chronicleNowHour();   // R55-F4
     if (saved) {   // R55-F4: a returner keeps who it was; the caller has already cleared barbNameUsed and set sasukeTaken
         b.birthRace = (barbRace)clampRace(saved->birthRace);
@@ -9780,6 +9852,7 @@ void crownBarb(vector<barb>& barbs, int i, int r) {
 // always fires on a load: the oldest returners by name, or the founders when the file had no barbs (v1/v2).
 void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<RectangleShape>& squares, vector<birthRing>& rings) {
     resetPlague(barbs);   // R59-F2: no case, immunity or outbreak survives a load (returners are cleared again in makeBarb())
+    resetHeal(barbs);     // R60-F2: nor a cure's immunity or its ring
     if (d.barbs.empty()) {
         for (auto& b : barbs) b.bornHour = chronicleNowHour() - founderAgeHours();   // founders arrive on the restored clock (R57-F1: grown)
         printf("CHRONICLE - no barbs saved: the %d founders stay\n", (int)barbs.size());
@@ -9902,7 +9975,8 @@ void shinobiTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
         barb& b = barbs[i];
         if (!b.shinobi) continue;
         if (!barbAvailable(b) || b.moving || b.chopping || b.building || b.movingbspot || b.deertargeting || b.timer > 0 || b.jobKind != jobNone
-            || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb || b.activity == actStudy) continue;   // R47-F6: no blinking off the drill slot (R51-F1: or the watch; R52-F3: or the rite; R53-F2: or the herb bed; R59-F3: or the bench)
+            || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb || b.activity == actStudy
+            || b.activity == actHeal) continue;   // R60-F2: nor off a healer's walk. R47-F6: no blinking off the drill slot (R51-F1: or the watch; R52-F3: or the rite; R53-F2: or the herb bed; R59-F3: or the bench)
         if (blinkChance(gen) != 0) continue;
         Vector2f from = squares[i].getPosition(), size = squares[i].getSize();
         for (int t = 0; t < shinobiBlinkTries; t++) {
@@ -10977,7 +11051,7 @@ void plagueCarryHome(vector<barb>& barbs, int i, int src, const char* how) {
     if (b.plagueTimer > 0) {
         if (!exiled) return;   // a case it left home with is not a new arrival
     } else {
-        if (b.plagueImmune > 0 || plagueCasesIn(barbs, src) == 0) return;
+        if (b.plagueImmune > 0 || healImmune(b) || plagueCasesIn(barbs, src) == 0) return;   // R60-F2
         if (uniform_real_distribution<float>(0.0f, 1.0f)(gen) >= kPlagueCarryChance) return;
         catchPlague(b);
     }
@@ -11015,7 +11089,7 @@ void plagueTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
         for (int i = 0; i < (int)barbs.size(); i++) {
             const barb& b = barbs[i];
             int r = clampRace(b.race);
-            if (b.health > 0 && !plagueAway(b) && b.plagueImmune <= 0 && raceLiving[r] > kPlagueMinRacePop) open[r].push_back(i);
+            if (b.health > 0 && !plagueAway(b) && b.plagueImmune <= 0 && !healImmune(b) && raceLiving[r] > kPlagueMinRacePop) open[r].push_back(i);   // R60-F2
         }
         vector<int> races;
         for (int r = 0; r < raceCount; r++) if (!open[r].empty()) races.push_back(r);
@@ -11065,7 +11139,7 @@ void plagueTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
             openHere.clear();
             for (int i : m) {
                 if (barbs[i].plagueTimer > 0) here++;
-                else if (barbs[i].plagueImmune <= 0) openHere.push_back(i);
+                else if (barbs[i].plagueImmune <= 0 && !healImmune(barbs[i])) openHere.push_back(i);   // R60-F2
             }
             if (openHere.empty()) continue;
             int near = 0;
@@ -11118,6 +11192,153 @@ void plagueTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
         plagueGraveNext = true;
         removeBarb(barbs, squares, i, sh, fg, stores, fields);
         plagueGraveNext = false;
+    }
+}
+
+// R60-F2: may this barb set out as a healer? An idle, standing, grown, well elf with no order (like herbWanted()).
+bool orderIdle(const barb& b);
+bool healWanted(const barb& b) {
+    return b.race == kHerbRace && b.health > 0 && b.sick <= 0 && b.plagueTimer <= 0 && lifeStage(b) != stageChild
+        && b.activity == actNone && !b.moving && b.timer <= 0 && !b.inMine && b.target == targetNone && b.order == needNone && orderIdle(b);
+}
+// R60-F2: may barb p be cured by race r's healers now? Sick (cough or plague), alive, of the race, at home and reachable
+// (no tick owns it, not down the shaft) and not out healing itself.
+bool healPatientOpen(const barb& p, int r) {
+    return p.race == r && p.health > 0 && (p.sick > 0 || p.plagueTimer > 0) && barbAvailable(p) && !p.inMine && p.activity != actHeal;
+}
+
+// R60-F2: the only place the heal visit is set. The patient is held by id on the healer until endActivity().
+void startHeal(barb& b, const barb& p, Vector2f at) {
+    beginActivity(b, actHeal);
+    b.healPatientId = p.id;
+    b.healWalkTicks = 0;
+    b.target = targetNone;
+    b.targetx = (int)at.x;
+    b.targety = (int)at.y;
+    b.wanderX = b.wanderY = -1;
+    b.moving = true;
+    b.stepTimer = 0;
+    printf("HEAL STARTED - barb %d (%s) goes to %s (%s), %d herbs\n", b.id, b.name, p.name, p.plagueTimer > 0 ? "plague" : "cough",
+           raceHerbs[clampRace(b.race)]);
+}
+
+// R60-F2: once per sim tick, right after sickTick(). Counts healClock, then: (1) buckets the herb race's open patients by
+// house (founders by race), one pass over barbs; (2) walks every healer, re-resolving its patient by id each tick and
+// re-checking it on arrival, and cures it there, spending exactly one herb in the same step; (3) may send idle grown
+// elves out (at most kHealMaxHealers, never more than the herbs in stock), each to an unreserved patient found house
+// bucket by house bucket (plague first, then nearest). The reservation is only ever the healer's healPatientId.
+void healTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
+    static unordered_map<int, vector<int>> buckets;   // house id (founders: -1 - race) -> open patient indices, this tick only
+    static unordered_map<int, int> patientIdx;        // open patient barb.id -> index, this tick only
+    static vector<int> reserved;                      // patient ids some healer holds, this tick only (a handful at most)
+    static int tickerAt[raceCount] = {};              // healClock of the race's last cure ticker line
+    static bool tickerSaid[raceCount] = {};
+    static uniform_int_distribution<int> join(0, kHealJoinOneIn - 1);
+    healClock++;
+    const int r = kHerbRace;
+    int n = min((int)barbs.size(), (int)squares.size());
+
+    for (auto& kv : buckets) kv.second.clear();
+    patientIdx.clear();
+    reserved.clear();
+    for (int i = 0; i < n; i++) {
+        const barb& b = barbs[i];
+        if (b.activity == actHeal && b.healPatientId >= 0) reserved.push_back(b.healPatientId);
+        if (!healPatientOpen(b, r)) continue;
+        patientIdx[b.id] = i;
+        buckets[b.homeHouse >= 0 ? b.homeHouse : -1 - clampRace(b.race)].push_back(i);
+    }
+
+    int healers = 0;
+    for (int i = 0; i < n; i++) {
+        barb& b = barbs[i];
+        if (b.activity != actHeal) continue;
+        auto stop = [&]() {
+            b.moving = false; clearRoute(b);
+            b.stepTimer = 0;
+            b.targetx = b.targety = -1;
+        };
+        auto it = patientIdx.find(b.healPatientId);
+        const char* why = b.race != r ? "left the race" : it == patientIdx.end() ? "patient gone or well"
+                        : raceHerbs[r] <= 0 ? "no herbs left" : ++b.healWalkTicks > kHealMaxWalkTicks ? "patient out of reach" : nullptr;
+        if (why) {
+            printf("HEAL ABORTED - barb %d, %s\n", b.id, why);
+            endActivity(b, actHeal);
+            stop();
+            continue;
+        }
+        int j = it->second;
+        Vector2f pp = squares[j].getPosition(), hp = squares[i].getPosition();
+        Vector2f d = pp - hp;
+        if (d.x * d.x + d.y * d.y > kHealTouchPx * kHealTouchPx) {
+            healers++;
+            // keep the planned walk until the patient drifts kHealRetargetPx from it (or the healer reaches the old spot)
+            Vector2f g = pp - Vector2f((float)b.targetx, (float)b.targety), t = Vector2f((float)b.targetx, (float)b.targety) - hp;
+            if (b.targetx < 0 || g.x * g.x + g.y * g.y > kHealRetargetPx * kHealRetargetPx || t.x * t.x + t.y * t.y < 1.0f) {
+                b.targetx = (int)pp.x;
+                b.targety = (int)pp.y;
+            }
+            b.moving = true;
+            walkStep(b, squares[i]);
+            continue;
+        }
+        // arrival: check the patient again by id, then the herb and the cure in one step
+        barb& p = barbs[j];
+        if (p.id != b.healPatientId || !healPatientOpen(p, r) || raceHerbs[r] < 1) {
+            printf("HEAL ABORTED - barb %d, patient no longer open on arrival\n", b.id);
+            endActivity(b, actHeal);
+            stop();
+            continue;
+        }
+        bool plague = p.plagueTimer > 0;
+        raceHerbs[r]--;
+        if (p.plagueTimer > 0) clearPlague(p);
+        if (p.sick > 0) clearSick(p);
+        p.healImmuneUntil = healClock + kHealImmuneTicks;
+        printf("HEAL CURED - %s cures %s of the %s (%s herbs left %d)\n", b.name, p.name, plague ? "plague" : "cough", racePlurals[r], raceHerbs[r]);
+        if (healRingId < 0 || healClock - healRingStart >= kHealRingTicks + kHealRingGapTicks) {   // one ring, then a quiet gap
+            healRingId = p.id;
+            healRingStart = healClock;
+        }
+        if (!tickerSaid[r] || healClock - tickerAt[r] >= kHealTickerGapTicks) {
+            tickerSaid[r] = true;
+            tickerAt[r] = healClock;
+            logRaceEvent(string(b.name) + " cures " + p.name + " of the " + (plague ? "Red Plague" : "cough") + " with a herb ("
+                         + to_string(raceHerbs[r]) + " left)", r);
+        }
+        endActivity(b, actHeal);
+        stop();
+    }
+
+    // new visits: herbs in hand beyond those already promised, and someone to cure
+    if (buckets.empty() || healers >= kHealMaxHealers || healers >= raceHerbs[r]) return;
+    for (int i = 0; i < n && healers < kHealMaxHealers && healers < raceHerbs[r]; i++) {
+        barb& b = barbs[i];
+        if (!healWanted(b) || join(gen) != 0) continue;
+        Vector2f hp = squares[i].getPosition();
+        int best = -1;
+        float bestScore = 0.0f;
+        for (auto& kv : buckets) {   // one anchor per house: its first open patient
+            const vector<int>& m = kv.second;
+            if (m.empty()) continue;
+            Vector2f d = squares[m[0]].getPosition() - hp;
+            float dSq = d.x * d.x + d.y * d.y;
+            if (dSq > kHealSearchRadius * kHealSearchRadius) continue;
+            int pick = -1;
+            bool plague = false;
+            for (int k : m) {
+                const barb& p = barbs[k];
+                if (p.id == b.id || find(reserved.begin(), reserved.end(), p.id) != reserved.end() || !healPatientOpen(p, r)) continue;
+                if (pick < 0 || (p.plagueTimer > 0 && !plague)) { pick = k; plague = p.plagueTimer > 0; }
+            }
+            if (pick < 0) continue;
+            float score = plague ? dSq * 0.25f : dSq;   // the plague draws a healer from twice as far
+            if (best < 0 || score < bestScore) { best = pick; bestScore = score; }
+        }
+        if (best < 0) continue;
+        reserved.push_back(barbs[best].id);
+        startHeal(b, barbs[best], squares[best].getPosition());
+        healers++;
     }
 }
 
@@ -12049,7 +12270,8 @@ bool orderIdle(const barb& b) {
         && b.activity != actDrill     // R47-F6: drillers take no orders and join no party (expedition preference deferred)
         && b.activity != actWatch     // R51-F1: nor do watchmen (and so they never start a drill)
         && b.activity != actHerb      // R53-F2: nor do herb tenders (the bed visit is short)
-        && b.activity != actStudy;    // R59-F3: nor do scholars
+        && b.activity != actStudy     // R59-F3: nor do scholars
+        && b.activity != actHeal;     // R60-F2: nor do healers on a visit
 }
 
 // INBOX-F2b: right after the leader names its need, it hands that need as an individual order to idle members (not
@@ -14261,7 +14483,8 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
         auto& sq = squares[i];
         auto& b  = barbs[i];
         if (!barbAvailable(b) || b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone || atForgeTask(b)) continue;   // R29-F1: haulTick() walks haulers; INBOX-F1: bellTick() walks garrisoned; R41-F2: temperTick() walks temperers (R47-F7: smeltTick() smelters); R45-F2: expeditionTick() walks parties
-        if (b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb || b.activity == actStudy) continue;   // R47-F6: drillTick() walks drillers; R51-F1: watchTick() walks watchmen; R52-F3: riteTick() kneelers; R53-F2: herbTendTick() tenders; R59-F3: studyTick() scholars
+        if (b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb || b.activity == actStudy
+            || b.activity == actHeal) continue;   // R60-F2: healTick() walks healers. R47-F6: drillTick() walks drillers; R51-F1: watchTick() walks watchmen; R52-F3: riteTick() kneelers; R53-F2: herbTendTick() tenders; R59-F3: studyTick() scholars
         Vector2f pos = sq.getPosition();
         if (!b.moving) {
             if (studyWanted(b, pos) && studyJoin(gen) == 0) {   // R59-F3: an idle elder near its Lore Hall sits to study
@@ -14313,7 +14536,8 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
     for (int j = 0; j < (int)barbs.size(); j++) {
         const barb& b = barbs[j];
         if (!barbAvailable(b) || b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.target == targetDepot || b.deertargeting || b.movingbspot || b.building
-            || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb || b.activity == actStudy) continue;   // R47-F6: a drill slot is not a tree spot (R51-F1: nor a patrol stop; R52-F3: nor a kneel slot; R53-F2: nor the herb bed; R59-F3: nor a bench)
+            || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb || b.activity == actStudy
+            || b.activity == actHeal) continue;   // R60-F2: nor a patient. R47-F6: a drill slot is not a tree spot (R51-F1: nor a patrol stop; R52-F3: nor a kneel slot; R53-F2: nor the herb bed; R59-F3: nor a bench)
         (b.target == targetRock ? rockSpots : treeSpots).emplace(workSpotKey(b.targetx, b.targety), j); // first claimant kept
     }
     treeClaim.assign(tris.size(), -1);
@@ -14757,6 +14981,13 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 printf("STUDY INTERRUPTED - barb %d\n", b.id);
                 endActivity(b, actStudy);
             } else continue;   // studyTick() walks the scholar to its bench; no work search while studying
+        }
+        if (b.activity == actHeal) {   // R60-F2: backstop: a visit is exclusive with work, builds, timers, hunts and hauls
+            if (b.movingbspot || b.building || b.deertargeting || b.chopping || b.timer > 0 || b.jobKind != jobNone
+                || b.carryKind != carryNone || atForgeTask(b) || b.target != targetNone || b.inMine) {
+                printf("HEAL INTERRUPTED - barb %d\n", b.id);
+                endActivity(b, actHeal);
+            } else continue;   // healTick() walks the healer to its patient; no work search on a visit
         }
         if (b.carryKind != carryNone) {   // R29-F1: any other state taken over the haul drops the load
             if (b.target != targetDepot || b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone) dropCarry(b);
@@ -17007,6 +17238,7 @@ int main() {
                 faithShrineTick(shrines);   // R51-F2: shrine motes at a faith-scaled rate (faith itself eases in veilTick)
                 hungerTick(barbs);
                 sickTick(barbs);   // R52-F4: after meals heal, before starveDeathTick() removes the fallen
+                healTick(barbs, squares);   // R60-F2: herb wardens walk to the sick and cure them, one herb each
                 ageDeathTick(barbs);   // R57-F1: old age, likewise before starveDeathTick()
                 trailTick();
                 birdTick(birds, birdHeading, squares, barbs);
