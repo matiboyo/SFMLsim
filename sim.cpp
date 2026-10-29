@@ -328,7 +328,8 @@ const char* const kChroniclePath = "chronicle.sav";
 const char* const kChronicleTmpPath = "chronicle.sav.tmp";
 const int32_t kChronicleMagic = 0x4C524843;         // "CHRL" little-endian
 const int32_t kChronicleEndMark = 0x444E4543;       // "CEND": trailer, so a truncated file is rejected
-const int32_t kChronicleVersion = 4;                // R58-F2: v4 widens each BARB entry with parents and dynasty
+const int32_t kChronicleVersion = 5;                // R59-F1: v5 adds the "ALLY" block (alliances and their brides)
+const int32_t kChronicleVersionDynasty = 4;         // R58-F2: v4 widens each BARB entry with parents and dynasty; still loads
 const int32_t kChronicleVersionBlocks = 3;          // R55-F4: v3 adds tagged blocks (named barbs first) after the houses; still loads
 const int32_t kChronicleVersionEras = 2;            // R54-F4: v2 adds the per-race era array after the relations; still loads
 const int32_t kChronicleVersionNoEras = 1;          // v1 files (no eras) still load, with every race back at Camp
@@ -339,6 +340,7 @@ const int32_t kChronicleBlockBarbs = 0x42524142;    // "BARB": the named barbs a
 const int32_t kChronicleBlockKnow = 0x574F4E4B;     // R55-F2 "KNOW": techs, then per race per tech {count, learned}
 const int32_t kChronicleBlockPurse = 0x53525550;   // R55-F3 "PURS": raceCount, then each race's purse
 const int kChronicleMaxPurse = 1000000;             // per-race purse bound on load
+const int32_t kChronicleBlockAlly = 0x594C4C41;     // R59-F1 "ALLY": raceCount, then per race {ally race, bride file barb index}
 const int kChronicleMaxBlocks = 32;                // blocks per file; more is rejected
 const int kChronicleMaxBlockWords = 1 << 20;        // int32 words in one block; more is rejected
 const int kChronicleMaxBarbs = 2000;                // a load with more barbs than this is rejected; a save writes at most this many
@@ -962,6 +964,24 @@ const int kEnvoyCrateSlot = 3;                // stands this many column gaps le
 const Vector2f kEnvoyPipSize(1.0f, 2.0f);     // upright 1x2 coin stack beside the envoy (the caravan pip is a 1px dot on a cart)
 const Color kEnvoyPipColor(226, 164, 44);     // deep amber gold: apart from the pale brass cart pips and the bright crown
 const Color kTributeTickerTint(226, 196, 120);   // warm gold: apart from the trade jade, the raid reds and the exile tan
+// R59-F1 Dynastic Bride-Price Marriages, phase 1: at dawn a leader's adult child of a named house (not the heir) walks
+// with two escorts (actProcession, owned by marriageTick()) to the crate of a neutral-or-better race whose leader has a
+// house. On arrival that race pays the bride-price (food + wood) to hers, she joins it and the two races become allies
+// (allyOf[], isAllied()): the raid launcher skips allies. The bride is held by stable id; her death (removeBarb())
+// breaks the alliance. Ally defenders and feuds are phase 2.
+const int kMaxAlliancesPerRace = 1;           // allyOf[] holds one ally per race
+const int kMarriageMembers = 3;               // bride (heads the column) + two escorts
+const int kBridePriceFood = 4;                // paid by the groom's race to the bride's on arrival
+const int kBridePriceWood = 4;
+const raceStock kBridePriceKeep{6, 0, 8};     // (wood, stone, food) the groom's race keeps on top of the price
+const int kMarriageMinHealth = 50;            // bride and escorts must be at least this hale (and not hungry)
+const float kMarriageRecruitRadius = 140.0f;  // bride and escorts come from within this of their own crate centre
+const int kMarriageMaxTicks = 12 * ticksPerMinute;   // backstop on the whole trip
+const int kMarriageCooldownTicks = 2 * 24 * ticksPerGameHour;   // per race after a wedding, abort or broken alliance
+const int kMarriageCrateSlot = 1;             // the bride stands this many column gaps left of the groom crate's stand spot
+const Color kMarriageTickerTint(218, 172, 190);   // dusty rose: apart from the trade jade, tribute gold and raid reds
+const float kAllyStripeRow = 3.0f;            // 1px band across the crate body, between the lid edge and the rope band
+const float kAllyStripeSegPx = 2.0f;          // alternating 2px segments: own lifted crate colour, then the ally's
 
 // Skittish deer: bolt away from a nearby barb for a short, capped time, then a cooldown so hunts can still land
 const int deerStepInterval = 3;            // ticks per 1px step while wandering (deer row of speciesDefs)
@@ -3315,7 +3335,7 @@ enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
 // R53-F4: the one exclusive state a barb is in (work flags like chopping/building stay separate). Set only by
 // beginActivity(), cleared only by endActivity(), which also runs the activity's cleanup.
 enum barbActivity { actNone, actShelter, actExpedition, actRaidAttack, actRaidDefend, actTemper, actSmelt, actDrill, actWatch,
-                    actKneel, actHerb, actCaravan, actExile, actEnvoy, activityCount };   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy
+                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, activityCount };   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
 struct activityDef {
     const char* name;
     bool ownsBarb;    // its tick owns the barb outright: every job selector skips it (barbAvailable() false)
@@ -3337,6 +3357,7 @@ const activityDef activityDefs[activityCount] = {
     {"caravan",       true,  false, false},  // R54-F1: caravanTick() owns the barb for the whole trip
     {"emigrate",      true,  false, false},  // R54-F3: exileTick() owns the migrant until it joins or is called back
     {"envoy",         true,  false, false},  // R56-F2: envoyTick() owns the leader for the whole trip
+    {"procession",    true,  false, false},  // R59-F1: marriageTick() owns the bride and escorts for the whole trip
 };
 
 struct barb {
@@ -3649,6 +3670,34 @@ void envoyMemberLost(const barb& b) {
 }
 int envoyCoinId() { return envoy.active && envoy.phase == envoyTrip::Out ? envoy.barbId : -1; }   // R56-F2: drawBarbs() pip
 
+// R59-F1: the one wedding procession. Members are held by barb id (never an index) and re-resolved by marriageTick()
+// every tick; memberIds[0] is the bride until she is wed (then -1, and `wed` is set). removeBarb() drops a dying
+// member's id through marriageMemberLost(), and the trip aborts the next tick.
+struct marriageTrip {
+    enum Phase {Out, Home} phase = Out;
+    bool active = false;
+    bool wed = false;                       // the bride has joined the groom's race; only the escorts walk home
+    int from = -1, to = -1;                 // bride's race and the groom's race
+    int memberIds[kMarriageMembers] = {-1, -1, -1};
+    int ticks = 0;
+};
+marriageTrip marriage;
+static_assert(kMarriageMembers == 3, "marriageTrip::memberIds initialiser is written for three members");
+// R59-F1: allyOf[r] = the race r is allied with (-1 = none), always symmetric; allyBrideId[r] = barb.id of the bride
+// that binds it (the same id on both sides). Written only by formAlliance()/breakAlliance() and the chronicle load.
+static_assert(kMaxAlliancesPerRace == 1, "allyOf holds a single ally per race");
+int allyOf[raceCount] = {-1, -1, -1};
+int allyBrideId[raceCount] = {-1, -1, -1};
+int marriageCooldown[raceCount] = {0, 0, 0};   // ticks before race r may send or receive another bride
+bool isAllied(int a, int b) {
+    return a >= 0 && a < raceCount && b >= 0 && b < raceCount && a != b && allyOf[a] == b && allyOf[b] == a;
+}
+int allianceCount(int r) { return r >= 0 && r < raceCount && allyOf[r] >= 0 ? 1 : 0; }
+void marriageMemberLost(const barb& b) {
+    if (!marriage.active) return;
+    for (auto& id : marriage.memberIds) if (id == b.id) id = -1;
+}
+
 // R52-F1: the one way out of the raid state, on every exit (outcome, abort, beaten defender, removeBarb, backstop)
 bool inRaid(const barb& b) { return b.activity == actRaidAttack || b.activity == actRaidDefend; }   // R53-F4
 void clearRaid(barb& b) {
@@ -3797,6 +3846,7 @@ void endActivity(barb& b) {
         case actCaravan:     // R54-F1: the cart's goods live on the caravan entry, not the barb
         case actExile:       // R54-F3: the trip lives on the exile entry; exileTick() resets the walk
         case actEnvoy:       // R56-F2: the coin stays in the purse until arrival; envoyTick() resets the walk
+        case actProcession:  // R59-F1: the trip lives on the marriage entry; marriageTick() resets the walk
         case actNone:
         case activityCount:
             break;
@@ -4385,6 +4435,9 @@ const char* barbTaskName(const barb& b) {
              : caravan.phase == caravanTrip::Home ? "caravan: heading home" : "caravan: on the road";
     if (b.activity == actExile) return "emigrating";   // R54-F3: the tooltip names the destination
     if (b.activity == actEnvoy) return envoy.phase == envoyTrip::Home ? "envoy: heading home" : "envoy: carrying tribute";   // R56-F2
+    if (b.activity == actProcession)   // R59-F1
+        return marriage.phase == marriageTrip::Home ? "wedding procession: heading home"
+             : marriage.memberIds[0] == b.id ? "wedding procession: the bride" : "wedding procession: escort";
     if (b.deertargeting) return b.hasSpear ? weaponOf(b).huntLabel : "hunting";   // R47-F8: "hunting (axe)" for dwarves
     if (b.building) return "building";
     if (b.activity == actTemper) return "tempering pick";   // R41-F2
@@ -7621,6 +7674,9 @@ struct chronicleData {
     bool knowLearned[raceCount][techCount] = {};
     bool havePurse = false;                        // R55-F3: a "PURS" block was read (absent in v1/v2 and earlier v3 files)
     int purse[raceCount] = {};                     // 0..kChronicleMaxPurse each
+    bool haveAlly = false;                         // R59-F1: an "ALLY" block was read (absent before v5)
+    int ally[raceCount] = {-1, -1, -1};            // -1..raceCount-1; checked for symmetry by chronicleRestoreBarbs()
+    int allyBride[raceCount] = {-1, -1, -1};       // index into barbs (the BARB block), -1 = none
 };
 
 int chronicleNameIndex(const barb& b) {   // R55-F4: -1 for Sasuke; names only ever come from barbNames or shinobiName
@@ -7684,6 +7740,27 @@ bool chronicleSavePurse(FILE* f) {
     return ok;
 }
 
+// R59-F1: the "ALLY" block. The bride is written as her index in the BARB block (same keep rule as
+// chronicleSaveBarbs(): living barbs in order, up to kChronicleMaxBarbs); a bride not written leaves the alliance out.
+bool chronicleSaveAlly(FILE* f, const vector<barb>& barbs) {
+    auto fileIndex = [&](int id) {
+        int k = 0;
+        for (auto& b : barbs) {
+            if (b.health <= 0) continue;
+            if (k >= kChronicleMaxBarbs) break;
+            if (b.id == id) return k;
+            k++;
+        }
+        return -1;
+    };
+    bool ok = chronPut(f, kChronicleBlockAlly) && chronPut(f, 1 + raceCount * 2) && chronPut(f, raceCount);
+    for (int r = 0; ok && r < raceCount; r++) {
+        int bride = isAllied(r, allyOf[r]) ? fileIndex(allyBrideId[r]) : -1;
+        ok = chronPut(f, bride >= 0 ? allyOf[r] : -1) && chronPut(f, bride);
+    }
+    return ok;
+}
+
 bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
     FILE* f = fopen(kChronicleTmpPath, "wb");
     if (!f) { printf("CHRONICLE - save failed: cannot open %s\n", kChronicleTmpPath); return false; }
@@ -7706,6 +7783,7 @@ bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
     ok = ok && chronicleSaveBarbs(f, barbs, houses, n);   // R55-F4 (v3): tagged blocks follow the houses; later blocks go here
     ok = ok && chronicleSaveKnow(f);                      // R55-F2: same v3 format, one more block
     ok = ok && chronicleSavePurse(f);                     // R55-F3: same v3 format, one more block
+    ok = ok && chronicleSaveAlly(f, barbs);               // R59-F1 (v5)
     ok = ok && chronPut(f, kChronicleEndMark);
     if (fclose(f) != 0) ok = false;
     if (!ok) {
@@ -7731,7 +7809,7 @@ bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
 // R58-F2: a v4 entry adds parentA, parentB and dynasty; a v3 entry has none, so those stay -1 (no parents, no house).
 bool chronicleReadBarbs(FILE* f, int words, int version, chronicleData& d, const char*& why) {
     int n = 0;
-    const int perBarb = version >= kChronicleVersion ? kChronicleBarbWords : kChronicleBarbWordsV3;
+    const int perBarb = version >= kChronicleVersionDynasty ? kChronicleBarbWords : kChronicleBarbWordsV3;   // R59-F1: v5 too
     if (words < 1 || !chronGetIn(f, 0, kChronicleMaxBarbs, n)) { why = "barb count over the cap"; return false; }
     if (words != 1 + n * perBarb) { why = "barb block size differs"; return false; }
     const int hungerCap = hungerThreshold * kChronicleMaxHungerMult;
@@ -7784,6 +7862,20 @@ bool chronicleReadPurse(FILE* f, int words, chronicleData& d, const char*& why) 
     return true;
 }
 
+// R59-F1: the "ALLY" block into d. Race count must match and every value be in range, else the file is rejected; the
+// pairing itself (symmetry, bride index, bride's race) is checked by chronicleRestoreBarbs(), which drops a bad pair.
+bool chronicleReadAlly(FILE* f, int words, chronicleData& d, const char*& why) {
+    int races = 0;
+    if (words != 1 + raceCount * 2 || !chronGetIn(f, raceCount, raceCount, races)) { why = "ally block size differs"; return false; }
+    for (int r = 0; r < raceCount; r++)
+        if (!chronGetIn(f, -1, raceCount - 1, d.ally[r]) || !chronGetIn(f, -1, kChronicleMaxBarbs - 1, d.allyBride[r])) {
+            why = "ally out of range";
+            return false;
+        }
+    d.haveAlly = true;
+    return true;
+}
+
 // Reads and bounds-checks the whole file into out; nothing global is touched here. why = the rejection reason.
 bool chronicleRead(chronicleData& out, const char*& why) {
     why = nullptr;
@@ -7796,8 +7888,8 @@ bool chronicleRead(chronicleData& out, const char*& why) {
     const int offMax = (int)worldSize;
     do {
         if (!chronGet(f, v) || v != kChronicleMagic) { why = "not a chronicle file"; break; }
-        if (!chronGet(f, v) || (v != kChronicleVersion && v != kChronicleVersionBlocks && v != kChronicleVersionEras
-                                && v != kChronicleVersionNoEras)) {
+        if (!chronGet(f, v) || (v != kChronicleVersion && v != kChronicleVersionDynasty && v != kChronicleVersionBlocks
+                                && v != kChronicleVersionEras && v != kChronicleVersionNoEras)) {
             why = "unknown version"; break;
         }
         int version = v;
@@ -7850,6 +7942,9 @@ bool chronicleRead(chronicleData& out, const char*& why) {
                 } else if (tag == kChronicleBlockPurse) {   // R55-F3
                     if (d.havePurse) { why = "two purse blocks"; break; }
                     if (!chronicleReadPurse(f, words, d, why)) break;
+                } else if (tag == kChronicleBlockAlly) {   // R59-F1
+                    if (d.haveAlly) { why = "two ally blocks"; break; }
+                    if (!chronicleReadAlly(f, words, d, why)) break;
                 } else {   // a block from a later feature: skipped word by word, so a short file still fails
                     for (int k = 0; k < words && !why; k++) if (!chronGet(f, v)) why = "truncated";
                 }
@@ -7897,6 +7992,8 @@ bool chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
         for (int b = 0; b < raceCount; b++) raceRelation[a][b] = a == b ? 0.0f : d.relation[a][b];   // direct: no tier lines on load
     for (auto& row : stockAnnounced) for (auto& s : row) s = false;   // transient: re-armed against the restored stocks
     for (auto& row : relationClashCooldown) for (auto& c : row) c = 0;
+    for (int r = 0; r < raceCount; r++) { allyOf[r] = -1; allyBrideId[r] = -1; marriageCooldown[r] = 0; }   // R59-F1: chronicleRestoreBarbs() re-binds
+    marriage = marriageTrip{};
     // R54-F4: eras before the houses, so addHouse() rebuilds a Fourth Age race's houses as townhouses. Written directly:
     // no promotion lines on load; eraTick() later lowers a pre-Fourth era quietly if the live barbs don't support it.
     for (int r = 0; r < raceCount; r++) raceEra[r] = (settlementEra)d.era[r];
@@ -8511,6 +8608,11 @@ void drawStorehouses(RenderWindow& window, const storehouse (&stores)[raceCount]
         drawParts(va, storeShadowParts, o, Color::White);
         drawParts(va, storeBodyParts, o, lerpColor(storehouseColors[r], Color::White, t));
         drawParts(va, storeTrimParts, o, Color::White);
+        if (allyOf[r] >= 0 && isAllied(r, allyOf[r])) {   // R59-F1: 1px two-tone band across the body (x 1..8), own then ally
+            for (int s = 0; s * kAllyStripeSegPx < storehouseSize.x - 2.0f; s++)
+                pushQuad(va, o + Vector2f(1.0f + s * kAllyStripeSegPx, kAllyStripeRow), Vector2f(kAllyStripeSegPx, 1.0f),
+                         MM_STORE_COLORS[s % 2 == 0 ? r : allyOf[r]]);
+        }
         if (raceEra[r] >= eraFourth) {   // R54-F4: thin muted pennant, static
             const partDef pennant[3] = {
                 {{eraPennantPoleX, eraPennantPoleTop}, {1.0f, -eraPennantPoleTop}, eraPennantPoleColor},
@@ -9286,8 +9388,27 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
         barbs[k].parentAId = c.parentA >= 0 && c.parentA < (int)barbs.size() ? barbs[c.parentA].id : -1;
         barbs[k].parentBId = c.parentB >= 0 && c.parentB < (int)barbs.size() ? barbs[c.parentB].id : -1;
     }
+    for (auto& b : barbs) {   // R59-F1: revalidate every remapped parent id against the barbs that came back
+        if (b.parentAId == b.id || findBarbById(barbs, b.parentAId) < 0) b.parentAId = -1;
+        if (b.parentBId == b.id || findBarbById(barbs, b.parentBId) < 0) b.parentBId = -1;
+    }
     for (int k = 0; k < (int)d.barbs.size() && k < (int)barbs.size(); k++)
         if (d.barbs[k].leader) crownBarb(barbs, k, d.barbs[k].race);   // crowned again directly (no election line)
+    for (int r = 0; r < raceCount; r++) {   // R59-F1: heirs re-found by id now that every leader is back
+        if (raceElected[r]) refreshHeir(barbs, r);
+        else raceHeirId[r] = -1;
+    }
+    // R59-F1: alliances (cleared by chronicleRestore()). A pair is re-bound only if both sides name each other and the
+    // same bride, and she came back as a member of one of the two races; anything else is dropped quietly.
+    for (int r = 0; r < raceCount && d.haveAlly; r++) {
+        int o = d.ally[r], bk = d.allyBride[r];
+        if (o < 0 || o >= raceCount || o == r || r > o) continue;   // each pair once, from its lower race
+        if (d.ally[o] != r || d.allyBride[o] != bk || bk < 0 || bk >= (int)barbs.size()) continue;
+        if (barbs[bk].race != r && barbs[bk].race != o) continue;
+        allyOf[r] = o; allyOf[o] = r;
+        allyBrideId[r] = allyBrideId[o] = barbs[bk].id;
+        printf("CHRONICLE - %s and %s allied again (bride %s)\n", racePlurals[r], racePlurals[o], barbs[bk].name);
+    }
     vector<int> order((int)barbs.size());
     for (int i = 0; i < (int)order.size(); i++) order[i] = i;
     stable_sort(order.begin(), order.end(), [&](int a, int b) { return barbs[a].bornHour < barbs[b].bornHour; });   // oldest first
@@ -10295,6 +10416,31 @@ void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)
 
 void ungarrison(barb& b);   // R31-F3: defined with bellTick(); also frees the barb's keep slot
 
+// R59-F1: the one way an alliance ends. Clears both sides together (allyOf stays symmetric) and starts both cooldowns.
+void breakAlliance(int r, const char* why) {
+    if (r < 0 || r >= raceCount || allyOf[r] < 0) return;
+    int o = allyOf[r];
+    allyOf[r] = -1;
+    allyBrideId[r] = -1;
+    marriageCooldown[r] = kMarriageCooldownTicks;
+    if (o >= 0 && o < raceCount && allyOf[o] == r) {
+        allyOf[o] = -1;
+        allyBrideId[o] = -1;
+        marriageCooldown[o] = kMarriageCooldownTicks;
+    }
+    string line = "The alliance of the " + string(racePlurals[r]) + " and " + racePlurals[clampRace(o)] + " is broken: " + why;
+    printf("---ALLIANCE BROKEN--- %s\n", line.c_str());
+    logEvent(line, kMarriageTickerTint);
+}
+// R59-F1: called from removeBarb() before the swapRemove: a dying bride breaks the alliance she binds
+void allianceBrideLost(const barb& b) {
+    for (int r = 0; r < raceCount; r++)
+        if (allyOf[r] >= 0 && allyBrideId[r] == b.id) {
+            string why = string(b.name) + ", the bride, is dead";
+            breakAlliance(r, why.c_str());
+        }
+}
+
 // R30-F5: the only place a barb is removed. Releases everything the barb holds or is referenced by (hunt, carried load,
 // reserved house/shrine materials, one-off build claims, paving/spear jobs, the crown), then swapRemoves barbs and
 // squares at the same index. Callers removing several must go in descending index order.
@@ -10313,9 +10459,17 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     endActivity(b, actCaravan);
     envoyMemberLost(b);                           // R56-F2: drops the envoy id; envoyTick() aborts unpaid next tick
     endActivity(b, actEnvoy);
+    marriageMemberLost(b);                        // R59-F1: drops its procession id; marriageTick() aborts the trip next tick
+    endActivity(b, actProcession);
+    allianceBrideLost(b);                         // R59-F1: a dead bride breaks her alliance (both sides cleared)
     clearSick(b);                                 // R52-F4
     clearKneel(b);                                // R52-F3: explicit, though releaseBarbWork()'s clearTraining() already did it
     if (isLeader(b)) loseLeader(barbs, b.race);   // R58-F2: may crown the heir; b stays valid (no barb is added or moved)
+    for (auto& o : barbs) {                       // R59-F1: no parent id outlives the barb (loseLeader() above has used them)
+        if (o.parentAId == b.id) o.parentAId = -1;
+        if (o.parentBId == b.id) o.parentBId = -1;
+    }
+    int deadId = b.id;
     printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
     addGrave(b, squares[i]);   // R47-F9: copied out by value; nothing in graves points back at barbs
@@ -10325,6 +10479,8 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     clearRoute(b);   // R39-F1: the route lives in the struct; the swapped-in barb keeps its own route
     swapRemove(barbs, i);
     swapRemove(squares, i);
+    for (int r = 0; r < raceCount; r++)           // R59-F1: an heir that just died is replaced by id (never a stale index)
+        if (raceHeirId[r] == deadId) refreshHeir(barbs, r);
 }
 
 // R30-F5: end of tick. Every barb at 0 hp is collected first, then removed once each, highest index first, so a
@@ -11797,6 +11953,7 @@ void tryLaunchRaid(vector<barb>& barbs, vector<RectangleShape>& squares, const s
         int a = (start + o) % raceCount, b = (a + 1) % raceCount;   // each pair once: (0,1) (1,2) (2,0)
         if (raidPairCooldown[a][b] > 0 || relationTierOf(raceRelation[a][b]) != relCold) continue;
         if (pairFriendly(a, b)) continue;   // R54-F1: friendly pairs never raid
+        if (isAllied(a, b)) continue;       // R59-F1: allies never raid each other
         if (!stores[a].built || !stores[b].built) continue;
         int ready[2] = {0, 0}, side[2] = {a, b};
         for (int s = 0; s < 2; s++) {
@@ -12819,6 +12976,198 @@ void envoyTick(vector<barb>& barbs, vector<RectangleShape>& squares, const store
     if (raidColumnStep(barbs, squares, ri, raidCrateSpot(payer, kEnvoyCrateSlot))) {
         printf("ENVOY HOME - %s leader back at their crate\n", racePlurals[payer]);
         endEnvoy(barbs);
+    }
+}
+
+// R59-F1: hand a procession member back to the other systems, standing where it is (every exit goes through here)
+void releaseProcessionBarb(barb& b) {
+    if (b.activity != actProcession) return;
+    expeditionReset(b);
+    endActivity(b, actProcession);
+}
+void endMarriage(vector<barb>& barbs) {
+    for (int id : marriage.memberIds) { int i = findBarbById(barbs, id); if (i >= 0) releaseProcessionBarb(barbs[i]); }
+    marriage = marriageTrip{};
+}
+// any exit short of the walk home. Nothing has been paid unless the bride was already wed.
+void abortMarriage(vector<barb>& barbs, const char* why) {
+    int from = clampRace(marriage.from), to = clampRace(marriage.to);
+    printf("---WEDDING ABORTED--- %s procession to the %s: %s%s\n", racePlurals[from], racePlurals[to], why,
+           marriage.wed ? " (already wed)" : " (no bride-price paid)");
+    if (!marriage.wed) {
+        logEvent(string(racePlurals[from]) + "' wedding procession to the " + racePlurals[to] + " is called off", kMarriageTickerTint);
+        marriageCooldown[from] = marriageCooldown[to] = kMarriageCooldownTicks;
+    }
+    endMarriage(barbs);
+}
+bool marriageRecruitOk(const barb& b, int r) {   // raidIdle(): free, on the surface, no job/haul/hunt/claim
+    return b.race == r && raidIdle(b) && b.health >= kMarriageMinHealth && !isHungry(b) && !isLeader(b) && !b.shinobi
+        && b.order == needNone;
+}
+// the groom's race can pay the bride-price and still keep kBridePriceKeep
+bool bridePriceOk(int r) {
+    return canAfford(stockOfRace(r), kBridePriceWood + kBridePriceKeep.wood, 0, kBridePriceFood + kBridePriceKeep.food);
+}
+
+// R59-F1: once at dawn, with no procession out. For each race (random start) with an elected leader and no ally: the
+// leader's eldest eligible adult child of a named house (not the heir, so succession is kept), and the best-related
+// partner race that is neutral or better, has no ally, a crate, a house, a leader of a named house and the bride-price
+// to spare. Two escorts nearest the bride's crate go with her. Nothing is paid until arrival.
+void marriageDawn(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, const storehouse (&stores)[raceCount]) {
+    if (marriage.active || raid.active || barbs.empty()) return;
+    int n = min((int)barbs.size(), (int)squares.size());
+    int raceHouses[raceCount] = {};
+    for (auto& h : houses) raceHouses[clampRace(h.race)]++;
+    float r2 = kMarriageRecruitRadius * kMarriageRecruitRadius;
+    int start = uniform_int_distribution<int>(0, raceCount - 1)(gen);
+    for (int o = 0; o < raceCount; o++) {
+        int from = (start + o) % raceCount;
+        if (!raceElected[from] || raceLeaderId[from] < 0 || allianceCount(from) >= kMaxAlliancesPerRace || marriageCooldown[from] > 0) continue;
+        if (!stores[from].built || raceBell[from] > 0) continue;
+        int bride = -1;
+        for (int i = 0; i < n; i++) {
+            const barb& c = barbs[i];
+            if (c.parentAId != raceLeaderId[from] && c.parentBId != raceLeaderId[from]) continue;
+            if (c.dynastyIdx < 0 || c.dynastyIdx >= kDynastyCount || lifeStage(c) != stageAdult || isHeir(c)) continue;
+            if (!marriageRecruitOk(c, from)) continue;
+            Vector2f d = raidCentre(squares[i]) - quarterCentre(from);
+            if (d.x * d.x + d.y * d.y > r2) continue;
+            if (bride < 0 || c.bornHour < barbs[bride].bornHour) bride = i;
+        }
+        if (bride < 0) continue;
+        int to = -1;
+        for (int t = 0; t < raceCount; t++) {
+            if (t == from || allianceCount(t) >= kMaxAlliancesPerRace || marriageCooldown[t] > 0) continue;
+            if (relationTierOf(raceRelation[from][t]) != relNeutral) continue;   // neutral or better (friendly is neutral tier)
+            if (!stores[t].built || raceHouses[t] == 0 || !raceElected[t] || raceLeaderDynasty[t] < 0 || raceLeaderDynasty[t] >= kDynastyCount) continue;
+            if (!bridePriceOk(t)) continue;
+            if (to < 0 || raceRelation[from][t] > raceRelation[from][to]) to = t;
+        }
+        if (to < 0) continue;
+        int pick[kMarriageMembers] = {bride, -1, -1};
+        bool ok = true;
+        for (int k = 1; k < kMarriageMembers && ok; k++) {
+            pick[k] = findNearest(quarterCentre(from), kMarriageRecruitRadius, n,
+                                  [&](int i) { return raidCentre(squares[i]); },
+                                  [&](int i) {
+                                      for (int q = 0; q < k; q++) if (pick[q] == i) return true;
+                                      return !marriageRecruitOk(barbs[i], from);
+                                  });
+            ok = pick[k] >= 0;
+        }
+        if (!ok) continue;
+        marriage = marriageTrip{};
+        marriage.active = true;
+        marriage.from = from;
+        marriage.to = to;
+        marriage.phase = marriageTrip::Out;
+        for (int k = 0; k < kMarriageMembers; k++) {
+            barb& m = barbs[pick[k]];
+            expeditionReset(m);   // ends any drill or wander walk first
+            beginActivity(m, actProcession);
+            marriage.memberIds[k] = m.id;
+        }
+        const barb& bb = barbs[pick[0]];
+        string line = string(bb.name) + " of House " + kDynastyNames[bb.dynastyIdx] + " sets out to wed into the " + racePlurals[to];
+        printf("---WEDDING OUT--- %s (escorts %s, %s; relation %.2f, bride-price %d food %d wood)\n", line.c_str(),
+               barbs[pick[1]].name, barbs[pick[2]].name, raceRelation[from][to], kBridePriceFood, kBridePriceWood);
+        logEvent(line, kMarriageTickerTint);
+        return;
+    }
+}
+
+// R59-F1: on arrival, the one place an alliance is made. The pair must still be neutral or better and unallied, and the
+// groom's race able to pay; then the bride-price moves, both allyOf entries are set, and the bride joins the groom's
+// race (a random house of it) in the same step. Returns nullptr when wed, otherwise why not (nothing changes).
+const char* marriageWed(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, int bi) {
+    int from = clampRace(marriage.from), to = clampRace(marriage.to);
+    if (relationTierOf(raceRelation[from][to]) != relNeutral) return "the pair has soured";
+    if (allianceCount(from) >= kMaxAlliancesPerRace || allianceCount(to) >= kMaxAlliancesPerRace) return "one side is already allied";
+    if (!raceElected[to] || raceLeaderDynasty[to] < 0 || raceLeaderDynasty[to] >= kDynastyCount) return "the groom's house has no head";
+    if (!canAfford(stockOfRace(to), kBridePriceWood, 0, kBridePriceFood)) return "the bride-price cannot be paid";
+    barb& b = barbs[bi];
+    if (b.dynastyIdx < 0 || b.dynastyIdx >= kDynastyCount) return "the bride has no house";
+    spend(stockOfRace(to), kBridePriceWood, 0, kBridePriceFood);
+    stockOfRace(from).wood += kBridePriceWood;
+    stockOfRace(from).food += kBridePriceFood;
+    allyOf[from] = to;
+    allyOf[to] = from;
+    allyBrideId[from] = allyBrideId[to] = b.id;
+    marriageCooldown[from] = marriageCooldown[to] = kMarriageCooldownTicks;
+    vector<int> homes;
+    for (auto& h : houses) if (h.race == to) homes.push_back(h.id);
+    int houseId = homes.empty() ? -1 : homes[uniform_int_distribution<int>(0, (int)homes.size() - 1)(gen)];
+    const char* xName = kDynastyNames[b.dynastyIdx];
+    const char* yName = kDynastyNames[raceLeaderDynasty[to]];
+    releaseProcessionBarb(b);
+    transferBarb(barbs, squares, bi, to, houseId);
+    marriage.memberIds[0] = -1;
+    marriage.wed = true;
+    string line = string("House ") + xName + " weds House " + yName;
+    printf("---WEDDING--- %s: %s joins the %s (house %d); %s +%d food +%d wood; %s and %s allied\n", line.c_str(), b.name,
+           racePlurals[to], houseId + 1, racePlurals[from], kBridePriceFood, kBridePriceWood, racePlurals[from], racePlurals[to]);
+    logEvent(line, kMarriageTickerTint);
+    logEvent(string(racePlurals[from]) + " and " + racePlurals[to] + " are now allies", kMarriageTickerTint);
+    return nullptr;
+}
+
+// R59-F1: runs in the fixed-step sim loop after envoyTick(). Counts the cooldowns down, drops an alliance whose race has
+// nobody left or whose bride no longer resolves, clears a stale procession flag, then walks the column (bride at the
+// head) to the groom's crate and the escorts home. Every member id is re-resolved each tick; a missing member or a
+// state conflict aborts the trip.
+void marriageTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, const storehouse (&stores)[raceCount]) {
+    for (auto& c : marriageCooldown) if (c > 0) c--;
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (int r = 0; r < raceCount; r++) {   // backstop: an alliance is only ever held by a living bride of one of the pair
+        if (allyOf[r] < 0) continue;
+        int bi = findBarbById(barbs, allyBrideId[r]);
+        if (!isAllied(r, allyOf[r]) || bi < 0) { breakAlliance(r, "the bond no longer holds"); continue; }
+        int living[2] = {0, 0}, side[2] = {r, allyOf[r]};
+        for (auto& b : barbs) for (int s = 0; s < 2; s++) if (b.health > 0 && b.race == side[s]) living[s]++;
+        if (living[0] == 0 || living[1] == 0) breakAlliance(r, "one house is no more");
+    }
+    for (int i = 0; i < n; i++) {   // backstop: a procession flag with no marriage entry behind it is cleared
+        barb& b = barbs[i];
+        if (b.activity != actProcession) continue;
+        bool listed = false;
+        if (marriage.active) for (int id : marriage.memberIds) listed = listed || id == b.id;
+        if (!listed) { printf("PROCESSION FLAG CLEARED - barb %d (no marriage entry)\n", b.id); releaseProcessionBarb(b); }
+    }
+    if (!marriage.active) return;
+    int from = clampRace(marriage.from), to = clampRace(marriage.to);
+    marriage.ticks++;
+    int ci[kMarriageMembers];
+    for (int k = 0; k < kMarriageMembers; k++) {
+        ci[k] = -1;
+        if (k == 0 && marriage.wed) continue;   // the bride has joined the groom's race
+        ci[k] = findBarbById(barbs, marriage.memberIds[k]);
+        if (ci[k] < 0 || ci[k] >= n) { abortMarriage(barbs, k == 0 ? "bride gone" : "escort gone"); return; }
+        const barb& m = barbs[ci[k]];
+        if (m.activity != actProcession || inRaid(m) || m.chopping || m.building || m.movingbspot || m.deertargeting || m.inMine
+            || m.race != from || m.health <= 0) {
+            printf("PROCESSION CONFLICT - barb %d (%s)\n", m.id, activityDefs[m.activity].name);
+            abortMarriage(barbs, "member state conflict");
+            return;
+        }
+    }
+    if (marriage.ticks > kMarriageMaxTicks || !stores[from].built || (marriage.phase == marriageTrip::Out && !stores[to].built)) {
+        abortMarriage(barbs, marriage.ticks > kMarriageMaxTicks ? "timeout" : "crate gone");
+        return;
+    }
+    if (marriage.phase == marriageTrip::Out) {
+        if (!raidColumnStep(barbs, squares, ci, raidCrateSpot(to, kMarriageCrateSlot))) return;
+        if (const char* why = marriageWed(barbs, squares, houses, ci[0])) {
+            printf("---WEDDING REFUSED--- %s procession at the %s crate: %s\n", racePlurals[from], racePlurals[to], why);
+            logEvent(string(racePlurals[to]) + " turn away the " + racePlurals[from] + "' bride: " + why, kMarriageTickerTint);
+            marriageCooldown[from] = marriageCooldown[to] = kMarriageCooldownTicks;
+        }
+        marriage.phase = marriageTrip::Home;
+        return;
+    }
+    // Home: the escorts (and a refused bride) are released on reaching their own crate
+    if (raidColumnStep(barbs, squares, ci, raidCrateSpot(from, kMarriageCrateSlot))) {
+        printf("PROCESSION HOME - %s escorts back at their crate\n", racePlurals[from]);
+        endMarriage(barbs);
     }
 }
 
@@ -15662,6 +16011,7 @@ int main() {
                 exileTick(barbs, squares, stores);     // R54-F3: walks the migrant; an arrival is only queued here...
                 applyExileTransfers(barbs, squares, houses);   // ...and applied here, outside every barb loop
                 envoyTick(barbs, squares, stores);     // R56-F2: the tribute envoy's walk and payment
+                marriageTick(barbs, squares, houses, stores);   // R59-F1: wedding procession walk, the wedding and alliance upkeep
                 bellTick(barbs, squares, houses, houseshapes, wolves, stores, smoke, dwarfForge, fields,
                          trees, tris, rocks, octs, bushes);   // INBOX-F1: after the wolves move
                 expeditionTick(barbs, squares, wolves, stores);   // R45-F2: after the wolves and the bell, before hungerTick()
@@ -15672,6 +16022,7 @@ int main() {
                     if (game_time != hourWas && game_time == nightEndHour) {
                         chronicleDawn(barbs, houses);   // R54-F2: dawn autosave; R55-F4: with the named barbs
                         exileDawn(barbs, houses, stores);   // R54-F3: the dawn emigration check
+                        marriageDawn(barbs, squares, houses, stores);   // R59-F1: a leader's child may set out to wed
                     }
                 }
                 weatherTick();
