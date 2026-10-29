@@ -343,6 +343,7 @@ const int kChronicleMaxPurse = 1000000;             // per-race purse bound on l
 const int32_t kChronicleBlockAlly = 0x594C4C41;     // R59-F1 "ALLY": raceCount, then per race {ally race, bride file barb index}
 const int32_t kChronicleBlockWar = 0x20524157;      // R60-F1 "WAR ": kMaxWars, then per war kChronicleWarWords words
 const int kChronicleWarWords = 8;                   // active, declarer, enemy, bypass ticks, ticks, wins x2, mustered bits
+const int32_t kChronicleBlockWonder = 0x444E4F57;   // R60-F3 "WOND": raceCount, then each race's wonder stage (no version bump)
 const int kChronicleMaxBlocks = 32;               // blocks per file; more is rejected
 const int kChronicleMaxBlockWords = 1 << 20;        // int32 words in one block; more is rejected
 const int kChronicleMaxBarbs = 2000;                // a load with more barbs than this is rejected; a save writes at most this many
@@ -1845,6 +1846,30 @@ const Color lanternPostColor(70, 56, 40);
 const Color lanternUnlitColor(98, 88, 66);       // by day: a dull brass head
 const Color lanternLitColor(250, 206, 120);      // at night, drawn after the overlay
 const Color lanternGlowColor(80, 52, 16, 255);   // additive 1px halo, like the windows
+// R60-F3 The Great Wonders (phase 1): once a race knows a tier-2 tech (studied at its Lore Hall), a barb of that race
+// raises the next stage of its wonder at a fixed spot right of the keep (buildOneOff, jobWonder), the whole stage cost
+// checked before any of it is spent. wonderStages[] is the data: one row per race per stage, only enabled rows are
+// built, drawn, reserved or restored. Phase 1 ships the human Sky Spire's stage 1 only; the grove-tree and forge-keep
+// rows are written but disabled, and stages 2-3, scaffolding, the lantern and the flash are deferred.
+struct wonderStageDef {barbRace race; int stage; const char* name; int wood, stone, food; float moralePerk;
+                       Color body, trim; bool enabled;};
+const wonderStageDef wonderStages[] = {
+    {raceHuman, 1, "Sky Spire",  36, 10, 20, 0.01f, Color(82, 88, 104), Color(56, 60, 72), true},    // muted slate-lavender
+    {raceElf,   1, "Grove-Tree", 40,  4, 24, 0.01f, Color(70, 92, 76),  Color(50, 64, 50), false},   // phase 2+
+    {raceDwarf, 1, "Forge-Keep", 24, 16, 20, 0.01f, Color(96, 84, 74),  Color(62, 54, 48), false},   // phase 2+
+};
+const int kWonderStageRows = (int)(sizeof(wonderStages) / sizeof(wonderStages[0]));
+const int wonderBuildTicks = 3 * houseBuildTicks;  // one stage: a bigger job than the keep
+const int kWonderFoodReserve = 20;                 // food that must be left in the larder after a stage is paid
+const Vector2f wonderCrateOffset(19.0f, 20.0f);    // wonder top-left relative to the crate: right of the keep (and its
+                                                   // 3px clear), below the shaft's clear zone, well inside the wall ring
+const Vector2f wonderSize(10.0f, 11.0f);           // stage 1: 10x2 plinth under a 6px-wide shaft, unfinished top course
+const Vector2f wonderStandOffset(4.0f, 13.0f);     // builder hitbox top-left: below the plinth and its shadow row
+const Vector2f wonderZoneSize(11.0f, 19.0f);       // silhouette + shadow + the builder's stand room
+const float wonderClearPx = 3.0f;                  // houses, plots, mills, walls and towers keep this far from the zone
+const Color wonderHighlightColor(100, 106, 122);   // 1px lit left edge of the shaft, still darker than the keep stone
+const Color wonderDoorColor(24, 24, 30);
+const uint8_t kWonderAlpha = 210;                  // a touch translucent: a silhouette set back behind the quarter
 
 // UI red (UIO-F1/F2/F3): one muted brick red for every "starving" mark in the UI (minimap dots, inspect panel, hunger lens)
 const Color uiStarvingRed = healthBarFillColor;
@@ -2454,8 +2479,8 @@ static_assert(weaponTierBonus[0] == 0, "an untiered weapon hits for its base dam
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
 // jobPave (R20-F2) is run by paveTick(): movingbspot while walking, building/timer while laying the cobbles.
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, jobHerbHut, jobLoreHall, buildJobCount};
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks, herbHutBuildTicks, loreHallBuildTicks};
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, jobHerbHut, jobLoreHall, jobWonder, buildJobCount};
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks, herbHutBuildTicks, loreHallBuildTicks, wonderBuildTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -2906,6 +2931,46 @@ bool loreHallClear(const FloatRect& rect) {
     return true;
 }
 
+// R60-F3: wonder[r] = stages of race r's wonder standing (0 = none). Persistent: saved in the "WOND" block, 0 for a file
+// without one, clamped to wonderStageCount() on load. Fixed per-race array, so nothing to swapRemove; addWonderStage()
+// is the one place a stage is registered. Not reset by placeQuarters() (the spot is fixed relative to the crate).
+int wonder[raceCount] = {0, 0, 0};
+Vector2f wonderPos(int r) { return storehousePos[r] + wonderCrateOffset; }
+FloatRect wonderZone(int r) { return FloatRect(wonderPos(r), wonderZoneSize); }
+// index into wonderStages[] of race r's enabled row for this stage, -1 = none
+int wonderRow(int r, int stage) {
+    for (int k = 0; k < kWonderStageRows; k++)
+        if (wonderStages[k].enabled && wonderStages[k].race == r && wonderStages[k].stage == stage) return k;
+    return -1;
+}
+// enabled stages race r can ever raise (1, 2, ... with no gap); the cap for wonder[r]
+int wonderStageCount(int r) {
+    int n = 0;
+    while (wonderRow(r, n + 1) >= 0) n++;
+    return n;
+}
+// the row of the highest standing stage, -1 = none (drawing and perks use it)
+int wonderTopRow(int r) { return (r >= 0 && r < raceCount && wonder[r] > 0) ? wonderRow(r, wonder[r]) : -1; }
+// small perk: the standing stages' morale, added to the race's grave morale term by graveTick()
+float wonderMorale(int r) {
+    float m = 0.0f;
+    for (int s = 1; r >= 0 && r < raceCount && s <= wonder[r]; s++) {
+        int k = wonderRow(r, s);
+        if (k >= 0) m += wonderStages[k].moralePerk;
+    }
+    return m;
+}
+// False if rect comes within wonderClearPx of the zone of any race that has an enabled wonder (reserved from the start)
+bool wonderClear(const FloatRect& rect) {
+    for (int k = 0; k < raceCount; k++) {
+        if (wonderStageCount(k) == 0) continue;
+        FloatRect z = wonderZone(k);
+        FloatRect zone(z.position - Vector2f(wonderClearPx, wonderClearPx), z.size + Vector2f(2 * wonderClearPx, 2 * wonderClearPx));
+        if (rect.findIntersection(zone).has_value()) return false;
+    }
+    return true;
+}
+
 // False if r comes within storehouseClearPx of any race's crate or its stand spot (reserved from the start, built or not)
 bool storehouseClear(const FloatRect& r) {
     for (int k = 0; k < raceCount; k++) {
@@ -3006,7 +3071,8 @@ bool forgeClear(const FloatRect& r) {
         && shaftClear(r)   // R34-F1
         && barracksClear(r)   // R47-F6
         && herbClear(r)       // R53-F2
-        && loreHallClear(r);  // R59-F3
+        && loreHallClear(r)   // R59-F3
+        && wonderClear(r);    // R60-F3
 }
 
 // R30-F1: race quarters
@@ -5814,7 +5880,7 @@ void graveTick(const vector<barb>& barbs, const vector<RectangleShape>& squares)
         }
     }
     for (int r = 0; r < raceCount; r++) {
-        graveMorale[r] = min(graveMoraleMax, own[r] * graveMoralePerStone);
+        graveMorale[r] = min(graveMoraleMax, own[r] * graveMoralePerStone) + wonderMorale(r);   // R60-F3: small wonder perk
         graveRestAcc[r] += graveMorale[r];
         graveHungerRest[r] = graveRestAcc[r] >= 1.0f;
         if (graveHungerRest[r]) graveRestAcc[r] -= 1.0f;
@@ -8117,6 +8183,8 @@ struct chronicleData {
     int allyBride[raceCount] = {-1, -1, -1};       // index into barbs (the BARB block), -1 = none
     bool haveWar = false;                          // R60-F1: a "WAR " block of the expected size was read
     int war[kMaxWars][kChronicleWarWords] = {};    // raw words: checked by chronicleRestoreWar(), which ends a bad war
+    bool haveWonder = false;                       // R60-F3: a "WOND" block of the expected size was read
+    int wonderStage[raceCount] = {};               // raw: clamped to wonderStageCount() by chronicleRestore()
 };
 
 int chronicleNameIndex(const barb& b) {   // R55-F4: -1 for Sasuke; names only ever come from barbNames or shinobiName
@@ -8215,6 +8283,13 @@ bool chronicleSaveWar(FILE* f) {
     return ok;
 }
 
+// R60-F3: the "WOND" block: raceCount, then each race's standing wonder stages
+bool chronicleSaveWonder(FILE* f) {
+    bool ok = chronPut(f, kChronicleBlockWonder) && chronPut(f, 1 + raceCount) && chronPut(f, raceCount);
+    for (int r = 0; ok && r < raceCount; r++) ok = chronPut(f, clamp(wonder[r], 0, wonderStageCount(r)));
+    return ok;
+}
+
 bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
     FILE* f = fopen(kChronicleTmpPath, "wb");
     if (!f) { printf("CHRONICLE - save failed: cannot open %s\n", kChronicleTmpPath); return false; }
@@ -8239,6 +8314,7 @@ bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
     ok = ok && chronicleSavePurse(f);                     // R55-F3: same v3 format, one more block
     ok = ok && chronicleSaveAlly(f, barbs);               // R59-F1 (v5)
     ok = ok && chronicleSaveWar(f);                       // R60-F1: one more tagged block, no version bump
+    ok = ok && chronicleSaveWonder(f);                    // R60-F3: likewise
     ok = ok && chronPut(f, kChronicleEndMark);
     if (fclose(f) != 0) ok = false;
     if (!ok) {
@@ -8351,6 +8427,25 @@ bool chronicleReadWar(FILE* f, int words, chronicleData& d, const char*& why) {
     return true;
 }
 
+// R60-F3: the "WOND" block into d, raw. A block of another size or race count is skipped (every wonder at stage 0)
+// rather than rejecting the file; chronicleRestore() clamps each stage to this build's table.
+bool chronicleReadWonder(FILE* f, int words, chronicleData& d, const char*& why) {
+    int32_t v = 0;
+    if (words != 1 + raceCount) {
+        for (int k = 0; k < words; k++) if (!chronGet(f, v)) { why = "truncated"; return false; }
+        printf("CHRONICLE - wonder block size differs: no wonder restored\n");
+        return true;
+    }
+    int32_t races = 0;
+    if (!chronGet(f, races)) { why = "truncated"; return false; }
+    for (int r = 0; r < raceCount; r++) {
+        if (!chronGet(f, v)) { why = "truncated"; return false; }
+        d.wonderStage[r] = v;
+    }
+    d.haveWonder = races == raceCount;
+    return true;
+}
+
 // Reads and bounds-checks the whole file into out; nothing global is touched here. why = the rejection reason.
 bool chronicleRead(chronicleData& out, const char*& why) {
     why = nullptr;
@@ -8423,6 +8518,9 @@ bool chronicleRead(chronicleData& out, const char*& why) {
                 } else if (tag == kChronicleBlockWar) {   // R60-F1
                     if (d.haveWar) { why = "two war blocks"; break; }
                     if (!chronicleReadWar(f, words, d, why)) break;
+                } else if (tag == kChronicleBlockWonder) {   // R60-F3
+                    if (d.haveWonder) { why = "two wonder blocks"; break; }
+                    if (!chronicleReadWonder(f, words, d, why)) break;
                 } else {   // a block from a later feature: skipped word by word, so a short file still fails
                     for (int k = 0; k < words && !why; k++) if (!chronGet(f, v)) why = "truncated";
                 }
@@ -8492,6 +8590,9 @@ bool chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
     // goldFound follows, so the HUD gold cell shows at once for a world that already has gold.
     for (int r = 0; r < raceCount; r++) purse[r] = d.havePurse ? clamp(d.purse[r], 0, kChronicleMaxPurse) : 0;
     goldFound = goldTotal() > 0;
+    // R60-F3: wonder stages, written directly (no ticker lines on load). A file without a "WOND" block is stage 0; a
+    // stage past this build's enabled rows is clamped down to them.
+    for (int r = 0; r < raceCount; r++) wonder[r] = d.haveWonder ? clamp(d.wonderStage[r], 0, wonderStageCount(r)) : 0;
     int placed = 0, moved = 0, dropped = 0;
     for (int hi = 0; hi < (int)d.houses.size(); hi++) {
         const chronicleHouse& ch = d.houses[hi];
@@ -16691,6 +16792,45 @@ void buildlorehall(vector<barb>& barbs, vector<RectangleShape>& squares, const s
     }
 }
 
+// R60-F3: the one place a wonder stage is registered as standing (fixed per-race array: no shapes or vectors to sync);
+// one ticker line per stage
+void addWonderStage(int r, int row) {
+    const wonderStageDef& w = wonderStages[row];
+    wonder[r] = w.stage;
+    printf("---WONDER STAGE--- %s %s stage %d (%d wood, %d stone, %d food)\n", raceDefs[r].name, w.name, w.stage, w.wood, w.stone, w.food);
+    logRaceEvent(string(racePlurals[r]) + " raise the " + w.name + (w.stage == 1 ? ": its first stage stands" : ": another stage stands"), r);
+}
+
+// R60-F3: runs after studyTick(). A race whose crate stands, that knows any tier-2 tech and has an enabled row for its
+// next wonder stage sends one builder to the fixed spot right of the keep (buildOneOff, jobWonder). The whole stage
+// cost (wood, stone and food, with a house's wood and stone kept back) is checked before anything is spent, then spent
+// at once at claim. The claim is not stored ("a barb of this race holds jobWonder"): a lost builder frees it through
+// releaseBarbWork() and the cost stays spent, like the Lore Hall.
+void wonderTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount],
+                const vector<CircleShape>& bushshapes) {
+    for (int r = 0; r < raceCount; r++) {
+        if (!stores[r].built || wonder[r] >= wonderStageCount(r)) continue;
+        int row = wonderRow(r, wonder[r] + 1);
+        if (row < 0) continue;
+        bool tier2 = false;
+        for (int t = kTier1TechCount; t < techCount; t++) if (know[r].learned[t]) tier2 = true;
+        if (!tier2) continue;
+        const wonderStageDef& w = wonderStages[row];
+        bool claimed = false;
+        for (auto& b : barbs) if (b.jobKind == jobWonder && b.race == r) claimed = true;
+        bool done = buildOneOff(barbs, squares, claimed, jobWonder, wonderPos(r) + wonderStandOffset, "WONDER",
+            [&](const barb&) {
+                FloatRect z = wonderZone(r);
+                if (!lakeClear(z)) return -1;   // fixed spot: a lake or bush on it means no wonder for this race
+                for (auto& bs : bushshapes) if (z.findIntersection(bs.getGlobalBounds())) return -1;
+                if (!canAfford(stock[r], w.wood + houseWoodCost, w.stone + houseStoneCost, w.food + kWonderFoodReserve)) return -1;   // whole cost first
+                spend(stock[r], w.wood, w.stone, w.food);
+                return 1;
+            }, r);
+        if (done) addWonderStage(r, row);
+    }
+}
+
 // R59-F3: candle brightness 0..1 for bench s, a pure function of loreClock (no state, no RNG): two slow beats and a
 // fast one, so the flame wavers without a regular pulse; frozen while paused because loreClock only moves on sim ticks
 float loreCandleLevel(int clock, int s) {
@@ -16715,6 +16855,32 @@ void drawLoreHall(RenderWindow& window) {
         pushQuad(va, o + Vector2f(0.0f, loreHallRoofH - 1.0f), Vector2f(loreHallSize.x, 1.0f), loreHallEaveColor);
         pushQuad(va, o + loreHallDoorPos, loreHallDoorSize, loreHallDoorColor);
         for (auto& w : loreHallWindowPos) pushQuad(va, o + w, loreHallWindowSize, loreHallWindowColor);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R60-F3: stage 1 of a race's wonder as a muted, slightly translucent silhouette: 10x2 plinth, a 6x8 shaft with a lit
+// left edge, one darker course and a dark 2x3 doorway, an unfinished broken top course, and a 1px ground shadow. Uses
+// the row's own colours. One static vertex array (no per-frame allocation); drawn on the ground layer before the house
+// slabs, so every building, barb and tree draws over it.
+void drawWonder(RenderWindow& window) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    auto fade = [](Color c) { c.a = kWonderAlpha; return c; };
+    for (int r = 0; r < raceCount; r++) {
+        int row = wonderTopRow(r);
+        if (row < 0) continue;
+        const Color body = fade(wonderStages[row].body), trim = fade(wonderStages[row].trim);
+        Vector2f o = snapPx(wonderPos(r));
+        pushQuad(va, o + Vector2f(1.0f, wonderSize.y), Vector2f(wonderSize.x, 1.0f), buildingShadowColor);
+        pushQuad(va, o + Vector2f(0.0f, wonderSize.y - 2.0f), Vector2f(wonderSize.x, 2.0f), trim);   // plinth
+        pushQuad(va, o + Vector2f(2.0f, 1.0f), Vector2f(6.0f, 8.0f), body);                           // shaft
+        pushQuad(va, o + Vector2f(2.0f, 1.0f), Vector2f(1.0f, 8.0f), fade(wonderHighlightColor));      // lit edge
+        pushQuad(va, o + Vector2f(3.0f, 5.0f), Vector2f(5.0f, 1.0f), trim);                           // course
+        pushQuad(va, o + Vector2f(4.0f, 6.0f), Vector2f(2.0f, 3.0f), fade(wonderDoorColor));           // doorway
+        pushQuad(va, o + Vector2f(2.0f, 0.0f), Vector2f(1.0f, 1.0f), body);                           // unfinished top
+        pushQuad(va, o + Vector2f(4.0f, 0.0f), Vector2f(2.0f, 1.0f), body);
+        pushQuad(va, o + Vector2f(7.0f, 0.0f), Vector2f(1.0f, 1.0f), body);
     }
     if (va.getVertexCount() > 0) window.draw(va);
 }
@@ -16955,6 +17121,7 @@ int main() {
     const Time Timepertick = seconds(1.0f / 60.0f);
 
     resetKnowHow();   // fresh practice counters and no learned techs for every new game (R20-F1)
+    for (auto& w : wonder) w = 0;   // R60-F3: no wonder stages until chronicleRestore() brings saved ones back
     resetTrails();    // wear, tiers and cobbles (R20-F2)
     world wd;   // R56-F4/R57-F4: owns the deer and barb pairs; constructed first, the references below keep every name
     vector<barb>& barbs = wd.barbs;             // bound only after wd exists; wd is never copied
@@ -17193,6 +17360,7 @@ int main() {
                 barbmove(squares, barbs);
                 riteTick(barbs, squares, shrines);   // R52-F3: after the work search, so a barb between jobs is caught idle
                 studyTick(barbs, squares);   // R59-F3: bench upkeep, scholars' walk and study points; loreClock for the candles
+                wonderTick(barbs, squares, stores, bushshapes);   // R60-F3: a race with a tier-2 tech raises its wonder's next stage
                 shaftTick(barbs);   // R40-F1: dust puffs and lintel flash
                 shinobiTick(barbs, squares, houseshapes, octs, shinobiPuffs);
                 treespawn(trees, tris, stumps, fields, houses, barbs);
@@ -17306,6 +17474,7 @@ int main() {
 	drawRocks(window, octs, rockGold, rockVerts, camRect);   // R46-F1a: gold rocks get one pale-gold fleck pixel
 	drawBushes(window, bushshapes, bushVerts, camRect);
 	drawGraves(window, camRect);   // R47-F9: ancestor stones, on the ground under the buildings
+	drawWonder(window);   // R60-F3: muted wonder silhouette behind every building, barb and tree
 
 	{
 		RectangleShape slab(houseSlabSize); // foundations under houses, drawn first so every house sits on top
