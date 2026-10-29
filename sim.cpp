@@ -341,7 +341,9 @@ const int32_t kChronicleBlockKnow = 0x574F4E4B;     // R55-F2 "KNOW": techs, the
 const int32_t kChronicleBlockPurse = 0x53525550;   // R55-F3 "PURS": raceCount, then each race's purse
 const int kChronicleMaxPurse = 1000000;             // per-race purse bound on load
 const int32_t kChronicleBlockAlly = 0x594C4C41;     // R59-F1 "ALLY": raceCount, then per race {ally race, bride file barb index}
-const int kChronicleMaxBlocks = 32;                // blocks per file; more is rejected
+const int32_t kChronicleBlockWar = 0x20524157;      // R60-F1 "WAR ": kMaxWars, then per war kChronicleWarWords words
+const int kChronicleWarWords = 8;                   // active, declarer, enemy, bypass ticks, ticks, wins x2, mustered bits
+const int kChronicleMaxBlocks = 32;               // blocks per file; more is rejected
 const int kChronicleMaxBlockWords = 1 << 20;        // int32 words in one block; more is rejected
 const int kChronicleMaxBarbs = 2000;                // a load with more barbs than this is rejected; a save writes at most this many
 const int kChronicleBarbWordsV3 = 8;                // v3, per barb: name, race, birthRace, trait, leader, hunger, age, home
@@ -1018,6 +1020,47 @@ const int kMarriageCrateSlot = 1;             // the bride stands this many colu
 const Color kMarriageTickerTint(218, 172, 190);   // dusty rose: apart from the trade jade, tribute gold and raid reds
 const float kAllyStripeRow = 3.0f;            // 1px band across the crate body, between the lid edge and the rope band
 const float kAllyStripeSegPx = 2.0f;          // alternating 2px segments: own lifted crate colour, then the ally's
+// R60-F1 The Banner War, phase 1: a cold pair whose relation has bottomed out (<= kWarDeclareRelation) goes to war; the
+// side with more living barbs declares. wars[] holds at most kMaxWars, each keyed by its canonical (min, max) race pair.
+// The declarer's ally and vassals muster (re-checked every kWarCheckTicks). For kWarBypassTicks the war's pairs (the
+// belligerents, and each mustered race against the enemy) may raid whatever their relation and pair cooldown, through the
+// one raidBypassesCooldown() helper, at most once per kWarRaidGapTicks. War raids are logged by raid id (never an index).
+// When the window closes and no logged raid is still live, a treaty ends it: the side with fewer won raids pays capped
+// reparations in food (warReparations()), and the pair warms to neutral. Plunder score and pennants are phase 2.
+const int kMaxWars = 1;                       // wars at once (MAX_WARS)
+const float kWarDeclareRelation = -0.9f;      // at or below (and cold): the pair may go to war
+const int kWarCheckTicks = 600;               // declaration / muster scan throttle (~10s at 1x)
+const int kWarBypassTicks = 3 * 24 * ticksPerGameHour;   // ~3 game days with the raid cooldowns waived
+const int kWarRaidGapTicks = 4 * ticksPerGameHour;       // still at least this long between two war raids
+const int kWarMaxTicks = kWarBypassTicks + 2 * kRaidMaxTicks;   // backstop: a treaty is forced after this
+const int kWarCooldownTicks = 4 * 24 * ticksPerGameHour;        // per pair after a treaty before it may declare again
+const int kWarRaidLog = 16;                   // raid ids remembered per war (oldest dropped first)
+const int kWarMaxWins = 1000;                 // load bound on a side's won raids
+const int kWarStarveFloor = 8;                // STARVE_FLOOR: reparations never take the loser's food below this
+const Color kWarTickerTint(208, 92, 90);      // muted crimson: declaration, muster and treaty lines
+const Color kWarChipColor(128, 36, 42);       // stock panel chip fill: muted crimson, alpha pulses slowly
+const uint8_t kWarChipAlphaMin = 150, kWarChipAlphaMax = 215;
+const float kWarChipPulseFrames = 240.0f;     // drawn frames per pulse (~4s at 60fps): slow and subtle
+const Color kWarChipTextColor(226, 206, 196); // pale rose cream on the chip
+const Vector2f kWarChipPad(3.0f, 1.0f);       // chip padding round the "WAR" text bounds
+const unsigned int kWarChipFontSize = 10;     // a notch under stockFontSize so the chip stays inside the row
+// R60-F1: reparations = min(tributeAmountOf(loser), loser food - kWarStarveFloor), clamped at 0
+constexpr int warReparations(int tribute, int loserFood) { return max(0, min(tribute, loserFood - kWarStarveFloor)); }
+// R60-F1 test: over every tribute the purse rule can give and a spread of food stocks, reparations are never negative,
+// never above the tribute, and never take a stock at or above the floor below it (one at or below it pays nothing)
+constexpr bool warReparationsKeepFloor() {
+    for (int t = 0; t <= kTributeMax; t++)
+        for (int food = -2; food <= kWarStarveFloor + 3 * kTributeMax; food++) {
+            int p = warReparations(t, food);
+            if (p < 0 || p > t) return false;
+            if (food <= kWarStarveFloor && p != 0) return false;
+            if (food >= kWarStarveFloor && food - p < kWarStarveFloor) return false;
+            if (food >= kWarStarveFloor + t && p != t) return false;
+        }
+    return warReparations(-3, 100) == 0 && warReparations(kTributeMax, kWarStarveFloor + 1) == 1;
+}
+static_assert(warReparationsKeepFloor(), "war reparations must never push the loser below kWarStarveFloor food");
+static_assert(kMaxWars == 1, "warState muster and chip code is written for one war at a time");
 
 // Skittish deer: bolt away from a nearby barb for a short, capped time, then a cooldown so hunts can still land
 const int deerStepInterval = 3;            // ticks per 1px step while wandering (deer row of speciesDefs)
@@ -3703,8 +3746,10 @@ struct raidParty {
     int defendersBeaten = 0;
     bool won = false;                       // outcome, for the walk home
     bool gateBroken = false;                // R58-F1: the Siege broke the gate (a won raid then makes a vassal)
+    int id = 0;                             // R60-F1: raid serial, set at launch (0 = none); wars log raids by this id
 };
 raidParty raid;
+int raidSerial = 0;                         // R60-F1: last raid id handed out
 // R57-F2: per-race gate strength, lowered only by the Siege rams and restored by resetSiege() whenever a raid ends;
 // gateFlash[r] = drawn frames left of the white flash across race r's gate gap
 int gateHp[raceCount] = {kGateHpMax, kGateHpMax, kGateHpMax};
@@ -3843,6 +3888,63 @@ int allianceCount(int r) { return r >= 0 && r < raceCount && allyOf[r] >= 0 ? 1 
 void marriageMemberLost(const barb& b) {
     if (!marriage.active) return;
     for (auto& id : marriage.memberIds) if (id == b.id) id = -1;
+}
+
+// R60-F1: one war. lo < hi is the canonical pair; declarer is one of them, the other is the enemy. mustered[r] = race r
+// (the declarer's ally or vassal) fights on the declarer's side. raidIds holds raid ids (raidParty::id), never indices;
+// an id that is not the live raid is a dead raid and is skipped. wins[0] = declarer's side, wins[1] = the enemy's.
+struct warState {
+    bool active = false;
+    int lo = -1, hi = -1;
+    int declarer = -1;
+    int bypassTicks = 0;                    // cooldown waiver left (kWarBypassTicks at declaration)
+    int gapTicks = kWarRaidGapTicks;        // since the last war raid launched
+    int ticks = 0;                          // since declaration (kWarMaxTicks backstop)
+    int wins[2] = {0, 0};
+    bool mustered[raceCount] = {};
+    int raidIds[kWarRaidLog] = {};          // 0 = empty slot
+    int raidCount = 0;                      // slots filled (ring once full)
+};
+warState wars[kMaxWars];
+int warCooldown[raceCount][raceCount] = {};   // R60-F1: ticks before the pair may declare again (kept symmetric)
+int warEnemyOf(const warState& w) { return w.declarer == w.lo ? w.hi : w.lo; }
+// the war whose canonical pair is (min(a,b), max(a,b)), or -1
+int warIndexOf(int a, int b) {
+    if (a < 0 || a >= raceCount || b < 0 || b >= raceCount || a == b) return -1;
+    int lo = min(a, b), hi = max(a, b);
+    for (int k = 0; k < kMaxWars; k++) if (wars[k].active && wars[k].lo == lo && wars[k].hi == hi) return k;
+    return -1;
+}
+bool atWar(int a, int b) { return warIndexOf(a, b) >= 0; }
+// the war that lets races a and b raid each other: their own war, or a mustered race against that war's enemy; -1 if none
+int warCovering(int a, int b) {
+    int w = warIndexOf(a, b);
+    if (w >= 0) return w;
+    for (int k = 0; k < kMaxWars && a >= 0 && a < raceCount && b >= 0 && b < raceCount && a != b; k++) {
+        if (!wars[k].active) continue;
+        int e = warEnemyOf(wars[k]);
+        if ((a == e && wars[k].mustered[b]) || (b == e && wars[k].mustered[a])) return k;
+    }
+    return -1;
+}
+// the one cooldown waiver: the pair is covered by a war still in its window, and the war's raid gap has run out
+bool raidBypassesCooldown(int a, int b) {
+    int w = warCovering(a, b);
+    return w >= 0 && wars[w].bypassTicks > 0 && wars[w].gapTicks >= kWarRaidGapTicks;
+}
+bool warRaidLive(int id) { return id > 0 && raid.active && raid.id == id; }
+void warRecordRaid(int w, int id) {
+    if (w < 0 || w >= kMaxWars || id <= 0) return;
+    wars[w].raidIds[wars[w].raidCount % kWarRaidLog] = id;
+    wars[w].raidCount++;
+    wars[w].gapTicks = 0;
+}
+// the war a raid id was logged by, or -1
+int warOfRaid(int id) {
+    for (int k = 0; k < kMaxWars && id > 0; k++)
+        if (wars[k].active)
+            for (int s = 0; s < min(wars[k].raidCount, kWarRaidLog); s++) if (wars[k].raidIds[s] == id) return k;
+    return -1;
 }
 
 // R52-F1: the one way out of the raid state, on every exit (outcome, abort, beaten defender, removeBarb, backstop)
@@ -7007,6 +7109,8 @@ struct hudValues {
     int gold;                // R46-F1a: nuggets; R55-F3: goldTotal(), the sum of the purses (per race: tooltip only)
     bool goldFound;          // R46-F1a: gold cell hidden until the first nugget
     int day;                 // R51-F3: game_day; the season comes from seasonOf()
+    bool atWar[raceCount];   // R60-F1: race is one of the two sides of a war (WAR chip in its stock panel row)
+    int frame;               // R60-F1: drawn frame count, for the chip's slow pulse
 };
 
 // Draws one table icon at pos (top-left, screen px), one quad per filled cell
@@ -7047,6 +7151,12 @@ string hudDetailText(const hudValues& v) {
         s += "\nPurses (gold " + to_string(v.gold) + "):";
         for (int r = 0; r < raceCount; r++) s += string("\n  ") + racePlurals[r] + ": " + to_string(purse[r]) + "c";
     }
+    for (auto& w : wars)   // R60-F1: the WAR chips, in words
+        if (w.active) {
+            s += string("\nWar: the ") + racePlurals[w.declarer] + " against the " + racePlurals[warEnemyOf(w)]
+                 + " (raids won " + to_string(w.wins[0]) + " / " + to_string(w.wins[1]) + ")";
+            for (int r = 0; r < raceCount; r++) if (w.mustered[r]) s += string(", the ") + racePlurals[r] + " mustered";
+        }
     s += "\nEras:";   // R54-F4: each race's own rank (the strip shows the leading one)
     for (int r = 0; r < raceCount; r++) s += string("\n  ") + racePlurals[r] + ": " + eraNames[raceEra[r]];
     if (veil.faithSeen) {   // R51-F2: the stock panel's faith tick, in words
@@ -7397,6 +7507,13 @@ FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues
             if (herbHutBuilt(r)) herbNumW = max(herbNumW, Text(font, to_string(raceHerbs[r]), stockFontSize).getLocalBounds().size.x);
         innerW += stockCellGap + iconSize + stockIconGap + herbNumW;
     }
+    // R60-F1: WAR chip, last in the row, the column shown only while some race is at war and the chip only in its rows
+    bool warCol = false;
+    for (int r = 0; r < raceCount; r++) warCol = warCol || v.atWar[r];
+    Text warText(font, "WAR", kWarChipFontSize);
+    FloatRect wb = warText.getLocalBounds();
+    Vector2f chipSize(round(wb.size.x + 2 * kWarChipPad.x), round(wb.size.y + 2 * kWarChipPad.y));
+    if (warCol) innerW += stockCellGap + chipSize.x;
     float barRowH = rowH + larderBarGap + larderBarH;   // R52-F2: each race row carries its 2px larder bar underneath
     Vector2f size(round(innerW + 2 * stockPad.x), round(raceCount * barRowH + (raceCount - 1) * stockRowGap + 2 * stockPad.y));
     Vector2f pos(round(stockMargin), round(hudBarHeight + stockMargin));
@@ -7496,6 +7613,19 @@ FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues
             t.setFillColor(empty ? stockEmptyRaceColor : raceHerbs[r] <= 0 ? stockShortColor : herbStockColor);
             t.setPosition(Vector2f(round(x + iconSize + stockIconGap - t.getLocalBounds().position.x), textY));
             window.draw(t);
+        }
+        if (warCol && v.atWar[r]) {   // R60-F1: right-aligned in its column, centred on the row; the fill breathes slowly
+            float wave = 0.5f + 0.5f * sin(6.2831853f * (v.frame % (int)kWarChipPulseFrames) / kWarChipPulseFrames);
+            Color fill = kWarChipColor;
+            fill.a = (uint8_t)round(kWarChipAlphaMin + (kWarChipAlphaMax - kWarChipAlphaMin) * wave);
+            Vector2f cp(round(pos.x + stockPad.x + innerW - chipSize.x), round(y + (rowH - chipSize.y) / 2.0f));
+            RectangleShape chip(chipSize);
+            chip.setPosition(cp);
+            chip.setFillColor(fill);
+            window.draw(chip);
+            warText.setFillColor(empty ? stockEmptyRaceColor : kWarChipTextColor);
+            warText.setPosition(Vector2f(round(cp.x + kWarChipPad.x - wb.position.x), round(cp.y + kWarChipPad.y - wb.position.y)));
+            window.draw(warText);
         }
     }
     return box;
@@ -7916,6 +8046,8 @@ struct chronicleData {
     bool haveAlly = false;                         // R59-F1: an "ALLY" block was read (absent before v5)
     int ally[raceCount] = {-1, -1, -1};            // -1..raceCount-1; checked for symmetry by chronicleRestoreBarbs()
     int allyBride[raceCount] = {-1, -1, -1};       // index into barbs (the BARB block), -1 = none
+    bool haveWar = false;                          // R60-F1: a "WAR " block of the expected size was read
+    int war[kMaxWars][kChronicleWarWords] = {};    // raw words: checked by chronicleRestoreWar(), which ends a bad war
 };
 
 int chronicleNameIndex(const barb& b) {   // R55-F4: -1 for Sasuke; names only ever come from barbNames or shinobiName
@@ -8000,6 +8132,20 @@ bool chronicleSaveAlly(FILE* f, const vector<barb>& barbs) {
     return ok;
 }
 
+// R60-F1: the "WAR " block. Raid ids are not written: raids never survive a load.
+bool chronicleSaveWar(FILE* f) {
+    bool ok = chronPut(f, kChronicleBlockWar) && chronPut(f, 1 + kMaxWars * kChronicleWarWords) && chronPut(f, kMaxWars);
+    for (int w = 0; ok && w < kMaxWars; w++) {
+        const warState& war = wars[w];
+        int bits = 0;
+        for (int r = 0; r < raceCount; r++) if (war.mustered[r]) bits |= 1 << r;
+        ok = chronPut(f, war.active ? 1 : 0) && chronPut(f, war.active ? war.declarer : -1) && chronPut(f, war.active ? warEnemyOf(war) : -1)
+          && chronPut(f, war.bypassTicks) && chronPut(f, war.ticks) && chronPut(f, war.wins[0]) && chronPut(f, war.wins[1])
+          && chronPut(f, bits);
+    }
+    return ok;
+}
+
 bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
     FILE* f = fopen(kChronicleTmpPath, "wb");
     if (!f) { printf("CHRONICLE - save failed: cannot open %s\n", kChronicleTmpPath); return false; }
@@ -8023,6 +8169,7 @@ bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
     ok = ok && chronicleSaveKnow(f);                      // R55-F2: same v3 format, one more block
     ok = ok && chronicleSavePurse(f);                     // R55-F3: same v3 format, one more block
     ok = ok && chronicleSaveAlly(f, barbs);               // R59-F1 (v5)
+    ok = ok && chronicleSaveWar(f);                       // R60-F1: one more tagged block, no version bump
     ok = ok && chronPut(f, kChronicleEndMark);
     if (fclose(f) != 0) ok = false;
     if (!ok) {
@@ -8115,6 +8262,26 @@ bool chronicleReadAlly(FILE* f, int words, chronicleData& d, const char*& why) {
     return true;
 }
 
+// R60-F1: the "WAR " block into d, raw. A block of another size is skipped (no war comes back) rather than rejecting the
+// file; the values are only judged by chronicleRestoreWar(), which ends an invalid war instead of failing the load.
+bool chronicleReadWar(FILE* f, int words, chronicleData& d, const char*& why) {
+    int32_t v = 0;
+    if (words != 1 + kMaxWars * kChronicleWarWords) {
+        for (int k = 0; k < words; k++) if (!chronGet(f, v)) { why = "truncated"; return false; }
+        printf("CHRONICLE - war block size differs: no war restored\n");
+        return true;
+    }
+    int32_t count = 0;
+    if (!chronGet(f, count)) { why = "truncated"; return false; }
+    for (int w = 0; w < kMaxWars; w++)
+        for (int k = 0; k < kChronicleWarWords; k++) {
+            if (!chronGet(f, v)) { why = "truncated"; return false; }
+            d.war[w][k] = v;
+        }
+    d.haveWar = count == kMaxWars;   // a wrong count leaves every war out (ended on load)
+    return true;
+}
+
 // Reads and bounds-checks the whole file into out; nothing global is touched here. why = the rejection reason.
 bool chronicleRead(chronicleData& out, const char*& why) {
     why = nullptr;
@@ -8184,6 +8351,9 @@ bool chronicleRead(chronicleData& out, const char*& why) {
                 } else if (tag == kChronicleBlockAlly) {   // R59-F1
                     if (d.haveAlly) { why = "two ally blocks"; break; }
                     if (!chronicleReadAlly(f, words, d, why)) break;
+                } else if (tag == kChronicleBlockWar) {   // R60-F1
+                    if (d.haveWar) { why = "two war blocks"; break; }
+                    if (!chronicleReadWar(f, words, d, why)) break;
                 } else {   // a block from a later feature: skipped word by word, so a short file still fails
                     for (int k = 0; k < words && !why; k++) if (!chronGet(f, v)) why = "truncated";
                 }
@@ -8233,6 +8403,8 @@ bool chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
     for (auto& row : relationClashCooldown) for (auto& c : row) c = 0;
     for (int r = 0; r < raceCount; r++) { allyOf[r] = -1; allyBrideId[r] = -1; marriageCooldown[r] = 0; }   // R59-F1: chronicleRestoreBarbs() re-binds
     marriage = marriageTrip{};
+    for (auto& w : wars) w = warState{};   // R60-F1: chronicleRestoreWar() re-declares a valid saved war
+    for (auto& row : warCooldown) for (auto& c : row) c = 0;
     // R54-F4: eras before the houses, so addHouse() rebuilds a Fourth Age race's houses as townhouses. Written directly:
     // no promotion lines on load; eraTick() later lowers a pre-Fourth era quietly if the live barbs don't support it.
     for (int r = 0; r < raceCount; r++) raceEra[r] = (settlementEra)d.era[r];
@@ -9672,6 +9844,40 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
     for (int r = 0; r < raceCount; r++)
         if (raceElected[r]) printf("CHRONICLE - %s leader %s returns\n", racePlurals[r], barbs[findBarbById(barbs, raceLeaderId[r])].name);
     logEvent(line, kChronicleRestoreTint);
+}
+
+// R60-F1: after chronicleRestoreBarbs() (alliances and the returners are back). A saved war comes back only if every word
+// is in range, the two sides differ, are not allied and both have living barbs; any other active war ends on load with
+// a ticker line. Raid ids start empty (raids never survive a load); the muster is re-checked by warTick().
+void chronicleRestoreWar(const chronicleData& d, const vector<barb>& barbs) {
+    if (!d.haveWar) return;
+    int living[raceCount] = {};
+    for (auto& b : barbs) if (b.health > 0) living[clampRace(b.race)]++;
+    for (int w = 0; w < kMaxWars; w++) {
+        const int* x = d.war[w];
+        if (x[0] != 1) continue;   // no war in this slot
+        int dec = x[1], en = x[2];
+        bool racesOk = dec >= 0 && dec < raceCount && en >= 0 && en < raceCount && dec != en;
+        bool ok = racesOk && x[3] >= 0 && x[3] <= kWarBypassTicks && x[4] >= 0 && x[4] <= kWarMaxTicks
+               && x[5] >= 0 && x[5] <= kWarMaxWins && x[6] >= 0 && x[6] <= kWarMaxWins && x[7] >= 0 && x[7] < (1 << raceCount)
+               && !isAllied(dec, en) && living[dec] > 0 && living[en] > 0 && !atWar(dec, en);
+        if (!ok) {
+            printf("CHRONICLE - saved war %d invalid (%d vs %d): ended on load\n", w, dec, en);
+            if (racesOk) logEvent("The war between the " + string(racePlurals[dec]) + " and " + racePlurals[en] + " ended in the chronicle",
+                                  kWarTickerTint);
+            continue;
+        }
+        warState& war = wars[w];
+        war = warState{};
+        war.active = true;
+        war.lo = min(dec, en); war.hi = max(dec, en);
+        war.declarer = dec;
+        war.bypassTicks = x[3];
+        war.ticks = x[4];
+        war.wins[0] = x[5]; war.wins[1] = x[6];
+        for (int r = 0; r < raceCount; r++) war.mustered[r] = r != dec && r != en && (x[7] & (1 << r)) != 0;
+        printf("CHRONICLE - %s still at war with the %s (%d ticks of waiver left)\n", racePlurals[dec], racePlurals[en], war.bypassTicks);
+    }
 }
 
 // R25-F2: Sasuke's blink. Puffs live in their own vector, aged per drawn frame and removed in reverse.
@@ -12382,6 +12588,128 @@ bool trySendEnvoy(vector<barb>& barbs, int att, int def) {
     return true;
 }
 
+// R60-F1: race r has barbs out in a party already (a raid, caravan, envoy, wedding procession or expedition)
+bool raceInParty(int r) {
+    return (raid.active && (raid.att == r || raid.def == r)) || (caravan.active && caravan.from == r)
+        || (envoy.active && envoy.payer == r) || (marriage.active && marriage.from == r) || (party.active && party.race == r);
+}
+// R60-F1: the one way a war ends. treaty = the window closed and the raids are over: the side with fewer won raids pays
+// warReparations() in food (nothing on a draw) and the pair warms to neutral. Otherwise the war just fades (a side gone,
+// the pair now allied, or an invalid war on load): no payment, no relation change.
+void endWar(int w, bool treaty, const char* why) {
+    if (w < 0 || w >= kMaxWars || !wars[w].active) return;
+    warState& war = wars[w];
+    int d = war.declarer, e = warEnemyOf(war);
+    string pair = string(racePlurals[war.lo]) + " and " + racePlurals[war.hi];
+    if (treaty) {
+        int loser = war.wins[0] < war.wins[1] ? d : war.wins[1] < war.wins[0] ? e : -1;
+        int winner = loser == d ? e : d;
+        int paid = 0;
+        if (loser >= 0) {
+            raceStock& ls = stockOfRace(loser);
+            paid = warReparations(tributeAmountOf(loser), ls.food);
+            ls.food -= paid;
+            stockOfRace(winner).food += paid;
+        }
+        string line = pair + " sign a treaty";
+        if (loser < 0) line += ": neither side yields";
+        else if (paid > 0) line += ": the " + string(racePlurals[loser]) + " pay the " + racePlurals[winner] + " " + to_string(paid) + " food";
+        else line += ": the " + string(racePlurals[loser]) + " have nothing to spare";
+        printf("---WAR ENDS--- %s (wins %d / %d, reparations %d food, loser food %d)\n", line.c_str(), war.wins[0], war.wins[1],
+               paid, loser >= 0 ? stockOfRace(loser).food : 0);
+        logEvent(line, kWarTickerTint);
+        if (raceRelation[war.lo][war.hi] < 0.0f) setRelation(war.lo, war.hi, 0.0f);   // warms to neutral
+        raidPairCooldown[war.lo][war.hi] = raidPairCooldown[war.hi][war.lo] = kRaidPairCooldownTicks;
+    } else {
+        printf("---WAR FADES--- %s (%s)\n", pair.c_str(), why);
+        logEvent("The war between the " + pair + " fades: " + why, kWarTickerTint);
+    }
+    warCooldown[war.lo][war.hi] = warCooldown[war.hi][war.lo] = kWarCooldownTicks;
+    war = warState{};
+}
+// R60-F1: a war raid's outcome scores for the side that held the field
+void warRaidOutcome(int raidId, int att, int def, bool won) {
+    int w = warOfRaid(raidId);
+    if (w < 0) return;
+    warState& war = wars[w];
+    int side = won ? att : def;
+    bool declarerSide = side == war.declarer || (side >= 0 && side < raceCount && war.mustered[side]);
+    war.wins[declarerSide ? 0 : 1]++;
+    printf("WAR RAID - raid %d %s by the %s (wins %d / %d)\n", raidId, won ? "won" : "held", racePlurals[clampRace(side)],
+           war.wins[0], war.wins[1]);
+}
+// R60-F1: once per sim tick, before raidTick(). Cooldowns; then per active war the clocks, upkeep, muster and treaty;
+// with a free war slot, a throttled scan for a pair whose relation has bottomed out.
+void warTick(const vector<barb>& barbs, const storehouse (&stores)[raceCount]) {
+    static int checkTimer = 0;
+    for (int a = 0; a < raceCount; a++)
+        for (int b = a + 1; b < raceCount; b++)
+            if (warCooldown[a][b] > 0) warCooldown[a][b] = --warCooldown[b][a];
+    bool check = --checkTimer <= 0;
+    if (check) checkTimer = kWarCheckTicks;
+    int living[raceCount] = {};
+    for (auto& b : barbs) if (b.health > 0) living[clampRace(b.race)]++;
+    int openSlots = 0;
+    for (int w = 0; w < kMaxWars; w++) {
+        warState& war = wars[w];
+        if (!war.active) { openSlots++; continue; }
+        int d = war.declarer, e = warEnemyOf(war);
+        if (living[d] <= 0 || living[e] <= 0) {
+            endWar(w, false, living[d] <= 0 ? "the declarer is gone" : "the enemy is gone");
+            openSlots++;
+            continue;
+        }
+        if (isAllied(d, e)) { endWar(w, false, "the two are allied now"); openSlots++; continue; }
+        war.ticks++;
+        if (war.bypassTicks > 0) war.bypassTicks--;
+        if (war.gapTicks < kWarRaidGapTicks) war.gapTicks++;
+        bool live = false;   // dead raids (ids that are no longer the live raid) are skipped
+        for (int s = 0; s < min(war.raidCount, kWarRaidLog); s++) live = live || warRaidLive(war.raidIds[s]);
+        if ((war.bypassTicks <= 0 && !live) || war.ticks > kWarMaxTicks) { endWar(w, true, "treaty"); openSlots++; continue; }
+        if (!check || war.bypassTicks <= 0) continue;
+        for (int t = 0; t < raceCount; t++) {   // muster: the declarer's ally and vassals
+            if (t == d || t == e) continue;
+            bool bound = isAllied(t, d) || vassalOf[t].lord == d;
+            if (war.mustered[t]) {
+                if (!bound || living[t] <= 0 || isAllied(t, e)) {
+                    war.mustered[t] = false;
+                    printf("WAR MUSTER - the %s stand down (%s)\n", racePlurals[t], living[t] <= 0 ? "gone" : "no longer bound");
+                }
+                continue;
+            }
+            if (!bound || atWar(t, d) || isAllied(t, e) || living[t] <= 0 || raceInParty(t) || !stores[t].built) continue;
+            war.mustered[t] = true;
+            string line = string(racePlurals[t]) + " muster for the " + racePlurals[d] + " against the " + racePlurals[e];
+            printf("---WAR MUSTER--- %s (%s)\n", line.c_str(), isAllied(t, d) ? "ally" : "vassal");
+            logEvent(line, kWarTickerTint);
+        }
+    }
+    if (!check || openSlots <= 0) return;
+    for (int a = 0; a < raceCount; a++)
+        for (int b = a + 1; b < raceCount; b++) {
+            float v = raceRelation[a][b];
+            if (v > kWarDeclareRelation || relationTierOf(v) != relCold || warCooldown[a][b] > 0) continue;
+            if (atWar(a, b) || isAllied(a, b) || pairFriendly(a, b) || !stores[a].built || !stores[b].built) continue;
+            if (living[a] <= 0 || living[b] <= 0) continue;
+            int slot = -1;
+            for (int w = 0; w < kMaxWars && slot < 0; w++) if (!wars[w].active) slot = w;
+            if (slot < 0) return;
+            int d = living[a] == living[b] ? (uniform_int_distribution<int>(0, 1)(gen) ? a : b) : living[a] > living[b] ? a : b;
+            int e = d == a ? b : a;
+            warState& war = wars[slot];
+            war = warState{};
+            war.active = true;
+            war.lo = a; war.hi = b;   // a < b: canonical
+            war.declarer = d;
+            war.bypassTicks = kWarBypassTicks;
+            string line = string(racePlurals[d]) + " declare war on the " + racePlurals[e];
+            printf("---WAR DECLARED--- %s (relation %.2f, %d vs %d living)\n", line.c_str(), v, living[d], living[e]);
+            logEvent(line, kWarTickerTint);
+            checkTimer = 1;   // the muster is called on the next tick
+            if (--openSlots <= 0) return;
+        }
+}
+
 void tryLaunchRaid(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
     if (isNightHour(game_time)) return;
     if (envoy.active && envoy.phase == envoyTrip::Out) return;   // R56-F2: no raid launches while tribute is on the road
@@ -12389,8 +12717,12 @@ void tryLaunchRaid(vector<barb>& barbs, vector<RectangleShape>& squares, const s
     int start = uniform_int_distribution<int>(0, raceCount - 1)(gen);
     for (int o = 0; o < raceCount; o++) {
         int a = (start + o) % raceCount, b = (a + 1) % raceCount;   // each pair once: (0,1) (1,2) (2,0)
-        if (raidPairCooldown[a][b] > 0 || relationTierOf(raceRelation[a][b]) != relCold) continue;
-        if (pairFriendly(a, b)) continue;   // R54-F1: friendly pairs never raid
+        int w = warCovering(a, b);          // R60-F1: a war still in its window lifts the cold and friendly rules
+        bool war = w >= 0 && wars[w].bypassTicks > 0;
+        if (raidPairCooldown[a][b] > 0 && !raidBypassesCooldown(a, b)) continue;
+        if (war && wars[w].gapTicks < kWarRaidGapTicks) continue;   // the war's own gap holds even off cooldown
+        if (!war && relationTierOf(raceRelation[a][b]) != relCold) continue;
+        if (!war && pairFriendly(a, b)) continue;   // R54-F1: friendly pairs never raid
         if (isAllied(a, b)) continue;       // R59-F1: allies never raid each other
         if (!stores[a].built || !stores[b].built) continue;
         int ready[2] = {0, 0}, side[2] = {a, b};
@@ -12403,6 +12735,10 @@ void tryLaunchRaid(vector<barb>& barbs, vector<RectangleShape>& squares, const s
         }
         if (ready[0] < kRaidPartySize && ready[1] < kRaidPartySize) continue;
         int s = ready[0] == ready[1] ? uniform_int_distribution<int>(0, 1)(gen) : ready[1] > ready[0] ? 1 : 0;
+        if (war && warIndexOf(a, b) < 0) {   // R60-F1: a muster pair: only the mustered race marches, on the enemy
+            s = wars[w].mustered[a] ? 0 : 1;
+            if (ready[s] < kRaidPartySize) continue;
+        }
         int att = side[s], def = side[1 - s];
         int pick[kRaidPartySize];
         bool ok = true;
@@ -12416,10 +12752,12 @@ void tryLaunchRaid(vector<barb>& barbs, vector<RectangleShape>& squares, const s
             ok = pick[k] >= 0;
         }
         if (!ok) continue;
-        if (trySendEnvoy(barbs, att, def)) return;   // R56-F2: the column stays home while the envoy walks
+        if (!war && trySendEnvoy(barbs, att, def)) return;   // R56-F2: the column stays home while the envoy walks (R60-F1: not in war)
         raid = raidParty{};
         resetSiege();   // R57-F2: every launch starts at full gates (endRaid() already did; defensive)
         raid.active = true;
+        raid.id = ++raidSerial;   // R60-F1
+        if (war) warRecordRaid(w, raid.id);
         raid.att = att;
         raid.def = def;
         raid.phase = raidParty::March;
@@ -12431,8 +12769,8 @@ void tryLaunchRaid(vector<barb>& barbs, vector<RectangleShape>& squares, const s
             raid.raiderIds[k] = m.id;
             names += string(k == 0 ? "" : k == kRaidPartySize - 1 ? " and " : ", ") + m.name;
         }
-        printf("---RAID OUT--- %s march on the %s (%s), relation %.2f\n", racePlurals[att], racePlurals[def], names.c_str(),
-               raceRelation[att][def]);
+        printf("---RAID OUT--- %s march on the %s (%s), relation %.2f%s\n", racePlurals[att], racePlurals[def], names.c_str(),
+               raceRelation[att][def], war ? ", war raid" : "");
         logEvent(string(racePlurals[att]) + " march on the " + racePlurals[def] + ": " + names, kRaidTickerTint);
         return;
     }
@@ -12913,6 +13251,7 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
                                                 : " (the raiders tire)");
         printf("---RAID %s--- %s after %d fight ticks\n", won ? "WON" : "LOST", line.c_str(), raid.fightTicks);
         logEvent(line, kRaidTickerTint);
+        warRaidOutcome(raid.id, att, def, won);   // R60-F1: a logged war raid scores for its side
         if (won) {   // R56-F3: the side that held the field; beaten fighters earn nothing
             for (int k = 0; k < kRaidPartySize; k++)
                 if (ri[k] >= 0 && !barbs[ri[k]].raidBeaten) addRenown(barbs, ri[k], kRenownRaidWin, deedRaid);
@@ -16484,8 +16823,10 @@ int main() {
     // R54-F2: after the world, trees and houseshapes exist, so restored houses are checked against the new map
     {
         chronicleData chron;
-        if (chronicleRestore(barbs, houses, houseshapes, fields, trees, rocks, bushshapes, chron))
+        if (chronicleRestore(barbs, houses, houseshapes, fields, trees, rocks, bushshapes, chron)) {
             chronicleRestoreBarbs(chron, barbs, squares, birthRings);   // R55-F4: after the houses, so home ids resolve
+            chronicleRestoreWar(chron, barbs);   // R60-F1: after the alliances and returners, so the checks see them
+        }
     }
 
     VertexArray treeVerts(PrimitiveType::Triangles);
@@ -16635,6 +16976,7 @@ int main() {
                 wolfTick(wolves, wd, barbs);
                 prowlerTick(prowlers, barbs, squares, houses, houseshapes, fire);   // R48-F1: bites land before starveDeathTick()
                 watchTick(barbs, squares, prowlers);   // R51-F1: watchmen patrol and fight; slain prowlers fade, prowlerTick() removes them
+                warTick(barbs, stores);   // R60-F1: declarations, muster and treaties, before the raid launcher reads the wars
                 raidTick(barbs, squares, stores);   // R52-F1: raid march and fight; sets raidThreat[] for bellTick() just below
                 caravanTick(barbs, squares, stores);   // R54-F1: caravans, swaps and the friendly timers, once per sim tick
                 campTick(barbs, squares, wd);   // R55-F1: wildfolk hunters, deer trade, trespass and tents
@@ -16907,6 +17249,9 @@ int main() {
             hv.gold = goldTotal();       // R46-F1a; R55-F3: the sum of the purses, no separate count
             hv.goldFound = goldFound;
             hv.day = game_day;           // R51-F3
+            for (int r = 0; r < raceCount; r++) hv.atWar[r] = false;   // R60-F1
+            for (auto& w : wars) if (w.active) hv.atWar[w.lo] = hv.atWar[w.hi] = true;
+            hv.frame = frameCount;
             for (int r = 0; r < raceCount; r++)   // R55-F2: one pip row per race
                 for (int k = 0; k < techCount; k++) {
                     hv.learned[r][k] = know[r].learned[k];
