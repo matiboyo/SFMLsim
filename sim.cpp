@@ -496,6 +496,42 @@ const int sickRaceFloor = 4;                           // ...or the barb's race 
 static_assert(sickColonyFloor > 0 && sickRaceFloor > 0, "the cough must never wipe out the colony or a race");
 const Color sickDotColor(172, 184, 88);                // sallow olive-yellow face pixel: greener than the sash/fleck golds,
                                                        // duller than chop green, far from the red raid pennant
+// R59-F2 The Red Plague, phase 1: its own disease beside the cough. `plagueTimer` counts a case down; `plagueImmune` is
+// its own field. A summer outbreak seeds in one quarter while no case is live (and the cooldown has run out); barbs
+// coming home from a caravan, raid, envoy trip or exile can carry it from a quarter that has cases. plagueTick() rolls
+// once per house per check (own sick, sick in nearby same-race houses and the quarter all add to that one chance). At a
+// case's end it rolls recovery; a failed roll dies, under the per-outbreak cap and the population guards. Deaths are
+// collected in the loop and removed after it in reverse index order. Quarantine is phase 2.
+const int kPlagueSeedOneIn = 6 * 60 * ticksPerMinute;       // summer seed: 1-in-N per tick (~6 real h; summer is 8)
+const int kPlagueCooldownTicks = 24 * ticksPerGameHour;     // no new outbreak for a game day after one passes
+const int kPlagueSpreadCheckTicks = 60;                     // spread rolls once a real second at 1x
+const float kPlagueSpreadPerSickHere = 1.0f / (3.0f * 60);  // per check per sick housemate (~3 real min under one roof)
+const float kPlagueSpreadPerSickNear = 1.0f / (10.0f * 60); // per check per sick barb in a nearby house of the race
+const float kPlagueSpreadPerSickQuarter = 1.0f / (40.0f * 60); // per check per sick barb anywhere in the quarter
+const float kPlagueSpreadChanceMax = 0.25f;                 // one house's roll never beats this
+const float kPlagueHouseReachPx = 48.0f;                    // house centres this close count as neighbours
+const float kPlagueCarryChance = 0.35f;                     // a traveller home from a stricken quarter catches it
+const int kPlagueMinTicks = 6 * ticksPerMinute;             // case length, rolled per case
+const int kPlagueMaxTicks = 10 * ticksPerMinute;
+const int kPlagueDamageTicks = 6 * 60;                      // -1hp every this many sick ticks (~-60..100hp a case)...
+const int kPlagueHealthFloor = 15;                          // ...never under this: only the crisis roll kills
+const float kPlagueRecoverChance = 0.7f;                    // at a case's end: recovers, else dies (if allowed)
+const int kPlagueDeathCap = 4;                              // at most this many plague deaths per outbreak
+const int kPlagueMinPop = 12;                               // no plague death (or seed) at or under this many living...
+const int kPlagueMinRacePop = 4;                            // ...or with the barb's race at or under this many
+static_assert(kPlagueMinPop > 0 && kPlagueMinRacePop > 0 && kPlagueDeathCap > 0, "the plague must never wipe out a race");
+const int kPlagueImmuneTicks = 60 * ticksPerMinute;         // a survivor can't catch it again for a real hour
+const int kPlagueRingTicks = 4 * 60;                        // the survivor's ring shows only the first ~4 s, fading
+const Color kPlagueTintColor(168, 184, 158);                // pale grey-green the sick body is mixed toward...
+const float kPlagueTintAmount = 0.55f;                      // ...by this much
+const Color kPlagueDotColor(184, 60, 52);                   // the pulsing face pixel: muted plague red...
+const Color kPlagueDotDimColor(92, 38, 34);                 // ...easing down to this and back
+const float kPlagueDotPulseRate = 0.12f;                    // radians per drawn frame (~0.9 s a beat at 60 fps)
+const Color kPlagueHouseOutlineColor(168, 184, 158, 72);    // faint 1px line just outside a stricken house's slab
+const Color kPlagueRingColor(236, 228, 200);                // warm cream survivor ring (alpha faded from kPlagueRingAlpha)
+const uint8_t kPlagueRingAlpha = 190;
+const Color kPlagueGraveColor(82, 80, 76);                  // a plague victim's stone: dark, no race tint
+const Color kPlagueTickerTint(176, 190, 146);               // sickly pale green on the black ticker strip
 // R47-F9 Ancestor Stones: every death (removeBarb) leaves a 3x4 headstone where the barb stood. The graves vector is
 // its own list (no barb index or id kept), capped at graveMax with the oldest evicted first.
 const int graveMax = 12;                          // stones on the map at once; a new one evicts the oldest
@@ -3427,6 +3463,8 @@ struct barb {
     int sick = 0;                // R52-F4: ticks of cough left (0 = well); set only by catchCough(), cleared by clearSick()
     int sickImmune = 0;          // R52-F4: ticks of immunity left after a recovery
     int cure = 0;                // R52-F4: reserved for phase 2 (herb hut remedy); unused in phase 1
+    int plagueTimer = 0;         // R59-F2: ticks of Red Plague left (0 = free of it); set only by catchPlague(), cleared by clearPlague()
+    int plagueImmune = 0;        // R59-F2: ticks of plague immunity left after surviving a case (its own field, not sickImmune)
     barbActivity activity = actNone; // R53-F4: the one exclusive state; written only by beginActivity()/endActivity()
     raceStock loot{0, 0, 0};     // R53-F1: plunder pack carried home; set only by raidTick() on a win, emptied only by settleLoot()
     int lootFrom = -1;           // R53-F1: race the pack was taken from (gets it back on a drop); -1 = no pack
@@ -3713,6 +3751,31 @@ void clearSick(barb& b) {
     b.sick = 0;
     b.sickImmune = 0;
     b.cure = 0;
+}
+// R59-F2: the add/remove pair for the plague. catchPlague() is the only place plagueTimer is set; clearPlague() wipes both
+// fields (makeBarb(), the chronicle load and removeBarb() all go through it)
+void catchPlague(barb& b) {
+    b.plagueTimer = uniform_int_distribution<int>(kPlagueMinTicks, kPlagueMaxTicks)(gen);
+    b.plagueImmune = 0;
+}
+void clearPlague(barb& b) {
+    b.plagueTimer = 0;
+    b.plagueImmune = 0;
+}
+// R59-F2: off on the road (party, raid column, caravan, exile, envoy, procession): neither spreads nor catches at home
+bool plagueAway(const barb& b) {
+    return b.activity == actExpedition || b.activity == actRaidAttack || b.activity == actCaravan || b.activity == actExile
+        || b.activity == actEnvoy || b.activity == actProcession;
+}
+// R59-F2: outbreak state, values only (never a barb index or id). Not saved: resetPlague() clears it on a chronicle load.
+bool plagueActive = false;    // an outbreak is on: set at the seed, cleared once no case is left
+int plagueDeaths = 0;         // deaths this outbreak, against kPlagueDeathCap
+int plagueCooldown = 0;       // ticks before a new outbreak may seed
+int plagueSpreadTimer = 0;    // ticks since the last spread check
+void resetPlague(vector<barb>& barbs) {
+    for (auto& b : barbs) clearPlague(b);
+    plagueActive = false;
+    plagueDeaths = plagueCooldown = plagueSpreadTimer = 0;
 }
 bool lootLaden(const barb& b) { return b.loot.food + b.loot.wood + b.loot.stone > 0; }   // R53-F1
 void raidMemberLost(const barb& b) {
@@ -5237,6 +5300,7 @@ vector<grave> graves;                      // oldest first, at most graveMax
 float graveMorale[raceCount] = {};          // the one morale term per race, recomputed by graveTick() every tick
 float graveRestAcc[raceCount] = {};         // carries the fractional rest ticks between ticks
 bool graveHungerRest[raceCount] = {};       // this tick, race r's hunger does not grow (read in hungerTick)
+bool plagueGraveNext = false;               // R59-F2: set by plagueTick() only around its own removeBarb() call: a dark stone
 
 // R50-F1a The Veil: hidden soul-ether. Holds only values (race, cell amounts), never a barb index or id.
 struct veilState {
@@ -5458,10 +5522,11 @@ void addGrave(const barb& b, const RectangleShape& sq) {
     g.race = clampRace(b.race);
     g.hero = hero;
     bool elder = lifeStage(b) == stageElder;   // R57-F1: an elder's stone is plain grey
-    g.tint = elder ? kElderGraveColor : lerpColor(graveStoneColor, raceEventColors[g.race], graveRaceTint);
+    g.tint = plagueGraveNext ? kPlagueGraveColor   // R59-F2: a plague victim's stone is dark, over the elder grey
+           : elder ? kElderGraveColor : lerpColor(graveStoneColor, raceEventColors[g.race], graveRaceTint);
     graves.push_back(g);
     printf("GRAVE - stone raised for %s (%s)%s%s%s at %d,%d - %d stones\n", b.name, raceOf(b).name, hero ? " " : "", b.title,
-           elder ? ", grey elder stone" : "", (int)p.x, (int)p.y, (int)graves.size());
+           plagueGraveNext ? ", dark plague stone" : elder ? ", grey elder stone" : "", (int)p.x, (int)p.y, (int)graves.size());
 }
 
 // Ages the stones, lights the ones a same-race barb is beside, and computes each race's morale term once.
@@ -5726,6 +5791,21 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
         Color tc = barbColor(b);                         // task colour; barbIdleColor means no task
         bool idle = tc == barbIdleColor;
         if (hungry) tc = hungryTint(tc);
+        int ringAge = kPlagueImmuneTicks - b.plagueImmune;   // R59-F2: sim ticks since the barb survived the plague
+        if (b.plagueImmune > 0 && ringAge < kPlagueRingTicks) {
+            // R59-F2: survivor ring, barb-sized: a 1px cream frame one px clear of the whole sprite (hat and feet
+            // included), fading out over kPlagueRingTicks. The stricken-house outline is a dim grey-green 12px square.
+            static RectangleShape ring;
+            float headTop = bodyTop - bob - rd.hatSize.y - rd.hatTipSize.y;   // unbobbed: the frame holds still on a walk
+            Color rc = kPlagueRingColor;
+            rc.a = (uint8_t)(kPlagueRingAlpha * (1.0f - (float)ringAge / kPlagueRingTicks));
+            ring.setSize(Vector2f(bodySize.x + 2.0f, feet - headTop + 2.0f));
+            ring.setPosition(Vector2f(base.x - 1.0f, headTop - 1.0f));
+            ring.setFillColor(Color::Transparent);
+            ring.setOutlineColor(rc);
+            ring.setOutlineThickness(1.0f);   // outside the rect: the frame sits 2px out, leaving a 1px gap round the sprite
+            window.draw(ring);
+        }
         if (stage == stageChild) {   // R57-F1: faint 1px rim under the small body, so a child reads as one at a glance
             body.setSize(Vector2f(bodySize.x + 2.0f, bodyH + 2.0f));
             body.setFillColor(kChildOutlineColor);
@@ -5747,6 +5827,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
         }
         Color bodyColor = b.shinobi ? shinobiBodyColor : barbBodyColor;
         body.setSize(Vector2f(bodySize.x, bodyH));
+        if (b.plagueTimer > 0) bodyColor = lerpColor(bodyColor, kPlagueTintColor, kPlagueTintAmount);   // R59-F2: pale grey-green
         body.setFillColor(raidHit ? kRaidFlashColor : hungry ? hungryTint(bodyColor) : bodyColor);
         body.setPosition(Vector2f(base.x, bodyTop));
         window.draw(body);
@@ -5782,6 +5863,12 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
         }
         if (b.sick > 0) {   // R52-F4: sallow 1px face pixel, top-left body cell (row 0: above the task stripe and the sash,
             dot.setFillColor(sickDotColor);   // clear of the dwarf beard at x=1); drawn over the shinobi band, at every zoom
+            dot.setPosition(Vector2f(base.x, bodyTop));
+            window.draw(dot);
+        }
+        if (b.plagueTimer > 0) {   // R59-F2: the same face pixel, pulsing plague red (wins over the cough dot), every zoom
+            float beat = 0.5f + 0.5f * sin(phase * kPlagueDotPulseRate);
+            dot.setFillColor(lerpColor(kPlagueDotDimColor, kPlagueDotColor, beat));
             dot.setPosition(Vector2f(base.x, bodyTop));
             window.draw(dot);
         }
@@ -6288,6 +6375,8 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
                 label += ", of house " + to_string(b.homeHouse + 1) + ", " + to_string(kin) + " kin";
             }
             if (b.sick > 0) label += ", coughing";   // R52-F4
+            if (b.plagueTimer > 0) label += ", plague-stricken";   // R59-F2
+            else if (b.plagueImmune > 0) label += ", plague survivor";
             lifeStageKind ls = lifeStage(b);         // R57-F1
             if (ls != stageAdult) label += ls == stageChild ? ", child" : ", elder";
             if (b.birthRace != b.race) label += string(", born ") + raceDefs[clampRace(b.birthRace)].name;   // R54-F3
@@ -9243,6 +9332,7 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
     b.memReturn = b.memShared = false;
     b.order = needNone;   // INBOX-F2b: a newborn holds no order
     b.orderTicks = 0;
+    clearPlague(b);       // R59-F2: no case and no immunity, for a newborn and a chronicle returner alike
     b.bornHour = chronicleNowHour();   // R55-F4
     if (saved) {   // R55-F4: a returner keeps who it was; the caller has already cleared barbNameUsed and set sasukeTaken
         b.birthRace = (barbRace)clampRace(saved->birthRace);
@@ -9358,6 +9448,7 @@ void crownBarb(vector<barb>& barbs, int i, int r) {
 // left unset (-1). Leaders are crowned again directly (no election line), so they keep the crown pixel. The return line
 // always fires on a load: the oldest returners by name, or the founders when the file had no barbs (v1/v2).
 void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<RectangleShape>& squares, vector<birthRing>& rings) {
+    resetPlague(barbs);   // R59-F2: no case, immunity or outbreak survives a load (returners are cleared again in makeBarb())
     if (d.barbs.empty()) {
         for (auto& b : barbs) b.bornHour = chronicleNowHour() - founderAgeHours();   // founders arrive on the restored clock (R57-F1: grown)
         printf("CHRONICLE - no barbs saved: the %d founders stay\n", (int)barbs.size());
@@ -10473,6 +10564,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
     addGrave(b, squares[i]);   // R47-F9: copied out by value; nothing in graves points back at barbs
+    clearPlague(b);            // R59-F2: after the stone (plagueTick() sets plagueGraveNext for its own deaths)
     veilDeposit(b.race, squares[i].getPosition() + squares[i].getSize() / 2.0f, veilSoulPerDeath);   // R50-F1a: by value
     veilAddSite(b.race, squares[i].getPosition() + squares[i].getSize() / 2.0f, b.name);   // R50-F1b: mote site, by value
     b.homeHouse = -1;
@@ -10497,6 +10589,192 @@ void starveDeathTick(vector<barb>& barbs, vector<RectangleShape>& squares,
         if (i >= (int)barbs.size() || i >= (int)squares.size()) continue;
         printf(barbs[i].oldAgeDeath ? "OLD AGE - " : barbs[i].sick > 0 ? "COUGHED - " : "STARVED - ");   // R52-F4, R57-F1
         removeBarb(barbs, squares, i, sh, fg, stores, fields);
+    }
+}
+
+// R59-F2: live plague cases in race r's quarter (away travellers not counted)
+int plagueCasesIn(const vector<barb>& barbs, int r, int skipId = -1) {
+    int n = 0;
+    for (auto& o : barbs) if (o.plagueTimer > 0 && o.race == r && o.health > 0 && o.id != skipId && !plagueAway(o)) n++;
+    return n;
+}
+
+// R59-F2: a traveller home from race src's quarter (caravan, raid, envoy) or an exile just joined from it. Called where
+// each trip ends, with barbs[i] already of its home race. While src has live cases a well, non-immune barb rolls
+// kPlagueCarryChance; an exile already sick brings its own case. The first case in a quarter names its vector.
+void plagueCarryHome(vector<barb>& barbs, int i, int src, const char* how) {
+    if (i < 0 || i >= (int)barbs.size() || src < 0 || src >= raceCount) return;
+    barb& b = barbs[i];
+    int home = clampRace(b.race);
+    const string kind = how;
+    bool exiled = kind == "exile";
+    if (src == home || b.health <= 0) return;
+    if (b.plagueTimer > 0) {
+        if (!exiled) return;   // a case it left home with is not a new arrival
+    } else {
+        if (b.plagueImmune > 0 || plagueCasesIn(barbs, src) == 0) return;
+        if (uniform_real_distribution<float>(0.0f, 1.0f)(gen) >= kPlagueCarryChance) return;
+        catchPlague(b);
+    }
+    string vec = exiled ? string("the exile ") + b.name
+               : string(b.name) + (kind == "raid" ? "'s raiding party" : kind == "envoy" ? "'s envoy trip" : "'s caravan");
+    bool first = plagueCasesIn(barbs, home, b.id) == 0;
+    printf("PLAGUE CARRIED - %s (%s) brings it home from the %s by %s%s\n", b.name, racePlurals[home], racePlurals[src], how,
+           first ? ", first case in the quarter" : "");
+    if (first) logEvent(string("The Red Plague reaches the ") + raceDefs[home].name + " quarter with " + vec, kPlagueTickerTint);
+}
+
+// R59-F2: once per sim tick, just before starveDeathTick(). Seeds a summer outbreak, rolls the spread once per house per
+// kPlagueSpreadCheckTicks, runs each case's course and the crisis roll, then removes the dead after the loop, highest
+// index first (dark stones via plagueGraveNext).
+void plagueTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses,
+                smokehouseSet& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
+    static uniform_real_distribution<float> roll(0.0f, 1.0f);
+    if (plagueCooldown > 0) plagueCooldown--;
+    int cases = 0, living = 0, raceLiving[raceCount] = {};
+    for (auto& b : barbs) {
+        if (b.health > 0) { living++; raceLiving[clampRace(b.race)]++; }
+        if (b.plagueTimer > 0) cases++;
+    }
+    if (plagueActive && cases == 0) {
+        plagueActive = false;
+        plagueCooldown = kPlagueCooldownTicks;
+        printf("PLAGUE OVER - %d dead this outbreak\n", plagueDeaths);
+        logEvent("The Red Plague has passed (" + to_string(plagueDeaths) + (plagueDeaths == 1 ? " dead)" : " dead)"), kPlagueTickerTint);
+    }
+
+    // Seed: one quarter, summer only, never while an outbreak is on or cooling down, never in a small village
+    if (!plagueActive && plagueCooldown == 0 && seasonOf(game_day) == seasonSummer && living > kPlagueMinPop
+        && uniform_int_distribution<int>(0, kPlagueSeedOneIn - 1)(gen) == 0) {
+        vector<int> open[raceCount];
+        for (int i = 0; i < (int)barbs.size(); i++) {
+            const barb& b = barbs[i];
+            int r = clampRace(b.race);
+            if (b.health > 0 && !plagueAway(b) && b.plagueImmune <= 0 && raceLiving[r] > kPlagueMinRacePop) open[r].push_back(i);
+        }
+        vector<int> races;
+        for (int r = 0; r < raceCount; r++) if (!open[r].empty()) races.push_back(r);
+        if (!races.empty()) {
+            int r = races[uniform_int_distribution<int>(0, (int)races.size() - 1)(gen)];
+            barb& p = barbs[open[r][uniform_int_distribution<int>(0, (int)open[r].size() - 1)(gen)]];
+            catchPlague(p);
+            plagueActive = true;
+            plagueDeaths = 0;
+            cases++;
+            printf("PLAGUE OUTBREAK - patient zero %s (%s, house %d)\n", p.name, raceDefs[r].name, p.homeHouse + 1);
+            logEvent(string("The Red Plague breaks out in the ") + raceDefs[r].name + " quarter - " + p.name + " is the first stricken", kPlagueTickerTint);
+        }
+    }
+    if (cases == 0) return;
+
+    // Spread: house buckets (founders by race), one roll per house. The chance adds the house's own sick, the sick in
+    // same-race houses within kPlagueHouseReachPx and the quarter's sick; travellers on the road are left out.
+    if (++plagueSpreadTimer >= kPlagueSpreadCheckTicks) {
+        plagueSpreadTimer = 0;
+        static unordered_map<int, vector<int>> buckets;   // house id (founders: -1 - race) -> barb indices, this check only
+        static unordered_map<int, Vector2f> centreOf;     // house id -> slab centre, this check only
+        static vector<pair<int, int>> sickHouses;         // (house id, sick count)
+        for (auto& kv : buckets) kv.second.clear();
+        centreOf.clear();
+        sickHouses.clear();
+        int raceSick[raceCount] = {};
+        for (int i = 0; i < (int)barbs.size(); i++) {
+            const barb& b = barbs[i];
+            if (b.health <= 0 || plagueAway(b)) continue;
+            buckets[b.homeHouse >= 0 ? b.homeHouse : -1 - clampRace(b.race)].push_back(i);
+            if (b.plagueTimer > 0) raceSick[clampRace(b.race)]++;
+        }
+        for (auto& h : houses) centreOf[h.id] = Vector2f(h.x + 2.0f, h.y + 2.0f);
+        for (auto& kv : buckets) {
+            int s = 0;
+            for (int i : kv.second) if (barbs[i].plagueTimer > 0) s++;
+            if (s > 0 && kv.first >= 0) sickHouses.push_back({kv.first, s});
+        }
+        static vector<int> openHere;
+        for (auto& kv : buckets) {
+            const vector<int>& m = kv.second;
+            if (m.empty()) continue;
+            int r = clampRace(barbs[m[0]].race);
+            if (raceSick[r] == 0) continue;
+            int here = 0;
+            openHere.clear();
+            for (int i : m) {
+                if (barbs[i].plagueTimer > 0) here++;
+                else if (barbs[i].plagueImmune <= 0) openHere.push_back(i);
+            }
+            if (openHere.empty()) continue;
+            int near = 0;
+            auto c = centreOf.find(kv.first);
+            if (c != centreOf.end())
+                for (auto& sh2 : sickHouses) {
+                    if (sh2.first == kv.first) continue;
+                    auto o = centreOf.find(sh2.first);
+                    if (o == centreOf.end()) continue;
+                    Vector2f d = o->second - c->second;
+                    if (d.x * d.x + d.y * d.y > kPlagueHouseReachPx * kPlagueHouseReachPx) continue;
+                    int bi = buckets[sh2.first].empty() ? -1 : buckets[sh2.first][0];
+                    if (bi >= 0 && barbs[bi].race == r) near += sh2.second;
+                }
+            float chance = min(kPlagueSpreadChanceMax, kPlagueSpreadPerSickHere * here + kPlagueSpreadPerSickNear * near
+                                                       + kPlagueSpreadPerSickQuarter * raceSick[r]);
+            if (roll(gen) >= chance) continue;   // the house's one roll this check
+            barb& v = barbs[openHere[uniform_int_distribution<int>(0, (int)openHere.size() - 1)(gen)]];
+            catchPlague(v);
+            printf("PLAGUE SPREADS - %s (%s, house %d: %d sick here, %d near, %d in the quarter)\n", v.name, racePlurals[r],
+                   kv.first >= 0 ? kv.first + 1 : 0, here, near, raceSick[r]);
+        }
+    }
+
+    // Course: slow health loss (floored), then the crisis roll. Deaths are only collected here.
+    vector<int> dead;
+    for (int i = 0; i < (int)barbs.size(); i++) {
+        barb& b = barbs[i];
+        if (b.plagueImmune > 0) b.plagueImmune--;
+        if (b.plagueTimer <= 0 || b.health <= 0) continue;
+        if (b.plagueTimer % kPlagueDamageTicks == 0 && b.health > kPlagueHealthFloor) b.health--;
+        if (--b.plagueTimer > 0) continue;
+        int r = clampRace(b.race);
+        bool mayDie = plagueDeaths < kPlagueDeathCap && living > kPlagueMinPop && raceLiving[r] > kPlagueMinRacePop;
+        if (mayDie && roll(gen) >= kPlagueRecoverChance) {
+            dead.push_back(i);
+            plagueDeaths++;
+            living--; raceLiving[r]--;
+            continue;
+        }
+        b.plagueImmune = kPlagueImmuneTicks;
+        printf("PLAGUE RECOVERED - %s (%s), %d hp%s\n", b.name, racePlurals[r], b.health, mayDie ? "" : " (spared by the cap or guard)");
+    }
+    sort(dead.begin(), dead.end(), greater<int>());   // highest first, so each swapRemove leaves the rest valid
+    for (int i : dead) {
+        if (i >= (int)barbs.size() || i >= (int)squares.size()) continue;
+        int r = clampRace(barbs[i].race);
+        logRaceEvent(string(barbs[i].name) + " dies of the Red Plague", r);
+        printf("PLAGUE DEATH %d/%d - ", plagueDeaths, kPlagueDeathCap);
+        plagueGraveNext = true;
+        removeBarb(barbs, squares, i, sh, fg, stores, fields);
+        plagueGraveNext = false;
+    }
+}
+
+// R59-F2: world layer, over the houses and under the barbs: a faint 1px grey-green line just outside the slab of every
+// house with a live case at home (no haze or fill). The survivor ring is drawn on the barb itself, in drawBarbs().
+void drawPlagueHouses(RenderWindow& window, const vector<barb>& barbs, const vector<house>& houses,
+                      const vector<RectangleShape>& houseshapes, const FloatRect& view) {
+    if (!plagueActive) return;
+    static vector<int> ids;
+    ids.clear();
+    for (auto& b : barbs) if (b.plagueTimer > 0 && b.homeHouse >= 0 && !plagueAway(b)) ids.push_back(b.homeHouse);
+    if (ids.empty()) return;
+    static RectangleShape line(houseSlabSize);
+    line.setFillColor(Color::Transparent);
+    line.setOutlineColor(kPlagueHouseOutlineColor);
+    line.setOutlineThickness(1.0f);   // outside the 10x10 slab: a 12x12 frame
+    for (int i = 0; i < (int)houses.size() && i < (int)houseshapes.size(); i++) {
+        if (find(ids.begin(), ids.end(), houses[i].id) == ids.end()) continue;
+        Vector2f centre = houseshapes[i].getPosition() + houseshapes[i].getSize() / 2.0f;
+        line.setPosition(snapPx(centre - houseSlabSize / 2.0f));
+        if (!view.findIntersection(line.getGlobalBounds())) continue;
+        window.draw(line);
     }
 }
 
@@ -12490,6 +12768,7 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
     if (raidColumnStep(barbs, squares, ri, raidCrateSpot(att, 0))) {
         printf("RAID HOME - %s back at their crate (%s)\n", racePlurals[att], raid.won ? "won" : "lost");
         endRaid(barbs, true);   // R53-F1: packs are deposited here
+        for (int k = 0; k < kRaidPartySize; k++) plagueCarryHome(barbs, ri[k], def, "raid");   // R59-F2: ri[k] -1 = dropped
     }
 }
 
@@ -12743,6 +13022,7 @@ void caravanTick(vector<barb>& barbs, vector<RectangleShape>& squares, const sto
     if (raidColumnStep(barbs, squares, ci, raidCrateSpot(from, 0))) {
         printf("CARAVAN HOME - %s back at their crate\n", racePlurals[from]);
         endCaravan(barbs, true);
+        for (int k = 0; k < kTradeMembers; k++) plagueCarryHome(barbs, ci[k], to, "caravan");   // R59-F2: released first, so they count as home
     }
 }
 
@@ -12887,6 +13167,7 @@ void applyExileTransfers(vector<barb>& barbs, vector<RectangleShape>& squares, c
         releaseExileBarb(barbs[i]);
         transferBarb(barbs, squares, i, q.to, houseId);
         exile = exileTrip{};
+        plagueCarryHome(barbs, i, q.from, "exile");   // R59-F2: after the transfer, so barbs[i] is of its new race
         printf("---EXILE JOINS--- %s (id %d, born %s) joins the %s, house %d\n", barbs[i].name, barbs[i].id,
                raceDefs[clampRace(barbs[i].birthRace)].name, racePlurals[clampRace(q.to)], houseId + 1);
     }
@@ -12976,6 +13257,7 @@ void envoyTick(vector<barb>& barbs, vector<RectangleShape>& squares, const store
     if (raidColumnStep(barbs, squares, ri, raidCrateSpot(payer, kEnvoyCrateSlot))) {
         printf("ENVOY HOME - %s leader back at their crate\n", racePlurals[payer]);
         endEnvoy(barbs);
+        plagueCarryHome(barbs, i, payee, "envoy");   // R59-F2
     }
 }
 
@@ -16048,6 +16330,7 @@ int main() {
                 leaderWatchTick(barbs);   // R30-F2: leader death -> global weights + ticker line, same tick
                 councilTick(barbs);
                 orderTick(barbs);   // INBOX-F2b: after leaderWatchTick, so a dead leader's orders lapse the same tick
+                plagueTick(barbs, squares, houses, smoke, dwarfForge, stores, fields);   // R59-F2: removes its own dead after its loop
                 starveDeathTick(barbs, squares, smoke, dwarfForge, stores, fields);   // R30-F5: last, once per tick
                 stockShortageTick(barbs);   // RACE-F1: after deaths, so an emptied race never announces
                 vassalWatchTick(barbs);   // R58-F1: after deaths, a race with nobody left loses every bond both ways
@@ -16130,6 +16413,7 @@ int main() {
 	drawBarracks(window);   // R47-F6: hall + straw dummy, left of the crates, under barbs
 	drawHerbHut(window);    // R53-F2: herb hut + bed, above-right of the elf crate, under barbs
 	drawGarrison(window, barbs, houses, houseshapes, stores);   // INBOX-F1: bell marker, sheltering roof tint + pips
+	drawPlagueHouses(window, barbs, houses, houseshapes, camRect);   // R59-F2: faint outline round stricken houses, under barbs
 	drawRaidMarker(window, frameCount);   // R52-F1: pulsing red marker on the raided crate, opposite corner to the bell
 	drawVassalChains(window, paused);   // R58-F1: translucent gold chain lord<->vassal crates + payday coin pip, under barbs
 	for (auto& st : stores) if (st.flashFrames > 0 && !paused) st.flashFrames--;
