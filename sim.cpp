@@ -1078,6 +1078,17 @@ const Color kWarChipColor(128, 36, 42);       // stock panel chip fill: muted cr
 const uint8_t kWarChipAlphaMin = 150, kWarChipAlphaMax = 215;
 const float kWarChipPulseFrames = 240.0f;     // drawn frames per pulse (~4s at 60fps): slow and subtle
 const Color kWarChipTextColor(226, 206, 196); // pale rose cream on the chip
+// R61-F4b Rival envy: when a race raises a wonder stage, each rival not allied with it grows envious: wonderEnvy[rival]
+// [owner] += kEnvyPerStage, capped at kEnvyCap, and decays linearly to 0 over kEnvyDecayTicks. warTick() adds the pair's
+// envy to kWarDeclareRelation (the pair must still be cold, so the threshold never rises past the cold tier), and a
+// declaration spends the pair's envy, so one wonder can tip at most one war. Unsaved: cleared on a chronicle load.
+const float kEnvyPerStage = 0.10f;            // war-odds bias a rival gains per wonder stage raised
+const float kEnvyCap = 0.15f;                 // cap: the declare threshold rises at most from -0.90 to -0.75
+const int kEnvyDecayTicks = 2 * 24 * ticksPerGameHour;    // a capped envy fades to nothing in ~2 game days
+const float kEnvyDecayPerTick = kEnvyCap / (float)kEnvyDecayTicks;
+const Vector2f kEnvyPipSize(2.0f, 2.0f);      // left of the envious crate's lid (mirrors the payday coin pip on the right)
+const float kEnvyPipGapPx = 1.0f;
+const Color kEnvyPipColor(204, 70, 62);       // muted red: reads on the dark green, apart from the crimson war chip
 const Vector2f kWarChipPad(3.0f, 1.0f);       // chip padding round the "WAR" text bounds
 const unsigned int kWarChipFontSize = 10;     // a notch under stockFontSize so the chip stays inside the row
 // R60-F1: reparations = min(tributeAmountOf(loser), loser food - kWarStarveFloor), clamped at 0
@@ -1929,6 +1940,8 @@ const Color lanternGlowColor(80, 52, 16, 255);   // additive 1px halo, like the 
 // tech). The silhouette is data too: each row names a run of wonderParts[] (1px-grid quads relative to wonderPos, each
 // with a colour role resolved from the row), and drawWonder() stacks the parts of every standing stage, so no race
 // branches. Stage 2 rows carry moralePerk 0: the stage 2 morale perk and the rival envy bias land in their own merges.
+// R61-F4b: the stage 2 perk is kWonderStage2Morale, derived from the saved stage in wonderMorale() (never stored).
+const float kWonderStage2Morale = 0.01f;          // small: added to the race's morale term while wonder[r] >= 2
 enum wonderPartRole {wpShadow, wpBody, wpTrim, wpLit, wpDoor, wpAccent};
 struct wonderPart {Vector2f pos, size; wonderPartRole role;};
 const wonderPart wonderParts[] = {
@@ -3110,6 +3123,7 @@ float wonderMorale(int r) {
         int k = wonderRow(r, s);
         if (k >= 0) m += wonderStages[k].moralePerk;
     }
+    if (r >= 0 && r < raceCount && wonder[r] >= 2) m += kWonderStage2Morale;   // R61-F4b: from the saved stage only
     return m;
 }
 // False if rect comes within wonderClearPx of the zone of any race that has an enabled wonder (reserved from the start)
@@ -4155,6 +4169,12 @@ struct warState {
 };
 warState wars[kMaxWars];
 int warCooldown[raceCount][raceCount] = {};   // R60-F1: ticks before the pair may declare again (kept symmetric)
+float wonderEnvy[raceCount][raceCount] = {};  // R61-F4b: [envious rival][wonder owner], 0..kEnvyCap; unsaved
+bool raceEnvious(int r) {                     // the red pip shows only while this is true
+    for (int o = 0; r >= 0 && r < raceCount && o < raceCount; o++) if (wonderEnvy[r][o] > 0.0f) return true;
+    return false;
+}
+float pairEnvy(int a, int b) { return max(wonderEnvy[a][b], wonderEnvy[b][a]); }
 int warEnemyOf(const warState& w) { return w.declarer == w.lo ? w.hi : w.lo; }
 // the war whose canonical pair is (min(a,b), max(a,b)), or -1
 int warIndexOf(int a, int b) {
@@ -10191,6 +10211,7 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
     resetPlague(barbs);   // R59-F2: no case, immunity or outbreak survives a load (returners are cleared again in makeBarb())
     resetHeal(barbs);     // R60-F2: nor a cure's immunity or its ring
     resetHosts(barbs);    // R61-F2: hosts are never saved; any on the field dissolve
+    for (auto& row : wonderEnvy) for (auto& e : row) e = 0.0f;   // R61-F4b: envy is never saved
     if (d.barbs.empty()) {
         for (auto& b : barbs) b.bornHour = chronicleNowHour() - founderAgeHours();   // founders arrive on the restored clock (R57-F1: grown)
         printf("CHRONICLE - no barbs saved: the %d founders stay\n", (int)barbs.size());
@@ -13510,6 +13531,7 @@ void warTick(vector<barb>& barbs, const vector<RectangleShape>& squares, const s
     for (int a = 0; a < raceCount; a++)
         for (int b = a + 1; b < raceCount; b++)
             if (warCooldown[a][b] > 0) warCooldown[a][b] = --warCooldown[b][a];
+    for (auto& row : wonderEnvy) for (auto& e : row) e = max(0.0f, e - kEnvyDecayPerTick);   // R61-F4b: envy fades
     bool check = --checkTimer <= 0;
     if (check) checkTimer = kWarCheckTicks;
     int living[raceCount] = {};
@@ -13555,7 +13577,8 @@ void warTick(vector<barb>& barbs, const vector<RectangleShape>& squares, const s
     for (int a = 0; a < raceCount; a++)
         for (int b = a + 1; b < raceCount; b++) {
             float v = raceRelation[a][b];
-            if (v > kWarDeclareRelation || relationTierOf(v) != relCold || warCooldown[a][b] > 0) continue;
+            float envy = pairEnvy(a, b);   // R61-F4b: capped wonder envy lifts the threshold, the cold tier still binds
+            if (v > kWarDeclareRelation + envy || relationTierOf(v) != relCold || warCooldown[a][b] > 0) continue;
             if (atWar(a, b) || isAllied(a, b) || pairFriendly(a, b) || !stores[a].built || !stores[b].built) continue;
             if (living[a] <= 0 || living[b] <= 0) continue;
             int slot = -1;
@@ -13570,7 +13593,8 @@ void warTick(vector<barb>& barbs, const vector<RectangleShape>& squares, const s
             war.declarer = d;
             war.bypassTicks = kWarBypassTicks;
             string line = string(racePlurals[d]) + " declare war on the " + racePlurals[e];
-            printf("---WAR DECLARED--- %s (relation %.2f, %d vs %d living)\n", line.c_str(), v, living[d], living[e]);
+            printf("---WAR DECLARED--- %s (relation %.2f, envy %.2f, %d vs %d living)\n", line.c_str(), v, envy, living[d], living[e]);
+            wonderEnvy[a][b] = wonderEnvy[b][a] = 0.0f;   // R61-F4b: spent on this war, so it cannot tip another
             logEvent(line, kWarTickerTint);
             checkTimer = 1;   // the muster is called on the next tick
             if (--openSlots <= 0) return;
@@ -13894,6 +13918,17 @@ void drawVassalChains(RenderWindow& window, bool paused) {
         pushQuad(va, snapPx(storehousePos[r]) + Vector2f(storehouseSize.x + kVassalCoinPipGapPx, 0.0f), kVassalCoinPipSize, kVassalCoinPipColor);
         if (!paused) vassalCoinPip[r]--;
     }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R61-F4b: a 2x2 red pip left of an envious race's crate lid, only while its wonder envy is above 0 (world layer,
+// drawn with the crate markers under barbs and trees)
+void drawEnvyPips(RenderWindow& window) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (int r = 0; r < raceCount; r++)
+        if (raceEnvious(r))
+            pushQuad(va, snapPx(storehousePos[r]) - Vector2f(kEnvyPipGapPx + kEnvyPipSize.x, 0.0f), kEnvyPipSize, kEnvyPipColor);
     if (va.getVertexCount() > 0) window.draw(va);
 }
 
@@ -17623,6 +17658,11 @@ void addWonderStage(int r, int row) {
     wonder[r] = w.stage;
     printf("---WONDER STAGE--- %s %s stage %d (%d wood, %d stone, %d food)\n", raceDefs[r].name, w.name, w.stage, w.wood, w.stone, w.food);
     logRaceEvent(string(racePlurals[r]) + " raise the " + w.name + (w.stage == 1 ? ": its first stage stands" : ": another stage stands"), r);
+    for (int o = 0; o < raceCount; o++) {   // R61-F4b: unallied rivals grow envious (capped; warTick() decays it)
+        if (o == r || isAllied(o, r)) continue;
+        wonderEnvy[o][r] = min(kEnvyCap, wonderEnvy[o][r] + kEnvyPerStage);
+        printf("WONDER ENVY - the %s envy the %s %s (%.2f)\n", racePlurals[o], racePlurals[r], w.name, wonderEnvy[o][r]);
+    }
 }
 
 // R60-F3: runs after studyTick(). A race whose crate stands, that knows any tier-2 tech and has an enabled row for its
@@ -18342,6 +18382,7 @@ int main() {
 	drawPlagueHouses(window, barbs, houses, houseshapes, camRect);   // R59-F2: faint outline round stricken houses, under barbs
 	drawRaidMarker(window, frameCount);   // R52-F1: pulsing red marker on the raided crate, opposite corner to the bell
 	drawVassalChains(window, paused);   // R58-F1: translucent gold chain lord<->vassal crates + payday coin pip, under barbs
+	drawEnvyPips(window);   // R61-F4b: red pip at an envious rival's crate while its envy lasts
 	for (auto& st : stores) if (st.flashFrames > 0 && !paused) st.flashFrames--;
 	for (int r = 0; r < raceCount; r++)
 	    for (auto& fp : fields[r]) drawField(window, fp, r, frameCount);
