@@ -1097,6 +1097,45 @@ constexpr bool warReparationsKeepFloor() {
 }
 static_assert(warReparationsKeepFloor(), "war reparations must never push the loser below kWarStarveFloor food");
 static_assert(kMaxWars == 1, "warState muster and chip code is written for one war at a time");
+// R61-F2 Field Hosts and Pitched Battles, phase 1: while a war is in its window, warTick() may muster one host per side
+// (up to kHostMax drilled, armed barbs each) under a race banner. Both columns march to the field between the two crates
+// and clash through raidFightStep(); a side with fewer than kHostMinStanding unbeaten fighters breaks, drops its banner
+// and goes home on its own. The winner's column marches home and is released at its crate. Hosts are never saved.
+// Every host barb is in actHost, so the one barbAvailable() early-out keeps every other tick off it (inHost()).
+const int kHostMax = 6;                         // fighters per side at most
+const int kHostMinMembers = 3;                  // each side needs this many eligible barbs to muster
+const int kHostMinStanding = 2;                 // fewer unbeaten fighters than this: the host breaks
+const int kHostGapTicks = 6 * ticksPerGameHour; // after a host ends, before the next may muster
+const float kHostFrontGapPx = 12.0f;            // each column's head halts this far short of the field centre
+const float kHostClashPx = 30.0f;               // two opposing fighters this close (centre to centre) start the clash
+const int kHostStallTicks = 6 * ticksPerMinute; // march + clash backstop: the field is then scored as it stands
+const int kHostHomeMaxTicks = 3 * ticksPerMinute;   // the winners' walk home; past it they are released where they stand
+const int kHostBannerDropTicks = 20 * 60;       // a broken host's banner lies on the field this long (~20s at 1x)
+const int kHostBannerDropMax = 2;
+const int kHostDustOneIn = 3;                   // a blow raises a dust puff one time in this many
+const int kHostDustMax = 6;                     // puffs on screen at once
+const int kHostDustFrames = 40;                 // drawn frames a puff lives (rises 1px every kHostDustRiseFrames)
+const int kHostDustRiseFrames = 12;
+const Vector2f kHostDustSize(2.0f, 2.0f);
+const Color kHostDustColor(176, 160, 122);      // dry tan, alpha fades from kHostDustAlpha
+const uint8_t kHostDustAlpha = 120;
+const float kHostPoleH = 10.0f;                 // banner pole, feet up; one column left of the trait dot (base.x - 2)
+const Color kHostPoleColor(118, 92, 62);        // darker than the spear shaft so the two never merge
+const Color kHostBannerColors[raceCount] = {
+    Color(204, 170, 96),                        // human: dull gold pennant
+    Color(160, 136, 192),                       // dwarf: dusky lavender square
+    Color(146, 196, 132),                       // elf: pale mint swallowtail
+};
+// flag cells by row, column 0 next to the pole, flying left: pennant points (middle row longest), square is solid,
+// swallowtail forks (middle row shortest)
+const int kHostFlagRows = 3, kHostFlagCols = 4;
+const char* const kHostFlagMask[raceCount][kHostFlagRows] = {
+    {"##..", "####", "##.."},
+    {"###.", "###.", "###."},
+    {"####", "##..", "####"},
+};
+const float kHostDroppedDim = 0.45f;            // a dropped banner's colour, lerped this far toward the pole brown
+const Color kHostTickerTint(214, 150, 96);      // muted amber: muster, battle and homecoming lines
 
 // Skittish deer: bolt away from a nearby barb for a short, capped time, then a cooldown so hunts can still land
 const int deerStepInterval = 3;            // ticks per 1px step while wandering (deer row of speciesDefs)
@@ -3655,7 +3694,7 @@ enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
 // R53-F4: the one exclusive state a barb is in (work flags like chopping/building stay separate). Set only by
 // beginActivity(), cleared only by endActivity(), which also runs the activity's cleanup.
 enum barbActivity { actNone, actShelter, actExpedition, actRaidAttack, actRaidDefend, actTemper, actSmelt, actDrill, actWatch,
-                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, actHeal, activityCount };   // R60-F2: actHeal = an elf walking to cure a patient   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
+                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, actHeal, actHost, activityCount };   // R61-F2: actHost = a field host fighter. R60-F2: actHeal = an elf walking to cure a patient   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
 struct activityDef {
     const char* name;
     bool ownsBarb;    // its tick owns the barb outright: every job selector skips it (barbAvailable() false)
@@ -3680,6 +3719,7 @@ const activityDef activityDefs[activityCount] = {
     {"procession",    true,  false, false},  // R59-F1: marriageTick() owns the bride and escorts for the whole trip
     {"study",         false, false, true},   // R59-F3: any claim outranks study, like the drill; studyTick() walks the scholar
     {"heal",          false, false, true},   // R60-F2: any claim outranks the visit; healTick() walks the healer
+    {"host",          true,  false, false},  // R61-F2: hostTick() owns the fighter from muster to release
 };
 
 struct barb {
@@ -4088,6 +4128,42 @@ int warOfRaid(int id) {
     return -1;
 }
 
+// R61-F2: the one field host pair. Fighters are held by barb id (never an index) and re-resolved by hostTick() every
+// tick; removeBarb() drops a dying fighter's id through hostMemberLost(). side 0 is the declarer's, side 1 the enemy's,
+// so a side index is also its wars[].wins index. Not saved: resetHosts() dissolves everything on a chronicle load.
+struct warHost {
+    enum Phase {March, Clash, Home} phase = March;
+    bool active = false;
+    int war = -1;                           // wars[] slot it fights for
+    int race[2] = {-1, -1};
+    int memberIds[2][kHostMax] = {{-1, -1, -1, -1, -1, -1}, {-1, -1, -1, -1, -1, -1}};
+    Vector2f field;                         // centre of the battlefield
+    int ticks = 0;                          // since muster (kHostStallTicks backstop on March and Clash)
+    int homeTicks = 0;                      // since the winners turned for home (kHostHomeMaxTicks)
+    int winner = -1;                        // side marching home
+};
+static_assert(kHostMax == 6, "warHost::memberIds initialiser is written for six fighters per side");
+warHost host;
+int hostCooldown = 0;                       // ticks before the next host may muster
+struct droppedBanner { Vector2f pos; int race = -1; int ticks = 0; };   // feet point where it fell; ticks left
+droppedBanner droppedBanners[kHostBannerDropMax];
+struct hostDust { Vector2f pos; int frames = 0; };
+vector<hostDust> hostDusts;                 // capped at kHostDustMax; aged in drawn frames
+// R61-F2: the one host check every other tick goes through barbAvailable() (actHost owns the barb)
+bool inHost(const barb& b) { return b.activity == actHost; }
+void hostMemberLost(const barb& b) {
+    if (!host.active || !inHost(b)) return;
+    for (auto& side : host.memberIds) for (auto& id : side) if (id == b.id) id = -1;
+}
+bool hostSideOf(int r) { return host.active && (host.race[0] == r || host.race[1] == r); }
+void resetHosts(vector<barb>& barbs) {
+    for (auto& b : barbs) endActivity(b, actHost);
+    host = warHost{};
+    hostCooldown = 0;
+    for (auto& d : droppedBanners) d = droppedBanner{};
+    hostDusts.clear();
+}
+
 // R52-F1: the one way out of the raid state, on every exit (outcome, abort, beaten defender, removeBarb, backstop)
 bool inRaid(const barb& b) { return b.activity == actRaidAttack || b.activity == actRaidDefend; }   // R53-F4
 void clearRaid(barb& b) {
@@ -4282,6 +4358,11 @@ void endActivity(barb& b) {
             break;
         case actHeal:        // R60-F2: the one reservation release (cure, abort, claim, backstop, death all end here)
             releaseHealPatient(b);
+            break;
+        case actHost:        // R61-F2: the fight fields raidFightStep() used
+            b.raidPreyId = -1;
+            b.raidCooldown = 0;
+            b.raidBeaten = false;
             break;
         case actKneel:     // R52-F3: nothing else to reset
         case actCaravan:     // R54-F1: the cart's goods live on the caravan entry, not the barb
@@ -4918,6 +4999,10 @@ const char* barbTaskName(const barb& b) {
     if (b.activity == actHerb) return b.moving ? "going to the herb patch" : "tending herbs";      // R53-F2: no stripe either
     if (b.activity == actStudy) return b.moving ? "going to the Lore Hall" : "studying";         // R59-F3: no stripe; the candle shows it
     if (b.activity == actHeal) return "going to heal";                                           // R60-F2: no stripe; the cure ring shows it
+    if (inHost(b))   // R61-F2
+        return host.phase == warHost::Home ? "field host: marching home"
+             : host.phase == warHost::Clash ? (b.raidPreyId >= 0 ? "field host: fighting" : "field host: holding the line")
+             : "field host: marching to battle";
     if (b.chopping && b.target == targetBush) return "picking";
     if (b.chopping && b.target == targetField) return "harvesting";
     if (b.chopping && b.target == targetLake) return "fishing";
@@ -10038,6 +10123,7 @@ void crownBarb(vector<barb>& barbs, int i, int r) {
 void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<RectangleShape>& squares, vector<birthRing>& rings) {
     resetPlague(barbs);   // R59-F2: no case, immunity or outbreak survives a load (returners are cleared again in makeBarb())
     resetHeal(barbs);     // R60-F2: nor a cure's immunity or its ring
+    resetHosts(barbs);    // R61-F2: hosts are never saved; any on the field dissolve
     if (d.barbs.empty()) {
         for (auto& b : barbs) b.bornHour = chronicleNowHour() - founderAgeHours();   // founders arrive on the restored clock (R57-F1: grown)
         printf("CHRONICLE - no barbs saved: the %d founders stay\n", (int)barbs.size());
@@ -11172,6 +11258,8 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     clearRaid(b);
     caravanMemberLost(b);                         // R54-F1: drops its caravan id; caravanTick() aborts the trip next tick
     endActivity(b, actCaravan);
+    hostMemberLost(b);                            // R61-F2: drops its host id before the swapRemove; hostTick() may break the host
+    endActivity(b, actHost);
     envoyMemberLost(b);                           // R56-F2: drops the envoy id; envoyTick() aborts unpaid next tick
     endActivity(b, actEnvoy);
     marriageMemberLost(b);                        // R59-F1: drops its procession id; marriageTick() aborts the trip next tick
@@ -13297,7 +13385,8 @@ bool trySendEnvoy(vector<barb>& barbs, int att, int def) {
 // R60-F1: race r has barbs out in a party already (a raid, caravan, envoy, wedding procession or expedition)
 bool raceInParty(int r) {
     return (raid.active && (raid.att == r || raid.def == r)) || (caravan.active && caravan.from == r)
-        || (envoy.active && envoy.payer == r) || (marriage.active && marriage.from == r) || (party.active && party.race == r);
+        || (envoy.active && envoy.payer == r) || (marriage.active && marriage.from == r) || (party.active && party.race == r)
+        || hostSideOf(r);   // R61-F2
 }
 // R60-F1: the one way a war ends. treaty = the window closed and the raids are over: the side with fewer won raids pays
 // warReparations() in food (nothing on a draw) and the pair warms to neutral. Otherwise the war just fades (a side gone,
@@ -13344,9 +13433,12 @@ void warRaidOutcome(int raidId, int att, int def, bool won) {
     printf("WAR RAID - raid %d %s by the %s (wins %d / %d)\n", raidId, won ? "won" : "held", racePlurals[clampRace(side)],
            war.wins[0], war.wins[1]);
 }
+bool tryMusterHost(vector<barb>& barbs, const vector<RectangleShape>& squares, const storehouse (&stores)[raceCount], int w);
 // R60-F1: once per sim tick, before raidTick(). Cooldowns; then per active war the clocks, upkeep, muster and treaty;
 // with a free war slot, a throttled scan for a pair whose relation has bottomed out.
-void warTick(const vector<barb>& barbs, const storehouse (&stores)[raceCount]) {
+// R61-F2: on the muster check a war in its window may also call out a field host (tryMusterHost()); a live host holds
+// the treaty off like a live raid (its own stall and home timeouts bound the wait).
+void warTick(vector<barb>& barbs, const vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
     static int checkTimer = 0;
     for (int a = 0; a < raceCount; a++)
         for (int b = a + 1; b < raceCount; b++)
@@ -13371,6 +13463,7 @@ void warTick(const vector<barb>& barbs, const storehouse (&stores)[raceCount]) {
         if (war.gapTicks < kWarRaidGapTicks) war.gapTicks++;
         bool live = false;   // dead raids (ids that are no longer the live raid) are skipped
         for (int s = 0; s < min(war.raidCount, kWarRaidLog); s++) live = live || warRaidLive(war.raidIds[s]);
+        live = live || (host.active && host.war == w);   // R61-F2
         if ((war.bypassTicks <= 0 && !live) || war.ticks > kWarMaxTicks) { endWar(w, true, "treaty"); openSlots++; continue; }
         if (!check || war.bypassTicks <= 0) continue;
         for (int t = 0; t < raceCount; t++) {   // muster: the declarer's ally and vassals
@@ -13389,6 +13482,7 @@ void warTick(const vector<barb>& barbs, const storehouse (&stores)[raceCount]) {
             printf("---WAR MUSTER--- %s (%s)\n", line.c_str(), isAllied(t, d) ? "ally" : "vassal");
             logEvent(line, kWarTickerTint);
         }
+        tryMusterHost(barbs, squares, stores, w);   // R61-F2: the field host, on the same throttled check
     }
     if (!check || openSlots <= 0) return;
     for (int a = 0; a < raceCount; a++)
@@ -13975,6 +14069,286 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
         endRaid(barbs, true);   // R53-F1: packs are deposited here
         for (int k = 0; k < kRaidPartySize; k++) plagueCarryHome(barbs, ri[k], def, "raid");   // R59-F2: ri[k] -1 = dropped
     }
+}
+
+// R61-F2: armed, drilled (wears the drill pip), hale, fed and free (raidIdle()); never a leader or the shinobi
+bool hostRecruitOk(const barb& b, int r) {
+    return b.race == r && b.hasSpear && b.drillCount >= kDrillPipCount && raidIdle(b) && b.health >= kRaidMinHealth
+        && !isHungry(b) && !isLeader(b) && !b.shinobi;
+}
+// R61-F2: the one way a fighter leaves the host, standing where it is (beaten, broken, outcome, home, timeout, backstop)
+void releaseHostBarb(barb& b) {
+    if (!inHost(b)) return;
+    expeditionReset(b);
+    endActivity(b, actHost);
+}
+// R61-F2: a broken host's banner falls at its bearer's feet (hitbox bottom-left); the oldest slot is reused
+void dropHostBanner(Vector2f feet, int r) {
+    int slot = 0;
+    for (int k = 1; k < kHostBannerDropMax; k++) if (droppedBanners[k].ticks < droppedBanners[slot].ticks) slot = k;
+    droppedBanners[slot] = droppedBanner{feet, clampRace(r), kHostBannerDropTicks};
+}
+// R61-F2: releases every fighter of side s; dropBanner = the bearer (first fighter still listed) lets the banner fall
+void releaseHostSide(vector<barb>& barbs, const vector<RectangleShape>& squares, int s, bool dropBanner) {
+    bool dropped = !dropBanner;
+    for (auto& id : host.memberIds[s]) {
+        int i = findBarbById(barbs, id);
+        id = -1;
+        if (i < 0) continue;
+        if (!dropped && i < (int)squares.size()) {
+            dropHostBanner(squares[i].getPosition() + Vector2f(0.0f, squares[i].getSize().y), host.race[s]);
+            dropped = true;
+        }
+        releaseHostBarb(barbs[i]);
+    }
+}
+// R61-F2: the one way a host ends: every fighter still listed is released where it stands, the gap restarts
+void endHost(vector<barb>& barbs, const vector<RectangleShape>& squares) {
+    for (int s = 0; s < 2; s++) releaseHostSide(barbs, squares, s, false);
+    host = warHost{};
+    hostCooldown = kHostGapTicks;
+}
+// R61-F2: a sparse puff where a blow lands (capped, and only one blow in kHostDustOneIn raises one)
+void hostDustAt(Vector2f c) {
+    if ((int)hostDusts.size() >= kHostDustMax || uniform_int_distribution<int>(0, kHostDustOneIn - 1)(gen) != 0) return;
+    uniform_int_distribution<int> off(-2, 1);
+    hostDusts.push_back(hostDust{snapPx(c + Vector2f((float)off(gen), (float)off(gen) - 1.0f)), kHostDustFrames});
+}
+
+// R61-F2: called from warTick() on its muster check for a war still in its window. By daylight, with both crates built,
+// both bells silent and neither race already out in a party, each side's nearest eligible fighters (up to kHostMax,
+// at least kHostMinMembers) take the field. The war's raid gap restarts, so no war raid launches on top of the host.
+bool tryMusterHost(vector<barb>& barbs, const vector<RectangleShape>& squares, const storehouse (&stores)[raceCount], int w) {
+    if (host.active || hostCooldown > 0 || w < 0 || w >= kMaxWars || !wars[w].active || wars[w].bypassTicks <= 0) return false;
+    if (isNightHour(game_time)) return false;
+    const int side[2] = {wars[w].declarer, warEnemyOf(wars[w])};
+    for (int r : side)
+        if (r < 0 || r >= raceCount || !stores[r].built || raceBell[r] > 0 || raceInParty(r)) return false;
+    int n = min((int)barbs.size(), (int)squares.size());
+    int pick[2][kHostMax];
+    int count[2] = {0, 0};
+    for (int s = 0; s < 2; s++)
+        for (int k = 0; k < kHostMax; k++) {
+            pick[s][k] = findNearest(quarterCentre(side[s]), kRaidRecruitRadius, n,
+                                     [&](int i) { return raidCentre(squares[i]); },
+                                     [&](int i) {
+                                         for (int q = 0; q < k; q++) if (pick[s][q] == i) return true;
+                                         return !hostRecruitOk(barbs[i], side[s]);
+                                     });
+            if (pick[s][k] < 0) break;
+            count[s]++;
+        }
+    if (count[0] < kHostMinMembers || count[1] < kHostMinMembers) return false;
+    Vector2f field = (quarterCentre(side[0]) + quarterCentre(side[1])) / 2.0f;
+    float reach = kHostFrontGapPx + 4.0f;
+    if (!lakeClear(FloatRect(field - Vector2f(reach, reach), Vector2f(2.0f * reach, 2.0f * reach)))) field = villageCenter;
+    host = warHost{};
+    host.active = true;
+    host.war = w;
+    host.race[0] = side[0];
+    host.race[1] = side[1];
+    host.field = field;
+    host.phase = warHost::March;
+    for (int s = 0; s < 2; s++)
+        for (int k = 0; k < count[s]; k++) {
+            barb& m = barbs[pick[s][k]];
+            expeditionReset(m);   // ends any drill or wander walk first
+            beginActivity(m, actHost);
+            m.order = needNone;
+            m.orderTicks = 0;
+            host.memberIds[s][k] = m.id;
+        }
+    wars[w].gapTicks = 0;
+    string line = string(racePlurals[side[0]]) + " and " + racePlurals[side[1]] + " take the field, " + to_string(count[0])
+                  + " against " + to_string(count[1]);
+    printf("---HOST MUSTER--- %s, field (%.0f, %.0f)\n", line.c_str(), field.x, field.y);
+    logEvent(line, kHostTickerTint);
+    return true;
+}
+
+// R61-F2: runs right after warTick() and before raidTick(). Owns every host fighter's movement. Re-resolves every id
+// each tick and drops a missing, dead or no-longer-hosting fighter. March: both columns walk to their side of the
+// field; the clash starts once both heads stand there or two foes come within kHostClashPx. Clash: every unbeaten
+// fighter goes for the nearest unbeaten foe through raidFightStep(); a beaten one leaves the host at once. A side under
+// kHostMinStanding breaks; kHostStallTicks forces the outcome as the field stands. The war scores it, the losers drop
+// their banner and are released, and the winners march home (released at their crate, or after kHostHomeMaxTicks).
+void hostTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
+    if (hostCooldown > 0) hostCooldown--;
+    for (auto& d : droppedBanners) if (d.ticks > 0) d.ticks--;
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (int i = 0; i < n; i++) {   // backstop: a host flag with no host entry behind it is cleared
+        barb& b = barbs[i];
+        if (!inHost(b)) continue;
+        bool listed = false;
+        if (host.active) for (auto& side : host.memberIds) for (int id : side) listed = listed || id == b.id;
+        if (!listed) { printf("HOST FLAG CLEARED - barb %d (no host entry)\n", b.id); releaseHostBarb(b); }
+    }
+    if (!host.active) return;
+    host.ticks++;
+    int r0 = clampRace(host.race[0]), r1 = clampRace(host.race[1]);
+    int hi[2][kHostMax];
+    int standing[2] = {0, 0}, hp[2] = {0, 0};
+    for (int s = 0; s < 2; s++)
+        for (int k = 0; k < kHostMax; k++) {
+            int i = findBarbById(barbs, host.memberIds[s][k]);
+            bool bad = i < 0 || i >= n || !inHost(barbs[i]) || barbs[i].race != host.race[s] || barbs[i].health <= 0;
+            if (bad) {
+                if (host.memberIds[s][k] >= 0) printf("HOST FIGHTER DROPPED - barb %d\n", host.memberIds[s][k]);
+                if (i >= 0 && i < n) releaseHostBarb(barbs[i]);
+                host.memberIds[s][k] = hi[s][k] = -1;
+                continue;
+            }
+            hi[s][k] = i;
+            standing[s]++;
+        }
+    string pairText = string(racePlurals[r0]) + " and " + racePlurals[r1];
+    if (host.phase != warHost::Home) {
+        int w = host.war;
+        bool warOn = w >= 0 && w < kMaxWars && wars[w].active && wars[w].lo == min(r0, r1) && wars[w].hi == max(r0, r1);
+        if (!warOn || !stores[r0].built || !stores[r1].built) {
+            printf("---HOST DISSOLVED--- %s (%s)\n", pairText.c_str(), warOn ? "crate gone" : "the war is over");
+            logEvent(pairText + " leave the field", kHostTickerTint);
+            endHost(barbs, squares);
+            return;
+        }
+    }
+
+    if (host.phase == warHost::March) {
+        Vector2f d = quarterCentre(r1) - quarterCentre(r0);
+        float len = sqrt(d.x * d.x + d.y * d.y);
+        Vector2f u = len > 0.5f ? d / len : Vector2f(1.0f, 0.0f);
+        bool there[2] = {false, false};
+        for (int s = 0; s < 2; s++) {
+            int head = -1;
+            for (int k = 0; k < kHostMax && head < 0; k++) head = hi[s][k];
+            if (head < 0) continue;
+            Vector2f c = host.field + u * (s == 0 ? -kHostFrontGapPx : kHostFrontGapPx);
+            there[s] = raidColumnStep(barbs, squares, hi[s], snapPx(c - squares[head].getSize() / 2.0f));
+        }
+        bool close = false;
+        for (int a = 0; a < kHostMax && !close; a++)
+            for (int b = 0; b < kHostMax && !close && hi[0][a] >= 0; b++) {
+                if (hi[1][b] < 0) continue;
+                Vector2f g = raidCentre(squares[hi[1][b]]) - raidCentre(squares[hi[0][a]]);
+                close = g.x * g.x + g.y * g.y < kHostClashPx * kHostClashPx;
+            }
+        if ((there[0] && there[1]) || close) {
+            host.phase = warHost::Clash;
+            printf("HOST CLASH - %s meet on the field after %d ticks (%d vs %d)\n", pairText.c_str(), host.ticks, standing[0], standing[1]);
+        }
+    } else if (host.phase == warHost::Clash) {
+        for (int s = 0; s < 2; s++)
+            for (int k = 0; k < kHostMax; k++) {
+                int i = hi[s][k];
+                if (i < 0 || barbs[i].raidBeaten) continue;
+                if (raidFightStep(barbs, squares, i, hi[1 - s], kHostMax, 2.0f * worldSize)) {
+                    if (barbs[i].raidCooldown == kRaidStrikeCooldownTicks) hostDustAt(raidCentre(squares[i]));   // struck this tick
+                } else if (barbs[i].moving) { barbs[i].moving = false; clearRoute(barbs[i]); barbs[i].stepTimer = 0; }
+            }
+        for (int s = 0; s < 2; s++)   // a beaten fighter leaves the host at once, standing where it fell
+            for (int k = 0; k < kHostMax; k++) {
+                int i = hi[s][k];
+                if (i < 0 || !barbs[i].raidBeaten) continue;
+                printf("HOST FIGHTER BEATEN - %s (id %d, %s)\n", barbs[i].name, barbs[i].id, racePlurals[clampRace(barbs[i].race)]);
+                releaseHostBarb(barbs[i]);
+                host.memberIds[s][k] = hi[s][k] = -1;
+                standing[s]--;
+            }
+    }
+
+    if (host.phase != warHost::Home) {
+        for (int s = 0; s < 2; s++)
+            for (int k = 0; k < kHostMax; k++) if (hi[s][k] >= 0) hp[s] += barbs[hi[s][k]].health;
+        bool broke[2] = {standing[0] < kHostMinStanding, standing[1] < kHostMinStanding};
+        bool stalled = host.ticks > kHostStallTicks;
+        if (!broke[0] && !broke[1] && !stalled) return;
+        int win = broke[0] != broke[1] ? (broke[0] ? 1 : 0)
+                : standing[0] != standing[1] ? (standing[0] > standing[1] ? 0 : 1)
+                : hp[0] != hp[1] ? (hp[0] > hp[1] ? 0 : 1)
+                : 1;   // dead level: the side that was attacked holds the field
+        int lose = 1 - win;
+        warState& war = wars[host.war];
+        war.wins[win]++;   // side 0 is the declarer's, the same index as wins[]
+        string line = string(racePlurals[host.race[win]]) + " win the field against the " + racePlurals[host.race[lose]]
+                      + (broke[lose] ? "; their host breaks and leaves its banner" : "; the battle stalls and they hold the ground");
+        printf("---HOST BATTLE--- %s (%d vs %d standing, %d ticks, wins %d / %d)\n", line.c_str(), standing[win], standing[lose],
+               host.ticks, war.wins[0], war.wins[1]);
+        logEvent(line, kHostTickerTint);
+        releaseHostSide(barbs, squares, lose, true);
+        if (standing[win] <= 0) { endHost(barbs, squares); return; }
+        host.phase = warHost::Home;
+        host.winner = win;
+        host.homeTicks = 0;
+        for (int k = 0; k < kHostMax; k++) if (hi[win][k] >= 0) { barbs[hi[win][k]].raidPreyId = -1; barbs[hi[win][k]].raidCooldown = 0; }
+        return;
+    }
+
+    // Home: the winners' column walks back and is released at its crate
+    int s = host.winner == 1 ? 1 : 0;
+    int r = clampRace(host.race[s]);
+    host.homeTicks++;
+    if (standing[s] <= 0 || !stores[r].built || host.homeTicks > kHostHomeMaxTicks) {
+        printf("HOST HOME - %s released on the road (%s)\n", racePlurals[r],
+               standing[s] <= 0 ? "none left" : !stores[r].built ? "crate gone" : "timeout");
+        endHost(barbs, squares);
+        return;
+    }
+    if (raidColumnStep(barbs, squares, hi[s], raidCrateSpot(r, 0))) {
+        printf("HOST HOME - %s back at their crate after %d ticks\n", racePlurals[r], host.homeTicks);
+        endHost(barbs, squares);
+    }
+}
+
+// R61-F2: world layer, under the barbs: a broken host's banner lying on the field, dimmed, fading over its last third
+void drawHostGround(RenderWindow& window) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (auto& d : droppedBanners) {
+        if (d.ticks <= 0 || d.race < 0) continue;
+        uint8_t a = (uint8_t)(255.0f * min(1.0f, d.ticks / (kHostBannerDropTicks / 3.0f)));
+        Color pole = kHostPoleColor, flag = lerpColor(kHostBannerColors[d.race], kHostPoleColor, kHostDroppedDim);
+        pole.a = flag.a = a;
+        Vector2f p = snapPx(d.pos);
+        float poleLen = kHostPoleH - 2.0f;
+        pushQuad(va, Vector2f(p.x - poleLen + 2.0f, p.y - 1.0f), Vector2f(poleLen, 1.0f), pole);   // pole flat on the ground
+        float fx = p.x - poleLen + 1.0f;   // the flag lies just past the pole's far end, its rows stacked up from the ground
+        for (int row = 0; row < kHostFlagRows; row++)
+            for (int c = 0; c < kHostFlagCols; c++)
+                if (kHostFlagMask[d.race][row][c] == '#')
+                    pushQuad(va, Vector2f(fx - c, p.y - kHostFlagRows + row), Vector2f(1.0f, 1.0f), flag);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R61-F2: world layer, over the barbs and under the trees: each side's banner on its bearer (the first fighter still
+// listed): a 1px pole kHostPoleH tall one column left of the trait dot, the race's flag flying left from its top. Then
+// the dust puffs, rising 1px every kHostDustRiseFrames and fading out.
+void drawHostBanners(RenderWindow& window, const vector<barb>& barbs, const vector<RectangleShape>& squares, bool paused) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (int s = 0; s < 2 && host.active; s++) {
+        int bearer = -1;
+        for (int k = 0; k < kHostMax && bearer < 0; k++) bearer = findBarbById(barbs, host.memberIds[s][k]);
+        if (bearer < 0 || bearer >= (int)squares.size() || !inHost(barbs[bearer])) continue;
+        int r = clampRace(host.race[s]);
+        Vector2f base = snapPx(squares[bearer].getPosition());
+        float feet = base.y + squares[bearer].getSize().y;
+        float poleX = base.x - 2.0f, poleTop = feet - kHostPoleH;
+        pushQuad(va, Vector2f(poleX, poleTop), Vector2f(1.0f, kHostPoleH), kHostPoleColor);
+        for (int row = 0; row < kHostFlagRows; row++)
+            for (int c = 0; c < kHostFlagCols; c++)
+                if (kHostFlagMask[r][row][c] == '#')
+                    pushQuad(va, Vector2f(poleX - 1.0f - c, poleTop + row), Vector2f(1.0f, 1.0f), kHostBannerColors[r]);
+    }
+    for (auto& p : hostDusts) {
+        Color c = kHostDustColor;
+        c.a = (uint8_t)(kHostDustAlpha * p.frames / kHostDustFrames);
+        float rise = (float)((kHostDustFrames - p.frames) / kHostDustRiseFrames);
+        pushQuad(va, p.pos - Vector2f(0.0f, rise), kHostDustSize, c);
+        if (!paused) p.frames--;
+    }
+    hostDusts.erase(remove_if(hostDusts.begin(), hostDusts.end(), [](const hostDust& p) { return p.frames <= 0; }), hostDusts.end());
+    if (va.getVertexCount() > 0) window.draw(va);
 }
 
 // R52-F1: world layer, beside the bell marker: a pulsing red marker on the target crate while a raid marches or fights
@@ -17759,7 +18133,8 @@ int main() {
                 prowlerTick(prowlers, barbs, squares, houses, houseshapes, fire);   // R48-F1: bites land before starveDeathTick()
                 wyrmTick(houses, houseshapes);   // R61-F1: house burns, wake, the night's torching; wyrmThreat[] for bellTick()
                 watchTick(barbs, squares, prowlers);   // R51-F1: watchmen patrol and fight; slain prowlers fade, prowlerTick() removes them
-                warTick(barbs, stores);   // R60-F1: declarations, muster and treaties, before the raid launcher reads the wars
+                warTick(barbs, squares, stores);   // R60-F1: declarations, muster and treaties, before the raid launcher reads the wars
+                hostTick(barbs, squares, stores);   // R61-F2: field hosts march, clash and go home; before the raids and the bell
                 raidTick(barbs, squares, stores);   // R52-F1: raid march and fight; sets raidThreat[] for bellTick() just below
                 caravanTick(barbs, squares, stores);   // R54-F1: caravans, swaps and the friendly timers, once per sim tick
                 campTick(barbs, squares, wd);   // R55-F1: wildfolk hunters, deer trade, trespass and tents
@@ -17914,12 +18289,14 @@ int main() {
         drawOmenAuras(window, shrines);   // R53-F3: faint aura round a shrine while its race's omen holds
         drawRiteRings(window, shrines);   // R52-F3: faint ring round each rite shrine, under the kneelers
         drawCampHunters(window, camRect);   // R55-F1: with the barbs, under the trees
+        drawHostGround(window);   // R61-F2: a broken host's dropped banner, on the ground under the barbs
         drawBarbs(window, barbs, squares, frameCount, zoom);
         drawTitlePips(window, camRect, zoom);   // R56-F3: pale 1px pip over titled barbs, capped
         for (auto& b : barbs) if (b.raidFlash > 0 && !paused) b.raidFlash--;   // R52-F1: the hit flash lasts 2 drawn frames
         for (auto& b : barbs) if (b.siegeLunge > 0 && !paused) b.siegeLunge--;   // R57-F2: the ram lunge lasts 2 drawn frames
         drawSiegeGate(window);   // R57-F2: gate flash + one red bar over the gatehouse, over the barbs, under trees and overlays
         for (auto& f : gateFlash) if (f > 0 && !paused) f--;
+        drawHostBanners(window, barbs, squares, paused);   // R61-F2: host banners + clash dust, over the barbs, under trees and overlays
 	if (activeTrader) drawSnapped(window, activeTrader->shape);
 	drawTrees(window, tris, treeVerts, camRect);
 	drawFires(window, trees, fireVerts, camRect, frameCount);   // R57-F3: flames on the burning canopy + faint smoke, under the overlay
