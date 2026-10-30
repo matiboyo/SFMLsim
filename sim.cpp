@@ -2240,6 +2240,38 @@ const Color lakeDeepColorB(56, 90, 134);   // checker partner, kept very close t
 const Color lakeShallowsColor(82, 112, 146); // deep blue pulled toward the bank
 const Color lakeBankColor(118, 138, 150);  // muted grey-blue bank
 
+// R61-F3 The Great River, phase 1: one narrow river crosses the map edge to edge on one side of the village, carved on
+// the trail grid (trailCellSize cells) from riverSeed (drawn from gen at startup, never saved; a failed check retries with
+// the next seed offset). Water cells block routes and placement like lakes; two ford spans stay walkable but slow waders.
+// Every mover steps through pathStep(), which sends a walker whose goal lies on the other bank by way of a ford.
+const int kRiverWidthCells = 2;                    // water cells across the river (16px): narrow
+const float kRiverOffsetMin = 600.0f;              // centreline distance from the campfire, on one random side
+const float kRiverOffsetMax = 780.0f;
+const float kRiverBendAmpMin = 40.0f;              // main meander amplitude (px)
+const float kRiverBendAmpMax = 90.0f;
+const float kRiverBendLenMin = 700.0f;             // main meander wavelength (px)
+const float kRiverBendLenMax = 1100.0f;
+const float kRiverWobbleAmp = 14.0f;               // small second wiggle on top of the bend
+const float kRiverWobbleLen = 230.0f;
+const float kRiverVillageMinDist = 480.0f;         // every water cell centre at least this far from the campfire (core is 420)
+const float kRiverQuarterGap = 48.0f;              // ...and this far past each quarter's widest reach (top build step)
+const int kRiverGenTries = 8;                      // seed offsets tried before the river is dropped for this game
+const int kFordCount = 2;
+const int kFordRows = 2;                           // grid rows along the river per ford (16px)
+const float kFordAlongMin = 220.0f;                // ford centre from the campfire's along-river coordinate, one each way
+const float kFordAlongMax = 420.0f;
+const float kFordEnterPx = 4.0f;                   // within this of a ford's bank point the walker heads straight across
+const int kFordWadeMult = 2;                       // step interval x this on a ford (or any water) cell, no trail bonus
+const int kRiverWalkTestSteps = 4000;              // generation check: a far-bank walker must reach the campfire in this
+const float kRiverWalkTestFarPx = 120.0f;          // test walker starts this far past the far bank
+const float kRiverWalkTestAlongPx = 200.0f;        // ...and this far along the river beyond its ford
+const Color kRiverWaterA(62, 97, 138);             // muted blue, one shade off the lake checker so the two read as kin
+const Color kRiverWaterB(58, 92, 132);
+const Color kFordWaterColor(88, 118, 148);         // shallows over the ford, a touch lighter than lake shallows
+const Color kFordStoneColor(200, 194, 176);        // pale stepping stones
+const Color kFordStoneShadow(70, 88, 106);         // 1px wet underside below each stone
+const Color kFordBankColor(164, 160, 144);         // pale gravel landing: the ford rows' bank rim, so both ends read from afar
+
 // Far Reaches (R45-F1b): one ruin site far out from the village (placed once at startup by spawnRuins, after the
 // quarters, lakes and bushes), a ridge of ordinary mineable rocks arcing behind it, and one lean-to camp per race beside
 // it, built through buildOneOff (jobCamp). Built camps are entries in `camps`; a claim is "a barb of that race holds
@@ -3611,6 +3643,55 @@ vector<FloatRect> lakes;         // water rects, fixed after spawnLakes()
 vector<VertexArray> lakeTiles;    // per lake: bank quads then water tiles as triangles (same index as lakes; swap-remove together)
 vector<Vector2f> shorePoints;     // 1px spots just outside each lake's rim at its edge midpoints (cached for angling, R19-F1)
 
+// R61-F3: the river, on the trail grid. Fixed after spawnRiver(); riverPlaced = false means no river this game (every
+// helper below then answers as if the map were dry, so all old behaviour holds). "Along" runs with the river (y for a
+// vertical river), "across" over it. Per grid row along the river the band spans cells riverLo..riverHi across.
+bool riverPlaced = false;
+bool riverVertical = true;
+uint32_t riverSeed = 0;                                       // drawn from gen once per start; not saved
+vector<uint8_t> riverWet(trailGridN * trailGridN, 0);         // 0 dry, 1 water, 2 ford
+vector<uint8_t> riverSide(trailGridN * trailGridN, 0);        // 0 low-across bank, 1 high-across bank, 2 in the band
+vector<int> riverRegion(trailGridN * trailGridN, -1);         // 4-connected walkable region id, -1 = water/lake/unlabelled
+vector<int> riverLo(trailGridN, 0), riverHi(trailGridN, -1);
+struct riverFord {int row0 = 0, lo = 0, hi = 0; Vector2f bank[2];};   // bank[s]: 1px off the band on side s, mid-ford
+riverFord fords[kFordCount];
+VertexArray riverVerts(PrimitiveType::Triangles);             // built once by buildRiverVerts()
+
+int riverCellAt(Vector2f p) {
+    int cx = clamp((int)floor(p.x / trailCellSize), 0, trailGridN - 1), cy = clamp((int)floor(p.y / trailCellSize), 0, trailGridN - 1);
+    return cy * trailGridN + cx;
+}
+int riverCellOf(int along, int across) { return riverVertical ? along * trailGridN + across : across * trailGridN + along; }
+float riverAlong(Vector2f p) { return riverVertical ? p.y : p.x; }
+float riverAcross(Vector2f p) { return riverVertical ? p.x : p.y; }
+Vector2f riverPoint(float along, float across) { return riverVertical ? Vector2f(across, along) : Vector2f(along, across); }
+int riverRowAt(Vector2f p) { return clamp((int)floor(riverAlong(p) / trailCellSize), 0, trailGridN - 1); }
+int riverSideAt(Vector2f p) { return riverPlaced ? riverSide[riverCellAt(p)] : 0; }
+
+// False if r (grown by pad) touches any river or ford cell
+bool riverClear(const FloatRect& r, float pad) {
+    if (!riverPlaced) return true;
+    int x0 = clamp((int)floor((r.position.x - pad) / trailCellSize), 0, trailGridN - 1);
+    int x1 = clamp((int)floor((r.position.x + r.size.x + pad - 0.001f) / trailCellSize), 0, trailGridN - 1);
+    int y0 = clamp((int)floor((r.position.y - pad) / trailCellSize), 0, trailGridN - 1);
+    int y1 = clamp((int)floor((r.position.y + r.size.y + pad - 0.001f) / trailCellSize), 0, trailGridN - 1);
+    for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++)
+            if (riverWet[y * trailGridN + x] != 0) return false;
+    return true;
+}
+
+// O(1) reachability (tree search): same region id, labelled once at generation. A walker standing on an unlabelled
+// cell (in water, or on a restored spot) may head anywhere; with no river every target counts as reachable.
+bool regionReachable(Vector2f from, Vector2f to) {
+    if (!riverPlaced) return true;
+    int a = riverRegion[riverCellAt(from)];
+    return a < 0 || riverRegion[riverCellAt(to)] == a;
+}
+
+struct barb;
+Vector2f pathStep(Vector2f pos, Vector2f goal, barb* routed = nullptr);   // R61-F3: defined beside walkStep()
+
 // True if segment a->b touches box (slab test). Pure geometry, used only by lakeClear().
 bool segmentHitsRect(Vector2f a, Vector2f b, const FloatRect& box) {
     float t0 = 0.0f, t1 = 1.0f;
@@ -3631,6 +3712,13 @@ bool segmentHitsRect(Vector2f a, Vector2f b, const FloatRect& box) {
 // the straight walk from pathFrom to r.position must also stay clear; a lake the walker already stands in is ignored
 // so anything that drifted into water can still leave.
 bool lakeClear(const FloatRect& r, const Vector2f* pathFrom = nullptr) {
+    if (riverPlaced) {   // R61-F3: the river and its fords count as water; a walk may not end on the other bank
+        if (!riverClear(r, lakeClearPx)) return false;
+        if (pathFrom) {
+            int s = riverSideAt(*pathFrom);
+            if (s != 2 && s != riverSideAt(r.position)) return false;
+        }
+    }
     for (auto& l : lakes) {
         FloatRect zone(l.position - Vector2f(lakeClearPx, lakeClearPx), l.size + Vector2f(2 * lakeClearPx, 2 * lakeClearPx));
         if (r.findIntersection(zone).has_value()) return false;
@@ -5354,7 +5442,7 @@ void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs) {
 		}
 		if (dSq >= 1.0f && ++w.stepTimer >= wolfStepInterval) {
 			w.stepTimer = 0;
-			w.shape.move(diff / sqrt(dSq));
+			w.shape.move(pathStep(pos, goal));   // R61-F3: fords only
 		}
 		++i;
 	}
@@ -5483,7 +5571,7 @@ void deerwander(world& wd, const vector<RectangleShape>& squares, const vector<b
                 d.stepTimer = 0;
             } else if (++d.stepTimer >= (d.fleeTimer > 0 ? speciesOf(d).fleeStepInterval : speciesOf(d).stepInterval)) {
                 d.stepTimer = 0;
-                ds.move(diff / sqrt(dSq));
+                ds.move(pathStep(pos, Vector2f(d.targetx, d.targety)));   // R61-F3: fords only
             }
         }
     }
@@ -5615,6 +5703,7 @@ void trailTick() {
 
 // R39-F1: path tier and road tier (paved cells included) shave trailSpeedBonus[tier] ticks off the step limit
 int stepLimit(const barb& b, Vector2f pos) {
+    if (riverPlaced && riverWet[riverCellAt(pos)] != 0) return stepLimit(b) * kFordWadeMult;   // R61-F3: waders slow
     int c = trailCell(pos);
     return max(1, stepLimit(b) - (c >= 0 ? trailSpeedBonus[trailTier[c]] : 0));
 }
@@ -5630,6 +5719,7 @@ int routeStamp = 0;
 
 // Lake water blocks a route cell (centre inside a lake rect); the bank zone stays walkable so shore spots are reachable
 bool routeCellBlocked(int c) {
+    if (riverPlaced && riverWet[c] == 1) return true;   // R61-F3: river water blocks; ford cells stay open
     Vector2f centre(((c % trailGridN) + 0.5f) * trailCellSize, ((c / trailGridN) + 0.5f) * trailCellSize);
     for (auto& l : lakes) if (l.contains(centre)) return true;
     return false;
@@ -5692,10 +5782,11 @@ bool planRoute(barbRoute& r, Vector2f from, Vector2f to, int goalX, int goalY) {
 
 // Where the barb at pos should head this step: the next waypoint cell's centre, or the goal once the route is spent
 // (or when it is a straight walk). Replans on a new goal, a waypoint cell gone blocked, or a barb that strayed.
-Vector2f routeAim(barb& b, Vector2f pos) {
+// R61-F3: goal is the leg's goal from crossingAim() (the barb's target, or a ford point on the way to it).
+Vector2f routeAim(barb& b, Vector2f pos, Vector2f goal) {
     barbRoute& r = b.route;
-    Vector2f goal((float)b.targetx, (float)b.targety);
-    if (!r.planned || r.goalX != b.targetx || r.goalY != b.targety) planRoute(r, pos, goal, b.targetx, b.targety);
+    int gx = (int)goal.x, gy = (int)goal.y;
+    if (!r.planned || r.goalX != gx || r.goalY != gy) planRoute(r, pos, goal, gx, gy);
     int cur = trailCell(pos);
     for (int k = r.idx; k < r.len && k < r.idx + routeLookahead; k++)
         if (r.cells[k] == cur) { r.idx = k + 1; break; }
@@ -5704,26 +5795,89 @@ Vector2f routeAim(barb& b, Vector2f pos) {
     Vector2f centre(((c % trailGridN) + 0.5f) * trailCellSize, ((c / trailGridN) + 0.5f) * trailCellSize);
     Vector2f d = centre - pos;
     if (routeCellBlocked(c) || d.x * d.x + d.y * d.y > routeStrayPx * routeStrayPx) {
-        if (!planRoute(r, pos, goal, b.targetx, b.targety) || r.len == 0) return goal;   // straight fallback
+        if (!planRoute(r, pos, goal, gx, gy) || r.len == 0) return goal;   // straight fallback
         c = r.cells[0];
         centre = Vector2f(((c % trailGridN) + 0.5f) * trailCellSize, ((c / trailGridN) + 0.5f) * trailCellSize);
     }
     return centre;
 }
 
+// R61-F3: where a walker at pos bound for goal should head now. Same bank: goal itself. Other bank: the near-bank point
+// of the ford with the shortest pos -> ford -> goal walk, then (once within kFordEnterPx of it) straight across to its
+// far-bank point. On a ford: on across to the goal's bank. Stranded in deep water: wade straight out to the goal's bank.
+// A goal inside the band counts as being on its nearer bank. O(kFordCount), no search.
+Vector2f crossingAim(Vector2f pos, Vector2f goal) {
+    if (!riverPlaced) return goal;
+    int sp = riverSideAt(pos), sg = riverSideAt(goal);
+    if (sp == 2 && sg == 2) return goal;
+    if (sg == 2) {
+        int row = riverRowAt(goal);
+        float mid = (riverLo[row] + riverHi[row] + 1) * trailCellSize / 2.0f;
+        sg = riverAcross(goal) < mid ? 0 : 1;
+    }
+    if (sp == 2) {
+        int row = riverRowAt(pos);
+        if (riverWet[riverCellAt(pos)] == 2)
+            for (auto& f : fords)
+                if (row >= f.row0 && row < f.row0 + kFordRows) return f.bank[sg];
+        float out = sg == 0 ? riverLo[row] * trailCellSize - 1.0f : (riverHi[row] + 1) * trailCellSize + 1.0f;
+        return riverPoint(riverAlong(pos), out);
+    }
+    if (sp == sg) return goal;
+    int best = 0;
+    float bestLen = numeric_limits<float>::infinity();
+    for (int k = 0; k < kFordCount; k++) {
+        Vector2f a = fords[k].bank[sp] - pos, b = goal - fords[k].bank[sg];
+        float len = hypot(a.x, a.y) + hypot(b.x, b.y);
+        if (len < bestLen) { bestLen = len; best = k; }
+    }
+    Vector2f d = fords[best].bank[sp] - pos;
+    return d.x * d.x + d.y * d.y <= kFordEnterPx * kFordEnterPx ? fords[best].bank[sg] : fords[best].bank[sp];
+}
+
+// R61-F3: unit step d from pos, unless it would carry a walker off dry ground (or a ford) into deep water. Then it slides:
+// 1px along the river toward where d pointed if that cell is clear, else 1px away from the river. A goal in the water
+// may still be walked into (as with lakes), and a walker already in the water is never held.
+Vector2f riverGuard(Vector2f pos, Vector2f d, Vector2f goal) {
+    if (!riverPlaced) return d;
+    int cur = riverCellAt(pos);
+    if (riverWet[cur] == 1 || riverWet[riverCellAt(pos + d)] != 1 || riverWet[riverCellAt(goal)] == 1) return d;
+    float al = riverAlong(d);
+    if (fabs(al) > 0.001f) {
+        Vector2f s = riverPoint(al > 0.0f ? 1.0f : -1.0f, 0.0f);
+        if (riverWet[riverCellAt(pos + s)] != 1) return s;
+    }
+    int side = riverSide[cur];
+    float away = side == 0 ? -1.0f : side == 1 ? 1.0f : (riverAcross(d) > 0.0f ? -1.0f : 1.0f);
+    return riverPoint(0.0f, away);
+}
+
+// R61-F3: the one crossing-aware pathing step for every mover (barbs via walkStep: caravans, raids, hosts, wanderers and
+// all work walks; plus wolves, deer, prowlers, the wyrm, the trader and camp hunters). Returns a 1px move from pos toward
+// goal, by way of a ford when goal lies on the other bank; zero when already there. routed: the barb whose trail route
+// (A*, river water blocked) is followed to the current leg's goal; nullptr = straight. No river = the old straight/route step.
+Vector2f pathStep(Vector2f pos, Vector2f goal, barb* routed) {
+    Vector2f leg = crossingAim(pos, goal);
+    Vector2f aim = routed ? routeAim(*routed, pos, leg) : leg;
+    Vector2f d = aim - pos;
+    float dSq = d.x * d.x + d.y * d.y;
+    if (dSq < 0.0001f) { d = leg - pos; dSq = d.x * d.x + d.y * d.y; }
+    if (dSq < 0.0001f) { d = goal - pos; dSq = d.x * d.x + d.y * d.y; }
+    if (dSq < 0.0001f) return Vector2f(0.0f, 0.0f);
+    return riverGuard(pos, d / sqrt(dSq), goal);
+}
+
 // R39-F1: the one walk step for every non-wander walk (and wander with straight = true). Counts the step timer,
 // moves 1px toward the route's next waypoint (or straight at targetx/y) and wears the trail once per cell entered.
 // Callers keep their own arrival checks and only call this while the barb is >= 1px from targetx/targety.
+// R61-F3: the step itself comes from pathStep(), so every barb walk crosses the river only at a ford.
 void walkStep(barb& b, RectangleShape& sq, bool straight = false) {
     Vector2f pos = sq.getPosition();
     if (++b.stepTimer < stepLimit(b, pos)) return;
     b.stepTimer = 0;
-    Vector2f aim = straight ? Vector2f((float)b.targetx, (float)b.targety) : routeAim(b, pos);
-    Vector2f d = aim - pos;
-    float dSq = d.x * d.x + d.y * d.y;
-    if (dSq < 0.0001f) { d = Vector2f((float)b.targetx, (float)b.targety) - pos; dSq = d.x * d.x + d.y * d.y; }
-    if (dSq < 0.0001f) return;
-    sq.move(d / sqrt(dSq));
+    Vector2f m = pathStep(pos, Vector2f((float)b.targetx, (float)b.targety), straight ? nullptr : &b);
+    if (m.x == 0.0f && m.y == 0.0f) return;
+    sq.move(m);
     trailStep(b, sq.getPosition());
 }
 
@@ -6911,7 +7065,7 @@ void traderTick(optional<trader>& tr, const vector<barb>& barbs, const storehous
         t.timer = 0;
     } else if (++t.stepTimer >= traderStepInterval) {
         t.stepTimer = 0;
-        t.shape.move(dSq > 1.0f ? diff / sqrt(dSq) : diff);
+        t.shape.move(dSq > 1.0f ? pathStep(t.shape.getPosition(), goal) : diff);   // R61-F3: fords only
     }
 }
 
@@ -11902,7 +12056,7 @@ void prowlerTick(vector<prowler>& prowlers, vector<barb>& barbs, const vector<Re
         }
         if (dSq >= 1.0f && ++p.stepTimer >= prowlerStepInterval) {
             p.stepTimer = 0;
-            p.pos += diff / sqrt(dSq);
+            p.pos += pathStep(c, goal);   // R61-F3: fords only
         }
     }
 }
@@ -12071,7 +12225,7 @@ void wyrmTick(const vector<house>& houses, const vector<RectangleShape>& housesh
     float dSq = diff.x * diff.x + diff.y * diff.y;
     if (dSq >= 1.0f && ++wyrm.stepTimer >= step) {
         wyrm.stepTimer = 0;
-        Vector2f m = diff / sqrt(dSq);
+        Vector2f m = pathStep(c, goal);   // R61-F3: fords only
         if (fabs(m.x) > 0.2f) wyrm.faceLeft = m.x < 0.0f;
         wyrm.pos += m;
     }
@@ -15959,7 +16113,8 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
         if (b.timer == 0 && !b.chopping) {
             float treeDSq, rockDSq, bushDSq;
             int bestTree = findNearestTree(tris, bpos, barbWorkSearchRadius,   // R47-F1: grid, nearby cells only
-                                       [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j); }, &treeDSq);
+                                       [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j)
+                                                           || !regionReachable(bpos, tris[i].getPosition() + treeWorkOffset); }, &treeDSq);   // R61-F3
             int bestRock = findNearest(bpos, barbWorkSearchRadius, (int)rocks.size(),
                                        [&](int k) { return octs[k].getPosition() + rockWorkOffset; },
                                        [&](int k) { return rocks[k].dying || (rockClaim[k] != -1 && rockClaim[k] != j); }, &rockDSq);
@@ -16041,7 +16196,8 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                     int hit = -1;
                     if (m.kind == memTree)
                         hit = findNearestTree(tris, m.pos, memSpotRadius,
-                                          [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j); });
+                                          [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j)
+                                                              || !regionReachable(bpos, tris[i].getPosition() + treeWorkOffset); });   // R61-F3
                     else if (m.kind == memRock)
                         hit = findNearest(m.pos, memSpotRadius, (int)rocks.size(),
                                           [&](int i) { return octs[i].getPosition() + rockWorkOffset; },
@@ -16141,7 +16297,8 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 // R47-F3: race-aware: the wide look never reaches into another race's frontier
                 int wTree = findNearestTree(tris, bpos, barbWorkFallbackRadius,
                                         [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j)
-                                                            || inOtherFrontier(tris[i].getPosition() + treeWorkOffset, b.race); }, &wTreeDSq);
+                                                            || inOtherFrontier(tris[i].getPosition() + treeWorkOffset, b.race)
+                                                            || !regionReachable(bpos, tris[i].getPosition() + treeWorkOffset); }, &wTreeDSq);   // R61-F3
                 int wRock = findNearest(bpos, barbWorkFallbackRadius, (int)rocks.size(),
                                         [&](int k) { return octs[k].getPosition() + rockWorkOffset; },
                                         [&](int k) { return rocks[k].dying || (rockClaim[k] != -1 && rockClaim[k] != j)
@@ -16714,6 +16871,199 @@ void drawLightning(RenderWindow& window, const View& worldView, RectangleShape& 
     if (!paused) lightningFrames--;
 }
 
+// R61-F3: carves the river for one seed into the grid (band rows, two fords, banks) and checks its geometry: the band
+// inside the map, and every water cell clear of the campfire core and of each quarter's widest reach (top build step).
+// Sets riverPlaced only on success.
+bool riverCarve(uint32_t seed) {
+    riverPlaced = false;
+    mt19937 rg(seed);
+    const float cell = trailCellSize;
+    const int N = trailGridN;
+    riverVertical = bernoulli_distribution(0.5)(rg);
+    float sign = bernoulli_distribution(0.5)(rg) ? 1.0f : -1.0f;
+    float base = riverAcross(villageCenter) + sign * uniform_real_distribution<float>(kRiverOffsetMin, kRiverOffsetMax)(rg);
+    float amp = uniform_real_distribution<float>(kRiverBendAmpMin, kRiverBendAmpMax)(rg);
+    float len = uniform_real_distribution<float>(kRiverBendLenMin, kRiverBendLenMax)(rg);
+    uniform_real_distribution<float> phase(0.0f, 6.2831853f);
+    float ph1 = phase(rg), ph2 = phase(rg);
+    for (int i = 0; i < N; i++) {
+        float a = (i + 0.5f) * cell;
+        float centre = base + amp * sin(6.2831853f * a / len + ph1) + kRiverWobbleAmp * sin(6.2831853f * a / kRiverWobbleLen + ph2);
+        int lo = (int)floor(centre / cell - kRiverWidthCells / 2.0f + 0.5f), hi = lo + kRiverWidthCells - 1;
+        if (i > 0) { lo = min(lo, riverHi[i - 1]); hi = max(hi, riverLo[i - 1]); }   // rows share a cell: no diagonal gap
+        if (lo < 1 || hi > N - 2) return false;
+        riverLo[i] = lo;
+        riverHi[i] = hi;
+    }
+    // Fords: one on each side of the campfire's along coordinate, kFordRows rows widened to their union span
+    float va = riverAlong(villageCenter);
+    uniform_real_distribution<float> fordOff(kFordAlongMin, kFordAlongMax);
+    for (int k = 0; k < kFordCount; k++) {
+        riverFord& f = fords[k];
+        float fa = va + (k % 2 == 0 ? -1.0f : 1.0f) * fordOff(rg);
+        f.row0 = clamp((int)floor(fa / cell) - kFordRows / 2, 1, N - kFordRows - 1);
+        f.lo = N; f.hi = -1;
+        for (int i = f.row0; i < f.row0 + kFordRows; i++) { f.lo = min(f.lo, riverLo[i]); f.hi = max(f.hi, riverHi[i]); }
+        for (int i = f.row0; i < f.row0 + kFordRows; i++) { riverLo[i] = f.lo; riverHi[i] = f.hi; }
+        float mid = (f.row0 + kFordRows / 2.0f) * cell;
+        f.bank[0] = riverPoint(mid, f.lo * cell - 1.0f);
+        f.bank[1] = riverPoint(mid, (f.hi + 1) * cell + 1.0f);
+    }
+    for (int i = 0; i < N; i++) {
+        bool ford = false;
+        for (auto& f : fords) if (i >= f.row0 && i < f.row0 + kFordRows) ford = true;
+        for (int x = 0; x < N; x++) {
+            int c = riverCellOf(i, x);
+            bool in = x >= riverLo[i] && x <= riverHi[i];
+            riverWet[c] = in ? (ford ? 2 : 1) : 0;
+            riverSide[c] = in ? 2 : x < riverLo[i] ? 0 : 1;
+        }
+    }
+    float reach = quarterReachAt(quarterStepMax) + kRiverQuarterGap;
+    for (int i = 0; i < N; i++)
+        for (int x = riverLo[i]; x <= riverHi[i]; x++) {
+            Vector2f p = riverPoint((i + 0.5f) * cell, (x + 0.5f) * cell);
+            if (hypot(p.x - villageCenter.x, p.y - villageCenter.y) < kRiverVillageMinDist) return false;
+            for (int q = 0; q < raceCount; q++) {
+                Vector2f d = p - quarterCentre(q);
+                if (hypot(d.x, d.y) < reach) return false;
+            }
+        }
+    riverPlaced = true;
+    return true;
+}
+
+// R61-F3: a straight test walker from `from` to `to` through pathStep(); false if it ever stands in deep water or stalls
+bool riverWalkTest(Vector2f from, Vector2f to) {
+    Vector2f p = from;
+    for (int s = 0; s < kRiverWalkTestSteps; s++) {
+        Vector2f d = to - p;
+        if (d.x * d.x + d.y * d.y < 1.0f) return true;
+        Vector2f m = pathStep(p, to);
+        if (m.x == 0.0f && m.y == 0.0f) return false;
+        p += m;
+        if (riverWet[riverCellAt(p)] == 1) return false;
+    }
+    return false;
+}
+
+// R61-F3: generation-time reachability check (before the lakes, which then keep lakeMinGap off the river). Fords alone
+// must join the banks: a 4-connected flood from the campfire over dry and ford cells reaches every dry cell (so every
+// quarter and every later resource spot), and a walker started on the far bank beyond each ford reaches the campfire.
+bool riverCheck() {
+    const int N = trailGridN;
+    vector<char> seen(N * N, 0);
+    vector<int> stack{riverCellAt(villageCenter)};
+    seen[stack[0]] = 1;
+    int reached = 0, open = 0;
+    for (int c = 0; c < N * N; c++) if (riverWet[c] != 1) open++;
+    while (!stack.empty()) {
+        int c = stack.back();
+        stack.pop_back();
+        reached++;
+        int x = c % N, y = c / N;
+        const int nx[4] = {x - 1, x + 1, x, x}, ny[4] = {y, y, y - 1, y + 1};
+        for (int k = 0; k < 4; k++) {
+            if (nx[k] < 0 || ny[k] < 0 || nx[k] >= N || ny[k] >= N) continue;
+            int m = ny[k] * N + nx[k];
+            if (seen[m] || riverWet[m] == 1) continue;
+            seen[m] = 1;
+            stack.push_back(m);
+        }
+    }
+    if (reached != open) {
+        printf("River check: %d of %d dry cells reachable from the campfire\n", reached, open);
+        return false;
+    }
+    int far = 1 - riverSideAt(villageCenter);
+    for (int k = 0; k < kFordCount; k++) {
+        float along = (fords[k].row0 + kFordRows / 2.0f) * trailCellSize + (k % 2 == 0 ? -1.0f : 1.0f) * kRiverWalkTestAlongPx;
+        along = clamp(along, trailCellSize, worldSize - trailCellSize);
+        int row = clamp((int)(along / trailCellSize), 0, N - 1);
+        float across = far == 0 ? riverLo[row] * trailCellSize - kRiverWalkTestFarPx : (riverHi[row] + 1) * trailCellSize + kRiverWalkTestFarPx;
+        across = clamp(across, trailCellSize, worldSize - trailCellSize);
+        Vector2f start = riverPoint(along, across);
+        if (!riverWalkTest(start, villageCenter)) {
+            printf("River check: walker from (%.0f, %.0f) past ford %d never reached the campfire\n", start.x, start.y, k);
+            return false;
+        }
+    }
+    return true;
+}
+
+// R61-F3: once at startup, right after placeQuarters(): carve and check the river from riverSeed + offset, moving to the
+// next offset on a failed check. No passing layout = no river this game (riverPlaced false, the map stays as before).
+void spawnRiver() {
+    riverSeed = (uint32_t)gen();
+    for (int t = 0; t < kRiverGenTries; t++) {
+        if (riverCarve(riverSeed + (uint32_t)t) && riverCheck()) {
+            printf("River: seed %u offset %d, %s, fords at (%.0f, %.0f) and (%.0f, %.0f)\n", riverSeed, t,
+                   riverVertical ? "north-south" : "east-west", fords[0].bank[0].x, fords[0].bank[0].y, fords[1].bank[0].x, fords[1].bank[0].y);
+            return;
+        }
+        riverPlaced = false;
+        printf("River: seed %u offset %d failed the check, trying the next offset\n", riverSeed, t);
+    }
+    fill(riverWet.begin(), riverWet.end(), 0);
+    fill(riverSide.begin(), riverSide.end(), 0);
+    printf("River: no layout passed in %d tries, none this game\n", kRiverGenTries);
+}
+
+// R61-F3: after every startup spawn (lakes fixed): labels each walkable cell (not river water, not lake) with a
+// 4-connected region id for regionReachable(), then removes startup trees, rocks and bushes outside the campfire's
+// region (each parallel vector together), so every startup resource is reachable via the fords alone.
+void riverLabelRegions(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<rock>& rocks,
+                       vector<CircleShape>& octs, vector<char>& rockGold, vector<bush>& bushes, vector<CircleShape>& bushshapes) {
+    if (!riverPlaced) return;
+    const int N = trailGridN;
+    vector<char> blocked(N * N);
+    for (int c = 0; c < N * N; c++) blocked[c] = routeCellBlocked(c);
+    fill(riverRegion.begin(), riverRegion.end(), -1);
+    int regions = 0;
+    vector<int> stack;
+    for (int s = 0; s < N * N; s++) {
+        if (blocked[s] || riverRegion[s] >= 0) continue;
+        riverRegion[s] = regions;
+        stack.push_back(s);
+        while (!stack.empty()) {
+            int c = stack.back();
+            stack.pop_back();
+            int x = c % N, y = c / N;
+            const int nx[4] = {x - 1, x + 1, x, x}, ny[4] = {y, y, y - 1, y + 1};
+            for (int k = 0; k < 4; k++) {
+                if (nx[k] < 0 || ny[k] < 0 || nx[k] >= N || ny[k] >= N) continue;
+                int m = ny[k] * N + nx[k];
+                if (blocked[m] || riverRegion[m] >= 0) continue;
+                riverRegion[m] = regions;
+                stack.push_back(m);
+            }
+        }
+        regions++;
+    }
+    int home = riverRegion[riverCellAt(villageCenter)];
+    for (int q = 0; q < raceCount; q++)
+        if (riverRegion[riverCellAt(quarterCentre(q))] != home)
+            printf("River: WARNING %s quarter is not reachable from the campfire\n", raceDefs[q].name);
+    int prunedT = 0, prunedR = 0, prunedB = 0;
+    for (int i = (int)tris.size() - 1; i >= 0; i--) {
+        if (riverRegion[riverCellAt(tris[i].getPosition() + treeWorkOffset)] == home) continue;
+        swapRemove(trees, i); swapRemove(tris, i); swapRemove(stumps, i);
+        treeGrid.stale = true;   // R58-F3: grid synced on every tree remove
+        prunedT++;
+    }
+    for (int i = (int)octs.size() - 1; i >= 0; i--) {
+        if (riverRegion[riverCellAt(octs[i].getPosition() + rockWorkOffset)] == home) continue;
+        swapRemove(rocks, i); swapRemove(octs, i); swapRemove(rockGold, i);
+        prunedR++;
+    }
+    for (int i = (int)bushshapes.size() - 1; i >= 0; i--) {
+        if (riverRegion[riverCellAt(bushWorkSpot(bushshapes[i]))] == home) continue;
+        swapRemove(bushes, i); swapRemove(bushshapes, i);
+        prunedB++;
+    }
+    printf("River: %d walkable regions; removed %d trees, %d rocks, %d bushes the fords cannot reach\n", regions, prunedT, prunedR, prunedB);
+}
+
 // lakeCountMin-Max ponds (2-3 per 800x800 of map) away from the village, apart from each other. Startup trees (trees/tris/stumps) and rocks (rocks/octs)
 // in or touching a lake are removed together. Fixed village spots (stall, forge) are inside the
 // lakeVillageMinDist ring, and the race smokehouses sit inside the dry quarters, so they never need a lake check. Shore points are cached here for angling.
@@ -16731,6 +17081,7 @@ void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
             FloatRect r(Vector2f(round(lx(gen)), round(ly(gen))), lakeSize);
             Vector2f c = r.position + lakeSize / 2.0f;
             if (hypot(c.x - villageCenter.x, c.y - villageCenter.y) < lakeVillageMinDist) continue;
+            if (!riverClear(r, lakeMinGap)) continue;   // R61-F3: lakes keep off the river, so they never plug a ford
             bool ok = true;
             for (auto& l : lakes) {
                 FloatRect gap(l.position - Vector2f(lakeMinGap, lakeMinGap), l.size + Vector2f(2 * lakeMinGap, 2 * lakeMinGap));
@@ -16802,6 +17153,40 @@ void spawnLakes(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectangle
 // Ground layer: after trails, before rocks/trees.
 void drawLakes(RenderWindow& window) {
     for (auto& va : lakeTiles) window.draw(va);
+}
+
+// R61-F3: the river's static quads, built once after spawnRiver(), in lake style: a lakeBankPx bank round every band
+// cell (pale gravel on the ford rows), then 8px water cells in a near-flat muted checker, then the fords as lighter
+// shallows with two pale 3x2 stepping stones per cell (each with a 1px wet underside), mirrored on alternate cells.
+void buildRiverVerts() {
+    riverVerts.clear();
+    if (!riverPlaced) return;
+    const int N = trailGridN;
+    const float cell = trailCellSize;
+    Vector2f tile(cell, cell), bank(lakeBankPx, lakeBankPx);
+    auto cellPos = [&](int c) { return Vector2f((c % N) * cell, (c / N) * cell); };
+    for (int pass = 0; pass < 2; pass++)   // plain banks, then ford banks over them
+        for (int c = 0; c < N * N; c++)
+            if (riverWet[c] == (pass == 0 ? 1 : 2)) pushQuad(riverVerts, cellPos(c) - bank, tile + 2.0f * bank, pass == 0 ? lakeBankColor : kFordBankColor);
+    for (int c = 0; c < N * N; c++) {
+        if (riverWet[c] == 0) continue;
+        Vector2f p = cellPos(c);
+        int cx = c % N, cy = c / N;
+        if (riverWet[c] == 1) { pushQuad(riverVerts, p, tile, (cx + cy) % 2 == 0 ? kRiverWaterA : kRiverWaterB); continue; }
+        pushQuad(riverVerts, p, tile, kFordWaterColor);
+        bool flip = (cx + cy) % 2 != 0;
+        const Vector2f stones[2] = {Vector2f(flip ? 4.0f : 1.0f, 1.0f), Vector2f(flip ? 1.0f : 4.0f, 5.0f)};
+        for (const Vector2f& s : stones) {
+            pushQuad(riverVerts, p + s, Vector2f(3.0f, 2.0f), kFordStoneColor);
+            pushQuad(riverVerts, p + s + Vector2f(0.0f, 2.0f), Vector2f(3.0f, 1.0f), kFordStoneShadow);
+        }
+    }
+    printf("River: %zu vertices\n", riverVerts.getVertexCount());
+}
+
+// R61-F3: ground layer, straight after the lakes (over trails and paving, under rocks, trees, buildings and barbs)
+void drawRiver(RenderWindow& window) {
+    if (riverVerts.getVertexCount() > 0) window.draw(riverVerts);
 }
 
 // R30-F1: true if p is within dist of any race quarter's centre
@@ -17192,7 +17577,7 @@ bool campHunterStep(campHunter& h, RectangleShape& s, Vector2f goal) {
     if (dSq < 1.0f) { s.setPosition(goal); return true; }
     if (++h.stepTimer < kCampHunterStepTicks) return false;
     h.stepTimer = 0;
-    s.move(d / sqrt(dSq));
+    s.move(pathStep(s.getPosition(), goal));   // R61-F3: fords only
     return false;
 }
 
@@ -18005,6 +18390,8 @@ int main() {
     squares.reserve(numbarbs);
     placeQuarters();  // R30-F1: crates first, so founders, lakes and bushes can use the quarters
     if (quarterFallbackUsed) logEvent("Quarters: random layout failed, fixed layout used");   // INBOX-F3: once per layout
+    spawnRiver();     // R61-F3: after the crates (it keeps clear of every quarter), before anything else is placed
+    buildRiverVerts();   // R61-F3: static quads, empty when no river passed the check
     {
         uniform_int_distribution<int> d(-30, 30);   // R30-F1: founders start around their own race's crate
         int founded[raceCount] = {};
@@ -18085,6 +18472,7 @@ int main() {
     spawnRuins(trees, tris, stumps, rocks, octs, rockGold, bushes, bushshapes);   // R45-F1b: last, so it clears whatever landed on the site
     spawnPois(trees, tris, stumps, rocks, octs, rockGold, bushes, bushshapes);    // R47-F4: after the ruins, so sites keep clear of them
     spawnWildCamp(trees, tris, stumps, rocks, octs, rockGold, bushes, bushshapes);   // R55-F1: after the sites, so it keeps clear of them
+    riverLabelRegions(trees, tris, stumps, rocks, octs, rockGold, bushes, bushshapes);   // R61-F3: last spawn step, lakes fixed
     for (auto& s : stock) {   // RACE-F1: every race starts with at least startStock
         s.wood = max(s.wood, startStock.wood);
         s.stone = max(s.stone, startStock.stone);
@@ -18343,6 +18731,7 @@ int main() {
         drawPaving(window, paveVerts);   // over the trail tint, under everything else
         drawQuarters(window, zoom);   // R30-F1: ground marks, under lakes, houses and crates
         drawLakes(window);
+        drawRiver(window);   // R61-F3: with the lakes, under the lens, rocks, buildings and barbs
         drawLens(window, lensVerts, worldView, lens, barbs, squares, houses, houseshapes, stores);   // UIO-F3: under rocks, buildings and barbs
 
 	drawRocks(window, octs, rockGold, rockVerts, camRect);   // R46-F1a: gold rocks get one pale-gold fleck pixel
