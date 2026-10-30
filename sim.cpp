@@ -1925,12 +1925,80 @@ const Color lanternGlowColor(80, 52, 16, 255);   // additive 1px halo, like the 
 // checked before any of it is spent. wonderStages[] is the data: one row per race per stage, only enabled rows are
 // built, drawn, reserved or restored. Phase 1 ships the human Sky Spire's stage 1 only; the grove-tree and forge-keep
 // rows are written but disabled, and stages 2-3, scaffolding, the lantern and the flash are deferred.
+// R61-F4: the grove-tree and forge-keep rows are enabled and every race has a stage 2 row (gated on a second tier-2
+// tech). The silhouette is data too: each row names a run of wonderParts[] (1px-grid quads relative to wonderPos, each
+// with a colour role resolved from the row), and drawWonder() stacks the parts of every standing stage, so no race
+// branches. Stage 2 rows carry moralePerk 0: the stage 2 morale perk and the rival envy bias land in their own merges.
+enum wonderPartRole {wpShadow, wpBody, wpTrim, wpLit, wpDoor, wpAccent};
+struct wonderPart {Vector2f pos, size; wonderPartRole role;};
+const wonderPart wonderParts[] = {
+    // [0..8] Sky Spire stage 1: 10x2 plinth, 6x8 shaft with a lit left edge, one course, doorway, broken top course
+    {{1.0f, 11.0f}, {10.0f, 1.0f}, wpShadow},
+    {{0.0f, 9.0f}, {10.0f, 2.0f}, wpTrim},
+    {{2.0f, 1.0f}, {6.0f, 8.0f}, wpBody},
+    {{2.0f, 1.0f}, {1.0f, 8.0f}, wpLit},
+    {{3.0f, 5.0f}, {5.0f, 1.0f}, wpTrim},
+    {{4.0f, 6.0f}, {2.0f, 3.0f}, wpDoor},
+    {{2.0f, 0.0f}, {1.0f, 1.0f}, wpBody},
+    {{4.0f, 0.0f}, {2.0f, 1.0f}, wpBody},
+    {{7.0f, 0.0f}, {1.0f, 1.0f}, wpBody},
+    // [9..15] Sky Spire stage 2: cornice closes the top course, a 4px upper tier, a 2px cap, 1px pole, gold pennant
+    {{2.0f, 0.0f}, {6.0f, 1.0f}, wpTrim},
+    {{3.0f, -3.0f}, {4.0f, 3.0f}, wpBody},
+    {{3.0f, -3.0f}, {1.0f, 3.0f}, wpLit},
+    {{4.0f, -5.0f}, {2.0f, 2.0f}, wpBody},
+    {{5.0f, -8.0f}, {1.0f, 3.0f}, wpTrim},
+    {{6.0f, -8.0f}, {2.0f, 1.0f}, wpAccent},
+    {{6.0f, -7.0f}, {1.0f, 1.0f}, wpAccent},
+    // [16..22] Grove-Tree stage 1: root flare, 4px trunk with a lit edge, hollow doorway, a young 3-row canopy
+    {{1.0f, 11.0f}, {10.0f, 1.0f}, wpShadow},
+    {{1.0f, 10.0f}, {8.0f, 1.0f}, wpTrim},
+    {{3.0f, 3.0f}, {4.0f, 7.0f}, wpTrim},
+    {{3.0f, 3.0f}, {1.0f, 7.0f}, wpLit},
+    {{4.0f, 7.0f}, {2.0f, 3.0f}, wpDoor},
+    {{1.0f, 0.0f}, {8.0f, 3.0f}, wpBody},
+    {{0.0f, 1.0f}, {10.0f, 1.0f}, wpBody},
+    // [23..26] Grove-Tree stage 2: a green crown spread over the canopy, two leaf glints on the old canopy
+    {{2.0f, -3.0f}, {6.0f, 1.0f}, wpAccent},
+    {{1.0f, -2.0f}, {8.0f, 2.0f}, wpAccent},
+    {{2.0f, 1.0f}, {1.0f, 1.0f}, wpAccent},
+    {{7.0f, 0.0f}, {1.0f, 1.0f}, wpAccent},
+    // [27..33] Forge-Keep stage 1: 10x2 plinth, squat 8x6 hall with a lit edge, lintel row, arched doorway, chimney stub
+    {{1.0f, 11.0f}, {10.0f, 1.0f}, wpShadow},
+    {{0.0f, 9.0f}, {10.0f, 2.0f}, wpTrim},
+    {{1.0f, 3.0f}, {8.0f, 6.0f}, wpBody},
+    {{1.0f, 3.0f}, {1.0f, 6.0f}, wpLit},
+    {{1.0f, 3.0f}, {8.0f, 1.0f}, wpTrim},
+    {{4.0f, 6.0f}, {2.0f, 3.0f}, wpDoor},
+    {{6.0f, 1.0f}, {2.0f, 2.0f}, wpBody},
+    // [34..37] Forge-Keep stage 2: the chimney raised 4px with a dark cap row, an ember glow at its mouth and the door
+    {{6.0f, -3.0f}, {2.0f, 4.0f}, wpTrim},
+    {{6.0f, -3.0f}, {2.0f, 1.0f}, wpAccent},
+    {{4.0f, 6.0f}, {2.0f, 1.0f}, wpAccent},
+    {{2.0f, 5.0f}, {1.0f, 1.0f}, wpAccent},
+};
+const int kWonderPartCount = (int)(sizeof(wonderParts) / sizeof(wonderParts[0]));
+const Color wonderHighlightColor(100, 106, 122);   // 1px lit left edge of the spire shaft, still darker than the keep stone
+const Color wonderPennantGold(196, 166, 92);      // muted gold: the Sky Spire's stage 2 pennant
+const Color wonderCrownGreen(98, 134, 86);         // muted leaf green, lighter than the grove canopy
+const Color wonderEmberColor(206, 118, 58);        // banked ember orange: the Forge-Keep's chimney mouth and door
+const Color wonderGroveLitColor(86, 104, 82);      // lit edge of the grove trunk
+const Color wonderForgeLitColor(122, 108, 96);     // lit edge of the forge hall
 struct wonderStageDef {barbRace race; int stage; const char* name; int wood, stone, food; float moralePerk;
-                       Color body, trim; bool enabled;};
+                       Color body, trim, lit, accent; int tier2Needed, firstPart, partCount; bool enabled;};
 const wonderStageDef wonderStages[] = {
-    {raceHuman, 1, "Sky Spire",  36, 10, 20, 0.01f, Color(82, 88, 104), Color(56, 60, 72), true},    // muted slate-lavender
-    {raceElf,   1, "Grove-Tree", 40,  4, 24, 0.01f, Color(70, 92, 76),  Color(50, 64, 50), false},   // phase 2+
-    {raceDwarf, 1, "Forge-Keep", 24, 16, 20, 0.01f, Color(96, 84, 74),  Color(62, 54, 48), false},   // phase 2+
+    {raceHuman, 1, "Sky Spire",  36, 10, 20, 0.01f, Color(82, 88, 104), Color(56, 60, 72), wonderHighlightColor,
+     wonderPennantGold, 1, 0, 9, true},     // muted slate-lavender
+    {raceElf,   1, "Grove-Tree", 40,  4, 24, 0.01f, Color(70, 92, 76),  Color(50, 64, 50), wonderGroveLitColor,
+     wonderCrownGreen, 1, 16, 7, true},
+    {raceDwarf, 1, "Forge-Keep", 24, 16, 20, 0.01f, Color(96, 84, 74),  Color(62, 54, 48), wonderForgeLitColor,
+     wonderEmberColor, 1, 27, 7, true},
+    {raceHuman, 2, "Sky Spire",  48, 16, 28, 0.0f,  Color(82, 88, 104), Color(56, 60, 72), wonderHighlightColor,
+     wonderPennantGold, 2, 9, 7, true},
+    {raceElf,   2, "Grove-Tree", 54,  6, 32, 0.0f,  Color(70, 92, 76),  Color(50, 64, 50), wonderGroveLitColor,
+     wonderCrownGreen, 2, 23, 4, true},
+    {raceDwarf, 2, "Forge-Keep", 32, 24, 28, 0.0f,  Color(96, 84, 74),  Color(62, 54, 48), wonderForgeLitColor,
+     wonderEmberColor, 2, 34, 4, true},
 };
 const int kWonderStageRows = (int)(sizeof(wonderStages) / sizeof(wonderStages[0]));
 const int wonderBuildTicks = 3 * houseBuildTicks;  // one stage: a bigger job than the keep
@@ -1941,7 +2009,6 @@ const Vector2f wonderSize(10.0f, 11.0f);           // stage 1: 10x2 plinth under
 const Vector2f wonderStandOffset(4.0f, 13.0f);     // builder hitbox top-left: below the plinth and its shadow row
 const Vector2f wonderZoneSize(11.0f, 19.0f);       // silhouette + shadow + the builder's stand room
 const float wonderClearPx = 3.0f;                  // houses, plots, mills, walls and towers keep this far from the zone
-const Color wonderHighlightColor(100, 106, 122);   // 1px lit left edge of the shaft, still darker than the keep stone
 const Color wonderDoorColor(24, 24, 30);
 const uint8_t kWonderAlpha = 210;                  // a touch translucent: a silhouette set back behind the quarter
 
@@ -17569,10 +17636,10 @@ void wonderTick(vector<barb>& barbs, vector<RectangleShape>& squares, const stor
         if (!stores[r].built || wonder[r] >= wonderStageCount(r)) continue;
         int row = wonderRow(r, wonder[r] + 1);
         if (row < 0) continue;
-        bool tier2 = false;
-        for (int t = kTier1TechCount; t < techCount; t++) if (know[r].learned[t]) tier2 = true;
-        if (!tier2) continue;
+        int tier2 = 0;
+        for (int t = kTier1TechCount; t < techCount; t++) if (know[r].learned[t]) tier2++;
         const wonderStageDef& w = wonderStages[row];
+        if (tier2 < w.tier2Needed) continue;   // R61-F4: stage 2 waits for a second tier-2 tech
         bool claimed = false;
         for (auto& b : barbs) if (b.jobKind == jobWonder && b.race == r) claimed = true;
         bool done = buildOneOff(barbs, squares, claimed, jobWonder, wonderPos(r) + wonderStandOffset, "WONDER",
@@ -17616,28 +17683,36 @@ void drawLoreHall(RenderWindow& window) {
     if (va.getVertexCount() > 0) window.draw(va);
 }
 
-// R60-F3: stage 1 of a race's wonder as a muted, slightly translucent silhouette: 10x2 plinth, a 6x8 shaft with a lit
-// left edge, one darker course and a dark 2x3 doorway, an unfinished broken top course, and a 1px ground shadow. Uses
-// the row's own colours. One static vertex array (no per-frame allocation); drawn on the ground layer before the house
-// slabs, so every building, barb and tree draws over it.
+// R60-F3 / R61-F4: a race's wonder as a muted, slightly translucent silhouette, data-driven: for each standing stage
+// (1 up to wonder[r]) the row's run of wonderParts[] is pushed in order, each part's role resolved to the row's own
+// body/trim/lit/accent colour (or the shared door and shadow colours), so later stages build on the earlier ones
+// (Sky Spire: gold pennant; Grove-Tree: green crown; Forge-Keep: glowing chimney). One static vertex array (no
+// per-frame allocation); drawn on the ground layer before the house slabs, so every building, barb and tree draws over it.
 void drawWonder(RenderWindow& window) {
     static VertexArray va(PrimitiveType::Triangles);
     va.clear();
     auto fade = [](Color c) { c.a = kWonderAlpha; return c; };
     for (int r = 0; r < raceCount; r++) {
-        int row = wonderTopRow(r);
-        if (row < 0) continue;
-        const Color body = fade(wonderStages[row].body), trim = fade(wonderStages[row].trim);
+        if (wonderTopRow(r) < 0) continue;
         Vector2f o = snapPx(wonderPos(r));
-        pushQuad(va, o + Vector2f(1.0f, wonderSize.y), Vector2f(wonderSize.x, 1.0f), buildingShadowColor);
-        pushQuad(va, o + Vector2f(0.0f, wonderSize.y - 2.0f), Vector2f(wonderSize.x, 2.0f), trim);   // plinth
-        pushQuad(va, o + Vector2f(2.0f, 1.0f), Vector2f(6.0f, 8.0f), body);                           // shaft
-        pushQuad(va, o + Vector2f(2.0f, 1.0f), Vector2f(1.0f, 8.0f), fade(wonderHighlightColor));      // lit edge
-        pushQuad(va, o + Vector2f(3.0f, 5.0f), Vector2f(5.0f, 1.0f), trim);                           // course
-        pushQuad(va, o + Vector2f(4.0f, 6.0f), Vector2f(2.0f, 3.0f), fade(wonderDoorColor));           // doorway
-        pushQuad(va, o + Vector2f(2.0f, 0.0f), Vector2f(1.0f, 1.0f), body);                           // unfinished top
-        pushQuad(va, o + Vector2f(4.0f, 0.0f), Vector2f(2.0f, 1.0f), body);
-        pushQuad(va, o + Vector2f(7.0f, 0.0f), Vector2f(1.0f, 1.0f), body);
+        for (int s = 1; s <= wonder[r]; s++) {
+            int row = wonderRow(r, s);
+            if (row < 0) continue;
+            const wonderStageDef& w = wonderStages[row];
+            for (int i = w.firstPart; i < w.firstPart + w.partCount && i < kWonderPartCount; i++) {
+                const wonderPart& p = wonderParts[i];
+                Color c = buildingShadowColor;   // wpShadow: the shared translucent ground shadow, not faded further
+                switch (p.role) {
+                    case wpBody:   c = fade(w.body); break;
+                    case wpTrim:   c = fade(w.trim); break;
+                    case wpLit:    c = fade(w.lit); break;
+                    case wpDoor:   c = fade(wonderDoorColor); break;
+                    case wpAccent: c = fade(w.accent); break;
+                    case wpShadow: break;
+                }
+                pushQuad(va, o + p.pos, p.size, c);
+            }
+        }
     }
     if (va.getVertexCount() > 0) window.draw(va);
 }
