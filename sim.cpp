@@ -852,6 +852,41 @@ const Color watchTorchGlowColor(255, 150, 60, 40);   // faint 3x3 halo behind th
 const int watchTorchFlickerFrames = 7;
 const Color watchRingColor(235, 160, 80, 55);        // faint 1px patrol ring, only while a watchman is hovered/selected
 const int watchRingPoints = 72;
+// R61-F1 The Wyrm of the Hollow, phase 1: once the Hollow is picked clean (hollowLootLeft == 0, re-derived every tick and
+// never saved) a wyrm wakes below. Each night it climbs out of the stair mouth, crawls to the nearest whole house and
+// torches it (one house a night), then prowls round that race's crate until dawn and crawls back down. Watchmen fight it
+// like a prowler (a watchman in reach holds it at bay); its hp carries over from night to night. Slain, it fades and the
+// Hollow stays quiet for kWyrmRewakeTicks before another wakes. A torched house burns (flames, darkening) for
+// kHouseBurnTicks, then stands charred black for kHouseCharTicks and is rebuilt; houseBurns holds both timers by house id.
+const int kWyrmMaxHp = 210;                        // ~10-14 spear hits; no regen, so a few nights of watch wear it down
+const int kWyrmRewakeTicks = 24 * ticksPerGameHour;   // after a slaying, one game day before the Hollow wakes another
+const int kWyrmEmergeMaxDelayTicks = ticksPerGameHour;   // rises at a random tick within the first game hour of the night
+const int kWyrmHuntStepInterval = 6;               // ticks per 1px on the way to its house (barbs step every 10)
+const int kWyrmLoiterStepInterval = 14;            // slower than a barb once it prowls the quarter, so the watch catches up
+const int kWyrmRetreatStepInterval = 4;            // dawn crawl back to the Hollow
+const int kWyrmRetreatMaxTicks = 4 * ticksPerMinute;   // backstop: a crawl home this long ends with it sinking where it is
+const int kWyrmSearchTicks = 60;                   // nearest-house search throttle; the target id is re-validated every tick
+const float kWyrmTorchRangePx = 6.0f;              // wyrm centre to house centre
+const float kWyrmLoiterPx = 30.0f;                 // prowl spots lie within this of the struck race's crate centre
+const int kWyrmLoiterRestTicks = 240;              // pause at each prowl spot (~4s at 1x)
+const int kWyrmHeldTicks = 30;                     // a watchman in strike reach pins it this long (refreshed every tick)
+const float kWyrmBellPx = 90.0f;                   // the wyrm this near a crate centre rings that race's bell (= kRaidAlarmPx)
+const int kWyrmFadeTicks = 120;                    // sink into the Hollow at dawn, or the death fade
+const int kWyrmFlashFrames = 2;                    // white hit flash, drawn frames
+const int kRenownWyrm = 15;                        // the killing blow
+const Vector2f kWyrmSize(14.0f, 5.0f);             // hitbox; head 3x4 at the front, 2px body segments, 3x1 tail
+const Color kWyrmColor(74, 78, 56);                // olive-grey: far darker than wolves (150,150,160), still reads on the ground
+const Color kWyrmBandColor(50, 54, 38);            // dark segment bands and the crest
+const Color kWyrmEyeColor(236, 120, 40);           // ember eye, drawn again above the night overlay
+const Color kWyrmEyeGlowColor(255, 130, 50, 34);   // faint 3x3 additive halo round the eye, night only
+const Color kWyrmFlashColor(255, 255, 255);
+const Color kWyrmTickerColor(186, 178, 128);       // pale olive on the black ticker strip
+const int kHouseBurnTicks = 2 * ticksPerMinute;    // flames on the roof this long (the house darkens as it burns)
+const int kHouseCharTicks = 24 * ticksPerGameHour; // then it stands charred black for one game day before it is rebuilt
+const int kHouseFlameTongues = 4;                  // flame pixels per burning house (thins over the last quarter)
+const Color kHouseCharRoofColor(38, 34, 32);       // charred roof
+const Color kHouseCharTint(70, 64, 60);            // multiplies walls, door, chimney and marks to near-black
+const Color kHouseFireGlowColor(255, 140, 50, 36); // faint additive glow round a burning house, night only
 // R52-F1 Spear Marches, phase 1: a cold pair (relCold), once its per-pair cooldown has run out, sends one 3-barb column of
 // armed barbs (1px red pennant on the spear) to the rival crate. A pulsing red marker sits on the target crate, the rival
 // bell rings through bellTick() (raidThreat[]), and raidTick() owns every raider's and defender's movement and runs its own
@@ -2794,6 +2829,17 @@ struct house {int x, y; bool hasFoundation = false; int id = -1; barbRace race =
 // R54-F4: the one style lookup for a house (drawing, lights, garrison retint, hover outline)
 const houseStyle& houseStyleOf(const house& h) { return h.tier >= 1 ? houseStyleFourth : houseStyles[(h.race >= 0 && h.race < raceCount) ? h.race : 0]; }
 int nextHouseId = 0;   // assigned only in buildhouse(); never reused, so ids survive any swapRemove
+// R61-F1: houses the wyrm has torched, by stable house id (never an index). One entry carries both timers: burnLeft > 0 =
+// alight; then charLeft > 0 = charred. houseBurnTick() drops an entry whose house is gone, or once the char runs out (the
+// house is rebuilt). Not saved: a reload brings every house back whole.
+struct houseBurn {int houseId = -1; int burnLeft = 0; int charLeft = 0;};
+vector<houseBurn> houseBurns;
+int houseBurnIndex(int houseId) {
+    for (int k = 0; k < (int)houseBurns.size(); k++) if (houseBurns[k].houseId == houseId) return k;
+    return -1;
+}
+// alight or charred: no shelter, no lamplight, never the wyrm's target, until the entry expires
+bool houseScorched(int houseId) { return !houseBurns.empty() && houseBurnIndex(houseId) >= 0; }
 struct shrine {int x, y; int id = -1;};  // x,y = slab top-left; id: stable, from nextShrineId (refer to shrines by id, never index)
 int nextShrineId = 0;  // assigned only in buildshrine(); at most maxShrines are ever standing
 // INBOX2-F1: one per race (index = barbRace), held in a fixed array in main; claimed = a builder of that race is on it;
@@ -3886,6 +3932,7 @@ Vector2f gatePoint(int r) {
     return Vector2f((float)keeps[r].x, (float)keeps[r].y) + keepSize / 2.0f + gateBearing(r) * wallRingRadius;
 }
 bool raidThreat[raceCount] = {};            // R52-F1: set by raidTick() (runs first), read by bellTick() like a wolf at the crate
+bool wyrmThreat[raceCount] = {};            // R61-F1: set by wyrmTick() (runs before bellTick()), rings the bell on the raid path
 int raidPairCooldown[raceCount][raceCount] = {
     {kRaidPairCooldownTicks, kRaidPairCooldownTicks, kRaidPairCooldownTicks},
     {kRaidPairCooldownTicks, kRaidPairCooldownTicks, kRaidPairCooldownTicks},
@@ -4377,6 +4424,34 @@ struct prowler {
     int flashFrames = 0;      // R51-F1: drawn frames of white hit flash left (counted down after drawProwlers())
 };
 int nextProwlerId = 0;
+// R61-F1: the one wyrm (a single global, nothing to swapRemove). id is stable for its life and fresh on each waking; the
+// house it hunts is held by house id and re-resolved every tick. Never saved: awake is re-derived from hollowLootLeft.
+enum wyrmPhase { wyrmLair, wyrmHunt, wyrmLoiter, wyrmRetreat };
+struct wyrmState {
+    bool awake = false;          // woken and not yet slain
+    int id = -1;
+    int hp = kWyrmMaxHp;         // carries over from night to night
+    wyrmPhase phase = wyrmLair;  // wyrmLair = below, not drawn
+    Vector2f pos;                // hitbox top-left
+    bool faceLeft = false;
+    int targetHouseId = -1;
+    int loiterRace = -1;         // the race whose house it torched tonight; it prowls round that crate
+    Vector2f loiterGoal;
+    int restTicks = 0;
+    int heldTicks = 0;           // > 0 = a watchman in reach pins it (set by watchTick())
+    int searchTimer = 0;
+    int stepTimer = 0;
+    int emergeIn = -1;           // ticks until it climbs out tonight; -1 = not scheduled
+    bool struckTonight = false;  // one house a night; reset at dusk
+    int retreatTicks = 0;
+    int fade = 0;                // > 0 = sinking at dawn (hp > 0) or dying (hp == 0); not fightable
+    int flashFrames = 0;         // white hit flash, drawn frames
+    int sleepTicks = 0;          // after a slaying: ticks before the Hollow can wake another
+};
+wyrmState wyrm;
+int nextWyrmId = 0;
+bool wyrmUp() { return wyrm.awake && wyrm.phase != wyrmLair; }
+bool wyrmFightable() { return wyrmUp() && wyrm.fade == 0 && wyrm.hp > 0; }
 vector<Vector2f> watchTorchPts;   // R51-F1: this frame's torch pixels, filled by drawBarbs(), drawn by drawWatchTorches()
 vector<pair<int, Vector2f>> titlePipPts;   // R56-F3: {renown, pip top-left} per titled barb this frame, filled by drawBarbs()
 
@@ -6407,27 +6482,35 @@ void drawHouses(RenderWindow& window, const vector<house>& houses, const vector<
         auto& hs = houseshapes[i];
         const houseStyle& st = houseStyleOf(houses[i]);   // R54-F4: tier picks the townhouse
         Vector2f o = snapPx(hs.getPosition());
+        // R61-F1: a torched house darkens over its burn and stays charred until houseBurnTick() rebuilds it
+        Color roofCol = st.roof, tint = Color::White;
+        int bk = houseBurns.empty() ? -1 : houseBurnIndex(houses[i].id);
+        if (bk >= 0) {
+            float t = houseBurns[bk].burnLeft > 0 ? 1.0f - (float)houseBurns[bk].burnLeft / kHouseBurnTicks : 1.0f;
+            roofCol = lerpColor(st.roof, kHouseCharRoofColor, t);
+            tint = lerpColor(Color::White, kHouseCharTint, t);
+        }
         drawParts(va, houseShadowParts, o, Color::White);
         if (st.chimneySize.x > 0.0f) {                  // behind the roof so its base tucks in
             partDef chimney{st.chimneyPos, st.chimneySize, houseChimneyDwarfColor};
-            drawParts(va, &chimney, 1, o, Color::White);
+            drawParts(va, &chimney, 1, o, tint);
         }
         partDef roof[houseStyleMaxRows];
         for (int k = 0; k < st.rows; k++)
             roof[k] = {Vector2f(st.left[k], st.top + k), Vector2f(st.width[k], 1.0f), k == st.rows - 1 ? partRampMid : partRampLight};
-        drawParts(va, roof, st.rows, o, st.roof);
-        drawParts(va, partRange{st.bodyFirst, st.bodyCount}, o, Color::White);   // R41-F1: race walls/door/window
+        drawParts(va, roof, st.rows, o, roofCol);
+        drawParts(va, partRange{st.bodyFirst, st.bodyCount}, o, tint);   // R41-F1: race walls/door/window
         int hr = houses[i].race;   // R59-F3: the builder race's tier-2 marks, each 1-2px on the slab round the walls
-        if (knows(hr, techMasonry)) pushQuad(va, o + masonryCoursePos, masonryCourseSize, masonryCourseColor);
+        if (knows(hr, techMasonry)) pushQuad(va, o + masonryCoursePos, masonryCourseSize, masonryCourseColor * tint);
         if (knows(hr, techCarpentry)) {   // 2x2 log stack: sawn ends on the diagonal, bark between
-            pushQuad(va, o + woodpilePos, Vector2f(1.0f, 1.0f), woodpileEndColor);
-            pushQuad(va, o + woodpilePos + Vector2f(1.0f, 0.0f), Vector2f(1.0f, 1.0f), woodpileBarkColor);
-            pushQuad(va, o + woodpilePos + Vector2f(0.0f, 1.0f), Vector2f(1.0f, 1.0f), woodpileBarkColor);
-            pushQuad(va, o + woodpilePos + Vector2f(1.0f, 1.0f), Vector2f(1.0f, 1.0f), woodpileEndColor);
+            pushQuad(va, o + woodpilePos, Vector2f(1.0f, 1.0f), woodpileEndColor * tint);
+            pushQuad(va, o + woodpilePos + Vector2f(1.0f, 0.0f), Vector2f(1.0f, 1.0f), woodpileBarkColor * tint);
+            pushQuad(va, o + woodpilePos + Vector2f(0.0f, 1.0f), Vector2f(1.0f, 1.0f), woodpileBarkColor * tint);
+            pushQuad(va, o + woodpilePos + Vector2f(1.0f, 1.0f), Vector2f(1.0f, 1.0f), woodpileEndColor * tint);
         }
         if (knows(hr, techLamplight)) {   // post + unlit head; drawHouseLights() lights the head at night
-            pushQuad(va, o + lanternPostPos, Vector2f(1.0f, 2.0f), lanternPostColor);
-            pushQuad(va, o + lanternPostPos - Vector2f(0.0f, 1.0f), Vector2f(1.0f, 1.0f), lanternUnlitColor);
+            pushQuad(va, o + lanternPostPos, Vector2f(1.0f, 2.0f), lanternPostColor * tint);
+            pushQuad(va, o + lanternPostPos - Vector2f(0.0f, 1.0f), Vector2f(1.0f, 1.0f), lanternUnlitColor * tint);
         }
     }
     if (va.getVertexCount() > 0) window.draw(va);
@@ -6440,6 +6523,7 @@ void drawHouseLights(RenderWindow& window, const View& worldView, const vector<h
     RectangleShape glow, lamp;
     const Vector2f halo(houseWindowGlowPx, houseWindowGlowPx);
     for (int i = 0; i < (int)houseshapes.size() && i < (int)houses.size(); i++) {
+        if (houseScorched(houses[i].id)) continue;   // R61-F1: no lamps in a burning or charred house
         const houseStyle& st = houseStyleOf(houses[i]);   // R54-F4
         Vector2f w = snapPx(houseshapes[i].getPosition()) + st.windowPos;
         glow.setSize(st.windowSize + 2.0f * halo);
@@ -11647,6 +11731,272 @@ void prowlerTick(vector<prowler>& prowlers, vector<barb>& barbs, const vector<Re
     }
 }
 
+// R61-F1: ages every torched house by id: alight -> charred -> rebuilt (entry dropped). An entry whose house is gone is
+// dropped too, so nothing outlives its house.
+void houseBurnTick(const vector<house>& houses) {
+    for (int k = (int)houseBurns.size() - 1; k >= 0; k--) {
+        houseBurn& e = houseBurns[k];
+        if (findHouseById(houses, e.houseId) < 0) { swapRemove(houseBurns, k); continue; }
+        if (e.burnLeft > 0) {
+            if (--e.burnLeft == 0) {
+                e.charLeft = kHouseCharTicks;
+                printf("HOUSE CHARRED - house %d burns out\n", e.houseId + 1);
+            }
+            continue;
+        }
+        if (--e.charLeft <= 0) {
+            printf("HOUSE REBUILT - house %d stands whole again\n", e.houseId + 1);
+            swapRemove(houseBurns, k);
+        }
+    }
+}
+
+// R61-F1: the one way the wyrm leaves the map: sinking into the Hollow (hp > 0) or dying (hp 0) both fade out first
+void sinkWyrm(const char* why) {
+    if (wyrm.fade > 0) return;
+    wyrm.fade = kWyrmFadeTicks;
+    wyrm.targetHouseId = -1;
+    printf("WYRM %d %s at (%.0f, %.0f), %d/%d hp\n", wyrm.id, why, wyrm.pos.x, wyrm.pos.y, wyrm.hp, kWyrmMaxHp);
+}
+
+// R61-F1: called by watchTick() on the killing blow (barb index i stays valid: nothing is removed here)
+void slayWyrm(vector<barb>& barbs, int i) {
+    barb& b = barbs[i];
+    printf("WYRM SLAIN - %s (id %d, %s)\n", b.name, b.id, racePlurals[clampRace(b.race)]);
+    logEvent(string(b.name) + " of the " + racePlurals[clampRace(b.race)] + " slays the Wyrm of the Hollow!", kWyrmTickerColor);
+    addRenown(barbs, i, kRenownWyrm, deedWatch);
+    sinkWyrm("is slain");
+}
+
+// R61-F1: runs right after prowlerTick(), before watchTick() and bellTick(). Ages torched houses; wakes the wyrm once the
+// Hollow is picked clean (and puts it back to sleep if the Hollow is ever full again); at night brings it up the stair
+// mouth, walks it to the nearest whole house (id re-validated every tick), torches it, prowls the quarter until dawn,
+// then crawls home. Sets wyrmThreat[] for bellTick().
+void wyrmTick(const vector<house>& houses, const vector<RectangleShape>& houseshapes) {
+    houseBurnTick(houses);
+    for (auto& t : wyrmThreat) t = false;
+    static bool wasNight = false;
+    bool night = isNightHour(game_time);
+    bool dusk = night && !wasNight;
+    wasNight = night;
+
+    bool clean = hollowPlaced && hollowLootLeft == 0;
+    if (!clean) {   // re-derived: no picked-clean Hollow, no wyrm (quietly, e.g. a fresh world)
+        if (wyrm.awake || wyrm.sleepTicks > 0) wyrm = wyrmState{};
+        return;
+    }
+    if (!wyrm.awake) {
+        if (wyrm.sleepTicks > 0) { wyrm.sleepTicks--; return; }
+        wyrm = wyrmState{};
+        wyrm.awake = true;
+        wyrm.id = nextWyrmId++;
+        wyrm.hp = kWyrmMaxHp;
+        printf("WYRM %d WAKES below the Hollow at (%.0f, %.0f)\n", wyrm.id, hollowPos.x, hollowPos.y);
+        logEvent("The Hollow is picked clean - something vast wakes below", kWyrmTickerColor);
+    }
+    if (dusk) wyrm.struckTonight = false;
+    Vector2f mouth = hollowPos + hollowSize / 2.0f;
+
+    if (wyrm.fade > 0) {
+        if (--wyrm.fade > 0) return;
+        if (wyrm.hp <= 0) {   // slain: the Hollow rests before another wakes
+            wyrm = wyrmState{};
+            wyrm.sleepTicks = kWyrmRewakeTicks;
+            return;
+        }
+        wyrm.phase = wyrmLair;
+        wyrm.emergeIn = -1;
+        return;
+    }
+
+    if (wyrm.phase == wyrmLair) {
+        if (!night || wyrm.struckTonight) { wyrm.emergeIn = -1; return; }
+        if (wyrm.emergeIn < 0) wyrm.emergeIn = uniform_int_distribution<int>(0, kWyrmEmergeMaxDelayTicks)(gen);
+        if (wyrm.emergeIn-- > 0) return;
+        wyrm.phase = wyrmHunt;
+        wyrm.pos = mouth - kWyrmSize / 2.0f;
+        wyrm.targetHouseId = -1;
+        wyrm.searchTimer = wyrm.stepTimer = wyrm.heldTicks = wyrm.restTicks = 0;
+        wyrm.emergeIn = -1;
+        printf("WYRM %d RISES from the Hollow, %d/%d hp\n", wyrm.id, wyrm.hp, kWyrmMaxHp);
+        return;
+    }
+
+    if (!night && wyrm.phase != wyrmRetreat) {
+        wyrm.phase = wyrmRetreat;
+        wyrm.retreatTicks = wyrm.restTicks = 0;
+        printf("WYRM %d RETREATS at dawn, %d/%d hp\n", wyrm.id, wyrm.hp, kWyrmMaxHp);
+    }
+    if (night && wyrm.phase == wyrmRetreat && !wyrm.struckTonight) wyrm.phase = wyrmHunt;   // a long crawl home met the dusk
+
+    Vector2f c = wyrm.pos + kWyrmSize / 2.0f;
+    for (int r = 0; r < raceCount; r++) {
+        Vector2f d = c - quarterCentre(r);
+        if (wyrm.phase != wyrmRetreat && d.x * d.x + d.y * d.y < kWyrmBellPx * kWyrmBellPx) wyrmThreat[r] = true;
+    }
+    if (wyrm.heldTicks > 0) { wyrm.heldTicks--; return; }   // a watchman stands in its way
+
+    Vector2f goal = c;
+    int step = kWyrmHuntStepInterval;
+    if (wyrm.phase == wyrmHunt) {
+        int hi = findHouseById(houses, wyrm.targetHouseId);
+        if (hi >= 0 && (hi >= (int)houseshapes.size() || houseScorched(houses[hi].id))) hi = -1;
+        if (hi < 0) wyrm.targetHouseId = -1;
+        if (hi < 0 && --wyrm.searchTimer <= 0) {   // throttled nearest search over whole houses
+            wyrm.searchTimer = kWyrmSearchTicks;
+            float best = numeric_limits<float>::infinity();
+            for (int k = 0; k < (int)houses.size() && k < (int)houseshapes.size(); k++) {
+                if (houseScorched(houses[k].id)) continue;
+                Vector2f d = houseshapes[k].getPosition() + houseshapes[k].getSize() / 2.0f - c;
+                float dSq = d.x * d.x + d.y * d.y;
+                if (dSq < best) { best = dSq; hi = k; }
+            }
+            if (hi >= 0) {
+                wyrm.targetHouseId = houses[hi].id;
+                printf("WYRM %d makes for house %d (%s)\n", wyrm.id, houses[hi].id + 1, racePlurals[clampRace(houses[hi].race)]);
+            }
+        }
+        goal = hi >= 0 ? houseshapes[hi].getPosition() + houseshapes[hi].getSize() / 2.0f : villageCenter;
+        Vector2f d = goal - c;
+        if (hi >= 0 && d.x * d.x + d.y * d.y <= kWyrmTorchRangePx * kWyrmTorchRangePx) {
+            const house& h = houses[hi];
+            int r = clampRace(h.race);
+            houseBurns.push_back(houseBurn{h.id, kHouseBurnTicks, 0});
+            wyrm.struckTonight = true;
+            wyrm.targetHouseId = -1;
+            wyrm.phase = wyrmLoiter;
+            wyrm.loiterRace = r;
+            wyrm.loiterGoal = c;
+            wyrm.restTicks = kWyrmLoiterRestTicks;
+            printf("WYRM %d TORCHES house %d (%s) at (%d, %d)\n", wyrm.id, h.id + 1, racePlurals[r], h.x, h.y);
+            logEvent(string("The wyrm sets a house of the ") + racePlurals[r] + " ablaze", kWyrmTickerColor);
+            return;
+        }
+    } else if (wyrm.phase == wyrmLoiter) {
+        step = kWyrmLoiterStepInterval;
+        Vector2f d = wyrm.loiterGoal - c;
+        if (d.x * d.x + d.y * d.y < 1.0f) {
+            if (wyrm.restTicks > 0) { wyrm.restTicks--; return; }
+            uniform_real_distribution<float> ang(0.0f, 6.2831853f), rad(0.0f, kWyrmLoiterPx);
+            float a = ang(gen), rr = rad(gen);
+            wyrm.loiterGoal = snapPx(quarterCentre(clampRace(wyrm.loiterRace)) + Vector2f(cos(a), sin(a)) * rr);
+            wyrm.restTicks = kWyrmLoiterRestTicks;
+        }
+        goal = wyrm.loiterGoal;
+    } else {   // wyrmRetreat
+        step = kWyrmRetreatStepInterval;
+        goal = mouth;
+        Vector2f d = goal - c;
+        if (d.x * d.x + d.y * d.y < 1.0f) { sinkWyrm("sinks into the Hollow"); return; }
+        if (++wyrm.retreatTicks >= kWyrmRetreatMaxTicks) { sinkWyrm("sinks into the ground"); return; }
+    }
+
+    Vector2f diff = goal - c;
+    float dSq = diff.x * diff.x + diff.y * diff.y;
+    if (dSq >= 1.0f && ++wyrm.stepTimer >= step) {
+        wyrm.stepTimer = 0;
+        Vector2f m = diff / sqrt(dSq);
+        if (fabs(m.x) > 0.2f) wyrm.faceLeft = m.x < 0.0f;
+        wyrm.pos += m;
+    }
+}
+
+// R61-F1: body in the world layer, under the night overlay; alpha follows the sink/death fade. Head at the facing end
+// (3x4 with a 1px crest), four 2px body segments that ripple a row while it crawls, a 3x1 tail.
+void drawWyrm(RenderWindow& window, int frame) {
+    if (!wyrmUp()) return;
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    float a = wyrm.fade > 0 ? (float)wyrm.fade / kWyrmFadeTicks : 1.0f;
+    bool flash = wyrm.flashFrames > 0;
+    Color body = flash ? kWyrmFlashColor : kWyrmColor, band = flash ? kWyrmFlashColor : kWyrmBandColor;
+    body.a = (uint8_t)(255.0f * a);
+    band.a = body.a;
+    Vector2f o = snapPx(wyrm.pos);
+    const float w = kWyrmSize.x;
+    auto at = [&](float x, float y, float sw, float sh, Color col) {   // offsets written facing right, mirrored for left
+        pushQuad(va, o + Vector2f(wyrm.faceLeft ? w - x - sw : x, y), Vector2f(sw, sh), col);
+    };
+    bool crawling = wyrm.fade == 0 && wyrm.heldTicks == 0 && wyrm.restTicks == 0;
+    at(0.0f, 2.0f, 3.0f, 1.0f, body);                                // tail
+    for (int s = 0; s < 4; s++) {                                    // body x 3..10
+        float lift = crawling && ((frame / 10 + s) % 2 == 0) ? 1.0f : 0.0f;
+        at(3.0f + 2.0f * s, 1.0f + lift, 2.0f, 3.0f, s % 2 == 0 ? body : band);
+    }
+    at(11.0f, 1.0f, 3.0f, 4.0f, body);                               // head
+    at(11.0f, 0.0f, 1.0f, 1.0f, band);                               // crest
+    at(12.0f, 2.0f, 1.0f, 1.0f, flash ? kWyrmFlashColor : kWyrmEyeColor);   // eye (lit again above the overlay)
+    window.draw(va);
+}
+
+// R61-F1: above the night overlay: the ember eye (with a faint halo at night) and a 1px hp bar once it is wounded
+void drawWyrmOverlay(RenderWindow& window, const View& worldView) {
+    if (!wyrmUp()) return;
+    window.setView(worldView);
+    float a = wyrm.fade > 0 ? (float)wyrm.fade / kWyrmFadeTicks : 1.0f;
+    Vector2f o = snapPx(wyrm.pos);
+    Vector2f eye = o + Vector2f(wyrm.faceLeft ? kWyrmSize.x - 13.0f : 12.0f, 2.0f);
+    RectangleShape px({1.0f, 1.0f});
+    if (isNightHour(game_time)) {
+        RectangleShape glow({3.0f, 3.0f});
+        Color g = kWyrmEyeGlowColor;
+        g.a = (uint8_t)(g.a * a);
+        glow.setFillColor(g);
+        glow.setPosition(eye - Vector2f(1.0f, 1.0f));
+        window.draw(glow, BlendAdd);
+    }
+    Color e = wyrm.flashFrames > 0 ? kWyrmFlashColor : kWyrmEyeColor;
+    e.a = (uint8_t)(255.0f * a);
+    px.setFillColor(e);
+    px.setPosition(eye);
+    window.draw(px);
+    if (wyrm.fade > 0 || wyrm.hp >= kWyrmMaxHp) return;
+    Vector2f b = o + Vector2f(0.0f, -2.0f);   // one row of grass above the crest
+    float fillW = min(kWyrmSize.x, ceil(kWyrmSize.x * max(wyrm.hp, 0) / kWyrmMaxHp));
+    RectangleShape bar(Vector2f(kWyrmSize.x, 1.0f));
+    bar.setFillColor(healthBarBackColor);
+    bar.setPosition(b);
+    window.draw(bar);
+    if (fillW > 0.0f) {
+        bar.setSize(Vector2f(fillW, 1.0f));
+        bar.setFillColor(healthBarFillColor);
+        window.draw(bar);
+    }
+}
+
+uint32_t fireHash(uint32_t a, uint32_t b);   // R57-F3: defined with the wildfire
+
+// R61-F1: above the night overlay so a torched house reads at night: a few flickering flame pixels over the roof (thinning
+// over the last quarter of the burn) and a faint additive glow at night. Charred houses are drawn by drawHouses().
+void drawHouseFires(RenderWindow& window, const View& worldView, const vector<house>& houses,
+                    const vector<RectangleShape>& houseshapes, int frame) {
+    if (houseBurns.empty()) return;
+    window.setView(worldView);
+    static VertexArray flames(PrimitiveType::Triangles), glow(PrimitiveType::Triangles);
+    flames.clear();
+    glow.clear();
+    bool night = isNightHour(game_time);
+    uint32_t cyc = (uint32_t)(frame / kFlameFlickerFrames);
+    for (auto& e : houseBurns) {
+        if (e.burnLeft <= 0) continue;
+        int i = findHouseById(houses, e.houseId);
+        if (i < 0 || i >= (int)houseshapes.size()) continue;
+        Vector2f o = snapPx(houseshapes[i].getPosition());
+        float left = (float)e.burnLeft / kHouseBurnTicks;
+        int n = left < 0.25f ? max(1, (int)ceil(kHouseFlameTongues * left / 0.25f)) : kHouseFlameTongues;
+        if (night) pushQuad(glow, o + Vector2f(-4.0f, -5.0f), Vector2f(12.0f, 12.0f), kHouseFireGlowColor);
+        for (int k = 0; k < n; k++) {
+            uint32_t h = fireHash((uint32_t)e.houseId * 8u + (uint32_t)k, cyc);
+            float x = -1.0f + (float)(h % 7u);           // over the roof, x -1..5
+            float y = -3.0f + (float)((h >> 4) % 4u);    // roof rows, y -3..0
+            bool tall = (h >> 8) & 1u;
+            pushQuad(flames, o + Vector2f(x, tall ? y - 1.0f : y), Vector2f(1.0f, tall ? 2.0f : 1.0f), kFlameColors[(h >> 9) & 1u]);
+        }
+    }
+    if (glow.getVertexCount() > 0) window.draw(glow, BlendAdd);
+    if (flames.getVertexCount() > 0) window.draw(flames);
+}
+
 // R51-F1: index of the prowler with this id, or -1 (dissolved and removed, or never)
 int findProwlerById(const vector<prowler>& prowlers, int id) {
     if (id < 0) return -1;
@@ -11795,6 +12145,36 @@ void watchTick(vector<barb>& barbs, vector<RectangleShape>& squares, vector<prow
                 walkStep(b, sq, true);
             }
             continue;
+        }
+
+        // R61-F1: no prowler to fight: the wyrm, if it is up and within engage range (one wyrm, so no stored id). Distance
+        // is to the nearest point of its body; a watchman in strike reach pins it (heldTicks) while the blows land.
+        if (wyrmFightable()) {
+            Vector2f np(clamp(c.x, wyrm.pos.x, wyrm.pos.x + kWyrmSize.x), clamp(c.y, wyrm.pos.y, wyrm.pos.y + kWyrmSize.y));
+            Vector2f d = np - c;
+            float dSq = d.x * d.x + d.y * d.y;
+            if (dSq <= watchEngagePx * watchEngagePx) {
+                if (dSq <= watchStrikeRangePx * watchStrikeRangePx) {
+                    b.moving = false; clearRoute(b);
+                    b.stepTimer = 0;
+                    wyrm.heldTicks = kWyrmHeldTicks;
+                    if (b.watchCooldown == 0) {
+                        b.watchCooldown = watchStrikeCooldownTicks;
+                        int dmg = weaponDamage(b);
+                        wyrm.hp = max(0, wyrm.hp - dmg);
+                        wyrm.flashFrames = kWyrmFlashFrames;
+                        printf("WATCH HIT - %s (id %d) hits wyrm %d for %d, %d hp left\n", b.name, b.id, wyrm.id, dmg, wyrm.hp);
+                        if (wyrm.hp <= 0) slayWyrm(barbs, i);
+                    }
+                } else {
+                    Vector2f goal = np - sq.getSize() / 2.0f;
+                    b.targetx = (int)goal.x;
+                    b.targety = (int)goal.y;
+                    b.moving = true;
+                    walkStep(b, sq, true);
+                }
+                continue;
+            }
         }
 
         // patrol: walk to the current stop, then on to the next open one round the ring
@@ -12182,7 +12562,8 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
             if (d.x * d.x + d.y * d.y < bellWolfRadius * bellWolfRadius) wolfNear = true;
         }
         bool raidNear = raidThreat[r];            // R52-F1: raiders at the crate ring the same bell
-        wolfNear = wolfNear || raidNear;
+        bool wyrmNear = wyrmThreat[r];            // R61-F1: so does the wyrm, on the same raid path
+        wolfNear = wolfNear || raidNear || wyrmNear;
         if (!stores[r].built) wolfNear = false;   // no crate, no bell
         if (raceBell[r] > 0) {
             raceBellAge[r]++;
@@ -12200,9 +12581,10 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
         } else if (wolfNear && raceBellCooldown[r] == 0) {
             raceBell[r] = bellQuietTicks;
             raceBellAge[r] = 0;
-            printf("BELL RUNG - %s, %s within %.0fpx of the crate\n", racePlurals[r], raidNear ? "raiders" : "wolf",
-                   raidNear ? kRaidAlarmPx : bellWolfRadius);
-            logRaceEvent(string(racePlurals[r]) + (raidNear ? " ring the bell: raiders at the crate!" : " ring the bell: wolf at the crate!"), r);
+            printf("BELL RUNG - %s, %s within %.0fpx of the crate\n", racePlurals[r], wyrmNear ? "wyrm" : raidNear ? "raiders" : "wolf",
+                   wyrmNear ? kWyrmBellPx : raidNear ? kRaidAlarmPx : bellWolfRadius);
+            logRaceEvent(string(racePlurals[r]) + (wyrmNear ? " ring the bell: the wyrm is in the quarter!"
+                         : raidNear ? " ring the bell: raiders at the crate!" : " ring the bell: wolf at the crate!"), r);
         }
     }
     for (int r = 0; r < raceCount; r++) {   // R31-F3: every slot must name a live barb of race r garrisoned in this keep
@@ -12233,8 +12615,8 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
                 spot = keepDoorstep(b.race);
             } else {
                 int h = findHouseById(houses, b.garrisonHouseId);
-                if (h < 0 || h >= (int)houseshapes.size()) {
-                    printf("GARRISON RELEASED - barb %d, house %d is gone\n", b.id, b.garrisonHouseId);
+                if (h < 0 || h >= (int)houseshapes.size() || houseScorched(b.garrisonHouseId)) {   // R61-F1: or torched
+                    printf("GARRISON RELEASED - barb %d, house %d is gone or burnt\n", b.id, b.garrisonHouseId);
                     ungarrison(b);
                     continue;
                 }
@@ -12257,6 +12639,7 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
             continue;
         }
         if (!barbAvailable(b)) continue;   // R45-F2: a party member is out at the ruins, not at the crate
+        if (b.activity == actWatch) continue;   // R61-F1: the watch stands its ground while the bell rings
         if (raceBell[b.race] == 0 || b.carryKind != carryNone) continue;   // haulers deposit first, then shelter
         Vector2f pos = sq.getPosition();
         Vector2f dq = pos - quarterCentre(b.race);
@@ -12267,7 +12650,7 @@ void bellTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
         float bestDSq = 0.0f;
         if (!toKeep)
             for (int k = 0; k < (int)houses.size() && k < (int)houseshapes.size(); k++) {
-                if (houses[k].race != b.race) continue;
+                if (houses[k].race != b.race || houseScorched(houses[k].id)) continue;   // R61-F1: not a burnt house
                 Vector2f d = garrisonDoorstep(houseshapes[k]) - pos;
                 float dSq = d.x * d.x + d.y * d.y;
                 if (best < 0 || dSq < bestDSq) { best = k; bestDSq = dSq; }
@@ -17374,6 +17757,7 @@ int main() {
                 deerkilling(wd, barbs, squares, smoke);
                 wolfTick(wolves, wd, barbs);
                 prowlerTick(prowlers, barbs, squares, houses, houseshapes, fire);   // R48-F1: bites land before starveDeathTick()
+                wyrmTick(houses, houseshapes);   // R61-F1: house burns, wake, the night's torching; wyrmThreat[] for bellTick()
                 watchTick(barbs, squares, prowlers);   // R51-F1: watchmen patrol and fight; slain prowlers fade, prowlerTick() removes them
                 warTick(barbs, stores);   // R60-F1: declarations, muster and treaties, before the raid launcher reads the wars
                 raidTick(barbs, squares, stores);   // R52-F1: raid march and fight; sets raidThreat[] for bellTick() just below
@@ -17522,6 +17906,7 @@ int main() {
 		drawSnapped(window, w.shape);
 	drawProwlers(window, prowlers);   // R48-F1: bodies under the night overlay; eyes after it
 	for (auto& p : prowlers) if (p.flashFrames > 0 && !paused) p.flashFrames--;   // R51-F1: the hit flash lasts 2 drawn frames
+	drawWyrm(window, frameCount);   // R61-F1: body under the night overlay; ember eye and hp bar after it
 
         drawStumps(window, stumps, stumpVerts, camRect);   // R45-F1a: ~12k stumps (R47-F1), only those touching the view
         drawAshStumps(window, ashVerts, camRect);   // R57-F3: burnt-out stumps, same layer as the living trees' stumps
@@ -17584,6 +17969,9 @@ int main() {
         if (isNightHour(t)) drawHouseLights(window, worldView, houses, houseshapes);
         drawLoreCandles(window, worldView, barbs, isNightHour(t));   // R59-F3: study candles at any hour, halo at night
         drawProwlerOverlay(window, worldView, prowlers, fire);   // R48-F1: red eyes + safe-zone ring, above the night overlay
+        drawHouseFires(window, worldView, houses, houseshapes, frameCount);   // R61-F1: flames on torched roofs, above the overlay
+        drawWyrmOverlay(window, worldView);   // R61-F1: ember eye + hp bar
+        if (wyrm.flashFrames > 0 && !paused) wyrm.flashFrames--;   // the hit flash lasts 2 drawn frames
         drawWatchTorches(window, worldView, frameCount);   // R51-F1: torches glow above the overlay (prowler hp bars are drawn in the call above)
         drawBallots(window, worldView, zoom, barbs, squares); // above the overlays so the pips read true; under hover marks
         if (ballotFramesLeft > 0 && !paused) ballotFramesLeft--;
