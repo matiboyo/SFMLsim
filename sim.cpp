@@ -392,6 +392,22 @@ const float rainStreakFallPx = 4.0f;       // px fallen per frame (~240px/s)
 const float rainStreakDriftPx = 1.0f;      // px drifted left per frame, matches the slant
 const Color rainStreakColor(170, 195, 225, 64); // pale blue, ~25% alpha
 bool raining = false;
+// R63-F1 Winter snowfall and footprints: winter rain falls as 1px flakes (draw-only, hashed like the streaks); once snow
+// has fallen this winter, roofs and tree tips carry a 2px translucent cap and walking barbs leave faint 1px prints in a
+// fixed ring buffer (written from walkStep). After the snow stops, prints in the safe core fade twice as fast.
+const Color kSnowFlakeColor(235, 240, 250, 150);   // brighter than a rain streak so a single pixel reads
+const int kSnowFlakeLifeFrames = 160;              // frames a flake drifts before it respawns at a new hashed spot
+const float kSnowFlakeFallPx = 1.0f;               // px fallen per frame (~60px/s, a quarter of the rain)
+const int kSnowFlakeSwayFrames = 24;               // flakes sway 1px left/right every this many frames
+const uint8_t kSnowCapAlpha = 110;                 // translucent, so roof race tints and tree tips still show through
+const Color kSnowCapColor(220, 232, 245, kSnowCapAlpha);   // pale blue-white
+const float kSnowCapPx = 2.0f;                     // cap depth over the top of a roof / tree tip
+const int kFootprintMax = 3000;                    // fixed ring buffer; the oldest print is overwritten
+const int kFootprintLife = 2 * ticksPerMinute;     // ticks a print takes to fade out (2 real minutes at 1x)
+const float kFootprintStridePx = 6.0f;             // one print each time the feet cross into a new 6px cell
+const Color kFootprintColor(150, 170, 195, 45);    // grey-blue, alpha < 50; fades toward 0 over its life
+const int kFootprintCoreFadeMult = 2;              // safe-core prints age this many times faster once the snow stops
+bool snowLying = false;                            // snow has fallen this winter (caps + prints); cleared outside winter
 // R57-F3 Thunderstorm Wildfire, phase 1: every summer rain is a storm with exactly one lightning strike. It burns one wild
 // tree well outside the safe core (no spread, no rain quench, no firebreak yet: phase 2). The burning tree is tracked by id
 // (burningIds) and, once burnt out, leaves an ash-grey stump that fades back to stump colour over one game day, stands
@@ -3016,6 +3032,9 @@ void drawTrees(RenderWindow& window, const vector<CircleShape>& tris, VertexArra
             Vector2f s(2 * round(treeTierSize[k].x * kd.widthFactor / 2), round(treeTierSize[k].y * kd.heightFactor));
             Color c = k == 0 ? kd.tip : (k == last ? shade(kd.body, treeShadeAmount) : kd.body);
             pushQuad(va, p + Vector2f(floor((treeFootprint - s.x) / 2), offset + round(treeTierTop[k] * kd.heightFactor)), s, c);
+            if (k == 0 && snowLying)   // R63-F1: translucent snow cap over the top of the tip tier, after it in the batch
+                pushQuad(va, p + Vector2f(floor((treeFootprint - s.x) / 2), offset + round(treeTierTop[k] * kd.heightFactor)),
+                         Vector2f(s.x, min(kSnowCapPx, s.y)), kSnowCapColor);
         }
     }
     if (va.getVertexCount() > 0) window.draw(va);
@@ -6207,6 +6226,44 @@ Vector2f pathStep(Vector2f pos, Vector2f goal, barb* routed) {
 // moves 1px toward the route's next waypoint (or straight at targetx/y) and wears the trail once per cell entered.
 // Callers keep their own arrival checks and only call this while the barb is >= 1px from targetx/targety.
 // R61-F3: the step itself comes from pathStep(), so every barb walk crosses the river only at a ford.
+// R63-F1: snow footprints. Fixed ring buffer of plain values (no barb index or id), written from walkStep() and aged in
+// snowTick(), so they need no fixing on swapRemove.
+struct footprint {
+    Vector2f pos;        // whole-px top-left of the 1px print
+    int age = 0;         // ticks since it was pressed; >= kFootprintLife = gone
+    bool core = false;   // pressed inside the safe core (fades faster once the snow stops)
+};
+footprint footprints[kFootprintMax];
+int footprintHead = 0;   // next slot to overwrite
+int footprintLive = 0;   // slots ever written (capped at kFootprintMax), so the empty tail is never drawn
+
+void clearFootprints() {
+    footprintHead = 0;
+    footprintLive = 0;
+}
+
+// A print each time the feet cross into a new kFootprintStridePx cell; left/right foot alternates with the cell parity.
+// Not on open water or a flooded ford (ice and bridges take prints).
+void footprintStep(Vector2f before, const RectangleShape& sq) {
+    if (!snowLying) return;
+    Vector2f after = sq.getPosition();
+    int cx0 = (int)floor(before.x / kFootprintStridePx), cy0 = (int)floor(before.y / kFootprintStridePx);
+    int cx1 = (int)floor(after.x / kFootprintStridePx), cy1 = (int)floor(after.y / kFootprintStridePx);
+    if (cx0 == cx1 && cy0 == cy1) return;
+    Vector2f sz = sq.getSize();
+    Vector2f feet = snapPx(after) + Vector2f(((cx1 + cy1) & 1) ? max(0.0f, sz.x - 1.0f) : 0.0f, max(0.0f, sz.y - 1.0f));
+    if (riverPlaced) {
+        riverCell rc = riverWet[riverCellAt(feet)];
+        if (rc == riverCell::water || rc == riverCell::ford || rc == riverCell::flood) return;
+    }
+    footprint& f = footprints[footprintHead];
+    f.pos = feet;
+    f.age = 0;
+    f.core = zoneAt(feet) == zoneCore;
+    footprintHead = (footprintHead + 1) % kFootprintMax;
+    footprintLive = min(footprintLive + 1, kFootprintMax);
+}
+
 void walkStep(barb& b, RectangleShape& sq, bool straight = false) {
     Vector2f pos = sq.getPosition();
     if (++b.stepTimer < stepLimit(b, pos)) return;
@@ -6215,6 +6272,37 @@ void walkStep(barb& b, RectangleShape& sq, bool straight = false) {
     if (m.x == 0.0f && m.y == 0.0f) return;
     sq.move(m);
     trailStep(b, sq.getPosition());
+    footprintStep(pos, sq);   // R63-F1
+}
+
+// R63-F1: once per sim tick, after weatherTick(). Snow lies from the first winter rain to the end of winter; prints age
+// here (safe-core prints kFootprintCoreFadeMult times faster once the snow has stopped falling).
+void snowTick() {
+    if (!isWinter()) {
+        if (snowLying) clearFootprints();   // the thaw at spring's midnight takes the last prints with the snow
+        snowLying = false;
+    } else if (raining) snowLying = true;
+    bool snowing = raining && isWinter();
+    for (int i = 0; i < footprintLive; i++) {
+        footprint& f = footprints[i];
+        if (f.age >= kFootprintLife) continue;
+        f.age += (f.core && !snowing) ? kFootprintCoreFadeMult : 1;
+    }
+}
+
+// R63-F1: world layer just under drawBarbs(); 1px grey-blue prints, alpha fading linearly over their life, culled to view
+void drawFootprints(RenderWindow& window, const FloatRect& view) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (int i = 0; i < footprintLive; i++) {
+        const footprint& f = footprints[i];
+        if (f.age >= kFootprintLife || !view.contains(f.pos)) continue;
+        Color c = kFootprintColor;
+        c.a = (uint8_t)(kFootprintColor.a * (1.0f - (float)f.age / kFootprintLife));
+        if (c.a == 0) continue;
+        pushQuad(va, f.pos, Vector2f(1.0f, 1.0f), c);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
 }
 
 // Rebuilds the tinted cell quads only when some cell changed tier or wear bucket (va reused, capacity kept)
@@ -6341,6 +6429,23 @@ void drawBirds(RenderWindow& window, const vector<bird>& birds, RectangleShape& 
 // Rain streaks, batched; each streak's spawn spot comes from hash(cycle, index) and it falls for one cycle
 void drawRain(RenderWindow& window, VertexArray& va, int frame) {
     va.clear();
+    if (isWinter()) {   // R63-F1: snow: 1px white flakes, slower, swaying 1px instead of slanting
+        for (int i = 0; i < rainStreakCount; i++) {
+            uint32_t phase = (uint32_t)i * 2654435761u % kSnowFlakeLifeFrames;
+            uint32_t f = (uint32_t)frame + phase;
+            uint32_t cycle = f / kSnowFlakeLifeFrames;
+            int age = (int)(f % kSnowFlakeLifeFrames);
+            uint32_t h = cycle * 73856093u ^ (uint32_t)i * 19349663u;
+            h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+            float sway = ((age / kSnowFlakeSwayFrames + i) % 2 == 0) ? 0.0f : 1.0f;
+            float x = (float)(h % (uint32_t)worldSize) + sway;
+            float y = (float)((h >> 10) % (uint32_t)worldSize) + age * kSnowFlakeFallPx - kSnowFlakeLifeFrames * kSnowFlakeFallPx / 2;
+            Vector2f p = snapPx(Vector2f(fmod(x + worldSize, worldSize), fmod(y + worldSize, worldSize)));
+            pushQuad(va, p, Vector2f(1.0f, 1.0f), kSnowFlakeColor);
+        }
+        if (va.getVertexCount() > 0) window.draw(va);
+        return;
+    }
     for (int i = 0; i < rainStreakCount; i++) {
         uint32_t phase = (uint32_t)i * 2654435761u % rainStreakLifeFrames; // stagger respawns across streaks
         uint32_t f = (uint32_t)frame + phase;
@@ -7161,6 +7266,9 @@ void drawHouses(RenderWindow& window, const vector<house>& houses, const vector<
         for (int k = 0; k < st.rows; k++)
             roof[k] = {Vector2f(st.left[k], st.top + k), Vector2f(st.width[k], 1.0f), k == st.rows - 1 ? partRampMid : partRampLight};
         drawParts(va, roof, st.rows, o, roofCol);
+        if (snowLying && bk < 0)   // R63-F1: 2px translucent cap on the top roof rows (none on a burning or charred roof)
+            for (int k = 0; k < st.rows && k < (int)kSnowCapPx; k++)
+                pushQuad(va, o + Vector2f(st.left[k], st.top + k), Vector2f(st.width[k], 1.0f), kSnowCapColor);
         drawParts(va, partRange{st.bodyFirst, st.bodyCount}, o, tint);   // R41-F1: race walls/door/window
         int hr = houses[i].race;   // R59-F3: the builder race's tier-2 marks, each 1-2px on the slab round the walls
         if (knows(hr, techMasonry)) pushQuad(va, o + masonryCoursePos, masonryCourseSize, masonryCourseColor * tint);
@@ -19778,6 +19886,7 @@ int main() {
                 riverSeasonTick(barbs, squares, stores, smoke, dwarfForge, fields, trees, tris, rocks, octs, bushes);   // R62-F2: after clockk(), so ice/flood land at the midnight
                 bridgeTorchTick(barbs, squares, stores, smoke, dwarfForge, fields, trees, tris, rocks, octs, bushes);   // R62-F2c: burn timers, a won raid's torch
                 weatherTick();
+                snowTick();   // R63-F1: snow lying + footprint ageing, right after the weather turns
                 stormTick(trees, tris, stumps, barbs, fields, houses);   // R57-F3: after weatherTick, so a summer rain's first tick schedules its strike
                 relationTick();   // R51-F4: drift to neutral and clash cooldowns, before the trader prices a visit
                 traderTick(activeTrader, barbs, stores);
@@ -19917,6 +20026,7 @@ int main() {
         drawRiteRings(window, shrines);   // R52-F3: faint ring round each rite shrine, under the kneelers
         drawCampHunters(window, camRect);   // R55-F1: with the barbs, under the trees
         drawHostGround(window);   // R61-F2: a broken host's dropped banner, on the ground under the barbs
+        drawFootprints(window, camRect);   // R63-F1: faint snow prints, directly under the barbs
         drawBarbs(window, barbs, squares, frameCount, zoom);
         drawTitlePips(window, camRect, zoom);   // R56-F3: pale 1px pip over titled barbs, capped
         for (auto& b : barbs) if (b.raidFlash > 0 && !paused) b.raidFlash--;   // R52-F1: the hit flash lasts 2 drawn frames
