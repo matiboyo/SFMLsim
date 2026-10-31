@@ -1193,6 +1193,17 @@ const Color kHoardGlintColor(236, 206, 112);        // pale gold, a shade above 
 const Color kHoardGlintArmColor(212, 188, 118, 170);// the cross arms: goldFleckColor, translucent
 const Color kHoardGlowColor(120, 96, 40, 40);       // faint 5x5 additive halo, night only
 const Color kHoardTickerTint(212, 188, 118);        // hudGoldColor
+// R63-F5a Shared idle-gather helper: gatherIdleAt() sends up to kGatherSlots idle, available barbs of one race to fixed
+// slots on a ring round a point (feast fire, graves) and fills the caller's array with their barb ids (never indices).
+// One activity, actGather: entering runs expeditionReset() (moving/chopping/building/movingbspot/deertargeting cleared,
+// any drill or wander dropped); endActivity() clears the same flags and the walk on every exit. gatherTick() walks them
+// to their slots and releases each on its timer; a death (removeBarb), any claim or draft (clearTraining(): bell, watch,
+// raid, host, hunt, expedition) or releaseGather() ends it too. Never saved: resetGathers() on a chronicle load.
+const int kGatherSlots = 8;                         // fixed ring offsets round the point; most barbs one call sends
+const float kGatherRingPx = 14.0f;                  // ring radius, point to barb hitbox centre
+const float kGatherRecruitPx = 220.0f;              // only idle barbs this close to the point are called
+const int kGatherMaxTicks = 6 * ticksPerGameHour;   // backstop: no gathering outlasts this, whatever the caller asked
+const int kGatherSlotOrder[kGatherSlots] = {0, 4, 2, 6, 1, 5, 3, 7};   // fill order: a small group still rings the point
 // R61-F2 Field Hosts and Pitched Battles, phase 1: while a war is in its window, warTick() may muster one host per side
 // (up to kHostMax drilled, armed barbs each) under a race banner. Both columns march to the field between the two crates
 // and clash through raidFightStep(); a side with fewer than kHostMinStanding unbeaten fighters breaks, drops its banner
@@ -4040,7 +4051,7 @@ enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
 // R53-F4: the one exclusive state a barb is in (work flags like chopping/building stay separate). Set only by
 // beginActivity(), cleared only by endActivity(), which also runs the activity's cleanup.
 enum barbActivity { actNone, actShelter, actExpedition, actRaidAttack, actRaidDefend, actTemper, actSmelt, actDrill, actWatch,
-                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, actHeal, actHost, actHollowHunt, activityCount };   // R62-F3b: actHollowHunt = a joint wyrm hunter   // R61-F2: actHost = a field host fighter. R60-F2: actHeal = an elf walking to cure a patient   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
+                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, actHeal, actHost, actHollowHunt, actGather, activityCount };   // R63-F5a: actGather = called to a gathering (gatherIdleAt)   // R62-F3b: actHollowHunt = a joint wyrm hunter   // R61-F2: actHost = a field host fighter. R60-F2: actHeal = an elf walking to cure a patient   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
 struct activityDef {
     const char* name;
     bool ownsBarb;    // its tick owns the barb outright: every job selector skips it (barbAvailable() false)
@@ -4067,6 +4078,7 @@ const activityDef activityDefs[activityCount] = {
     {"heal",          false, false, true},   // R60-F2: any claim outranks the visit; healTick() walks the healer
     {"host",          true,  false, false},  // R61-F2: hostTick() owns the fighter from muster to release
     {"wyrm hunt",     true,  false, false},  // R62-F3b: huntTick() owns the hunter from muster to release
+    {"gathering",     false, false, true},   // R63-F5a: low priority: any claim or draft ends it; gatherTick() walks it
 };
 
 // R62-F3b: what a hunter was doing when the hunt took it. Written only by the muster, read by releaseHuntBarb(), wiped
@@ -4164,6 +4176,9 @@ struct barb {
     int healWalkTicks = 0;       // R60-F2: ticks since the visit began; reset by releaseHealPatient()
     int healImmuneUntil = 0;     // R60-F2: healClock tick a cure's immunity runs to (0 = none); 0 after makeBarb() and any load
     huntSaveState huntSave;      // R62-F3b: flags saved at the hunt muster; valid only while activity == actHollowHunt
+    int gatherX = -1, gatherY = -1; // R63-F5a: slot top-left while activity == actGather; set only by gatherIdleAt(),
+    int gatherTicks = 0;         //           ticks left before gatherTick() releases it; all three reset by endActivity()
+    const char* gatherLabel = ""; // R63-F5a: tooltip words for the gathering (static string from the caller)
 };
 // R57-F1: age and stage from bornHour on the live clock (same hour count as chronicleNowHour())
 enum lifeStageKind { stageChild, stageAdult, stageElder };
@@ -4887,6 +4902,19 @@ void endActivity(barb& b) {
             b.raidCooldown = 0;
             b.huntSave = huntSaveState{};
             break;
+        case actGather:      // R63-F5a: the same five flags as on entry, and the walk to the slot. Every claim path calls
+                             // clearTraining() before it sets its own work, so nothing a claim sets is undone here.
+            b.moving = b.chopping = b.building = b.movingbspot = false;
+            if (b.deertargeting) b.targetDeerId = -1;
+            b.deertargeting = false;
+            clearRoute(b);
+            b.stepTimer = 0;
+            b.targetx = b.targety = -1;
+            b.wanderX = b.wanderY = -1;
+            b.gatherX = b.gatherY = -1;
+            b.gatherTicks = 0;
+            b.gatherLabel = "";
+            break;
         case actKneel:     // R52-F3: nothing else to reset
         case actCaravan:     // R54-F1: the cart's goods live on the caravan entry, not the barb
         case actExile:       // R54-F3: the trip lives on the exile entry; exileTick() resets the walk
@@ -4899,6 +4927,8 @@ void endActivity(barb& b) {
     b.activity = actNone;
 }
 void endActivity(barb& b, barbActivity a) { if (b.activity == a) endActivity(b); }
+// R63-F5a: chronicle load: gatherings are never saved; endActivity() clears the flags, walk and slot
+void resetGathers(vector<barb>& barbs) { for (auto& b : barbs) endActivity(b, actGather); }
 
 // R41-F2: every way out of a temper (finished, interrupted, reassigned, forge gone, sheltering, death) goes through here.
 // Refunds the stone if it is still owed (in endActivity()) and resets toolCharges even with no temper live (the tempered
@@ -5543,6 +5573,7 @@ const char* barbTaskName(const barb& b) {
     if (b.activity == actHerb) return b.moving ? "going to the herb patch" : "tending herbs";      // R53-F2: no stripe either
     if (b.activity == actStudy) return b.moving ? "going to the Lore Hall" : "studying";         // R59-F3: no stripe; the candle shows it
     if (b.activity == actHeal) return "going to heal";                                           // R60-F2: no stripe; the cure ring shows it
+    if (b.activity == actGather) return b.gatherLabel[0] ? b.gatherLabel : "gathering";          // R63-F5a: the caller's words
     if (inHost(b))   // R61-F2
         return host.phase == warHost::Home ? "field host: marching home"
              : host.phase == warHost::Clash ? (b.raidPreyId >= 0 ? "field host: fighting" : "field host: holding the line")
@@ -10957,6 +10988,7 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
     for (auto& row : wonderEnvy) for (auto& e : row) e = 0.0f;   // R61-F4b: envy is never saved
     truce = wyrmTruce{};  // R62-F3: nor the truce
     resetHollowHunt(barbs);   // R62-F3b: nor the joint hunt
+    resetGathers(barbs);      // R63-F5a: nor any gathering
     if (d.barbs.empty()) {
         for (auto& b : barbs) b.bornHour = chronicleNowHour() - founderAgeHours();   // founders arrive on the restored clock (R57-F1: grown)
         printf("CHRONICLE - no barbs saved: the %d founders stay\n", (int)barbs.size());
@@ -11080,7 +11112,7 @@ void shinobiTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
         if (!b.shinobi) continue;
         if (!barbAvailable(b) || b.moving || b.chopping || b.building || b.movingbspot || b.deertargeting || b.timer > 0 || b.jobKind != jobNone
             || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb || b.activity == actStudy
-            || b.activity == actHeal) continue;   // R60-F2: nor off a healer's walk. R47-F6: no blinking off the drill slot (R51-F1: or the watch; R52-F3: or the rite; R53-F2: or the herb bed; R59-F3: or the bench)
+            || b.activity == actHeal || b.activity == actGather) continue;   // R63-F5a: nor out of a gathering ring. R60-F2: nor off a healer's walk. R47-F6: no blinking off the drill slot (R51-F1: or the watch; R52-F3: or the rite; R53-F2: or the herb bed; R59-F3: or the bench)
         if (blinkChance(gen) != 0) continue;
         Vector2f from = squares[i].getPosition(), size = squares[i].getSize();
         for (int t = 0; t < shinobiBlinkTries; t++) {
@@ -12095,6 +12127,7 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     endActivity(b, actHost);
     huntMemberLost(b);                            // R62-F3b: drops its hunt id; endActivity() wipes its saved flags (no restore)
     endActivity(b, actHollowHunt);
+    endActivity(b, actGather);                    // R63-F5a: explicit (releaseBarbWork() already did it); callers hold ids, so findBarbById() drops it
     envoyMemberLost(b);                         // R56-F2: drops the envoy id; envoyTick() aborts unpaid next tick
     endActivity(b, actEnvoy);
     marriageMemberLost(b);                        // R59-F1: drops its procession id; marriageTick() aborts the trip next tick
@@ -12951,7 +12984,7 @@ bool watchEligible(const barb& b) {
     if (b.chopping || b.building || b.movingbspot || b.deertargeting || b.jobKind != jobNone || b.carryKind != carryNone
         || atForgeTask(b) || b.timer > 0 || b.target != targetNone || b.order != needNone) return false;
     bool wandering = b.targetx == b.wanderX && b.targety == b.wanderY;
-    return !b.moving || wandering || b.activity == actDrill;
+    return !b.moving || wandering || b.activity == actDrill || b.activity == actGather;   // R63-F5a: so does a gathering
 }
 
 // R51-F1: the only place the watch state is set. Ends any drill first (clearTraining() also clears the watch, so the
@@ -13209,7 +13242,7 @@ Vector2f riteSlotPos(const shrine& s, int k, Vector2f size) {
 
 // R52-F3: idle on the surface (standing or on a wander walk), with no task, haul, hunt, order, drill, watch or raid
 bool riteEligible(const barb& b) {
-    if (b.activity == actKneel || b.health <= 0 || !barbAvailable(b) || barbHidden(b) || barbUnderground(b) || b.inMine) return false;
+    if (b.activity == actKneel || b.activity == actGather || b.health <= 0 || !barbAvailable(b) || barbHidden(b) || barbUnderground(b) || b.inMine) return false;
     if (b.activity == actDrill || b.activity == actWatch || b.chopping || b.building || b.movingbspot || b.deertargeting || b.jobKind != jobNone
         || b.carryKind != carryNone || atForgeTask(b) || b.timer > 0 || b.target != targetNone || b.order != needNone) return false;
     bool wandering = b.targetx == b.wanderX && b.targety == b.wanderY;
@@ -13679,7 +13712,8 @@ bool orderIdle(const barb& b) {
         && b.activity != actWatch     // R51-F1: nor do watchmen (and so they never start a drill)
         && b.activity != actHerb      // R53-F2: nor do herb tenders (the bed visit is short)
         && b.activity != actStudy     // R59-F3: nor do scholars
-        && b.activity != actHeal;     // R60-F2: nor do healers on a visit
+        && b.activity != actHeal      // R60-F2: nor do healers on a visit
+        && b.activity != actGather;   // R63-F5a: nor do gatherers (orders would sit unread: no work search while gathered)
 }
 
 // INBOX-F2b: right after the leader names its need, it hands that need as an individual order to idle members (not
@@ -13818,6 +13852,130 @@ bool expeditionEligible(const barb& b, int r) {
     bool wandering = !b.moving || (b.targetx == b.wanderX && b.targety == b.wanderY);
     return b.race == r && orderIdle(b) && wandering && b.target == targetNone && b.timer == 0 && !b.inMine
         && !b.shinobi && !isLeader(b) && !isHungry(b) && b.health >= expMinHealth;
+}
+
+// R63-F5a: may b be called to a gathering of race r? Alive, on the surface, no tick owns it, no other activity (drill,
+// watch, kneel, herbs, study, heal...), no job, haul, hunt, forge task, timer, target or order, standing or wandering.
+bool gatherEligible(const barb& b, int r) {
+    if (b.race != r || b.health <= 0 || b.activity != actNone || !barbAvailable(b) || barbHidden(b) || barbUnderground(b) || b.inMine) return false;
+    if (b.chopping || b.building || b.movingbspot || b.deertargeting || b.jobKind != jobNone || b.carryKind != carryNone
+        || b.timer > 0 || b.target != targetNone || b.order != needNone) return false;
+    bool wandering = b.targetx == b.wanderX && b.targety == b.wanderY;
+    return !b.moving || wandering;
+}
+
+// R63-F5a: top-left a barb of this body size stands at in ring slot k round centre (slot 0 just off the top)
+Vector2f gatherSlotPos(Vector2f centre, int k, Vector2f size) {
+    float a = 6.2831853f * ((float)k + 0.5f) / (float)kGatherSlots - 1.5707963f;
+    return snapPx(centre + Vector2f(cos(a), sin(a)) * kGatherRingPx - size / 2.0f);
+}
+
+// R63-F5a: the shared idle-gather helper. Sends up to want (<= kGatherSlots) eligible barbs of race r, nearest the point
+// first (within kGatherRecruitPx), to free dry slots on the fixed ring round pos for ticks ticks (capped at
+// kGatherMaxTicks). ids is the caller's: filled with the gatherers' barb ids, -1 in the unused entries; re-resolve them
+// with findBarbById() (gatherCount() does). Returns how many were sent. label = the tooltip words (a static string).
+int gatherIdleAt(vector<barb>& barbs, vector<RectangleShape>& squares, int r, Vector2f pos, int (&ids)[kGatherSlots],
+                 int want, int ticks, const char* label) {
+    for (auto& id : ids) id = -1;
+    int n = min((int)barbs.size(), (int)squares.size());
+    want = clamp(want, 0, kGatherSlots);
+    ticks = clamp(ticks, 1, kGatherMaxTicks);
+    if (r < 0 || r >= raceCount || want == 0) return 0;
+    int picked[kGatherSlots];
+    int sent = 0, s = 0;
+    while (sent < want) {
+        int i = findNearest(pos, kGatherRecruitPx, n,
+                            [&](int j) { return squares[j].getPosition() + squares[j].getSize() / 2.0f; },
+                            [&](int j) {
+                                for (int q = 0; q < sent; q++) if (picked[q] == j) return true;
+                                return !gatherEligible(barbs[j], r);
+                            });
+        if (i < 0) break;
+        Vector2f size = squares[i].getSize();
+        Vector2f slot;
+        bool found = false;
+        for (; s < kGatherSlots && !found; s++) {   // the next free dry slot in fill order (slots are never reused in one call)
+            slot = gatherSlotPos(pos, kGatherSlotOrder[s], size);
+            if (!watchStopOk(slot + size / 2.0f, size)) continue;
+            bool held = false;   // another gathering on the same point already stands there
+            for (int j = 0; j < n && !held; j++)
+                held = barbs[j].activity == actGather && barbs[j].gatherX == (int)slot.x && barbs[j].gatherY == (int)slot.y;
+            found = !held;
+        }
+        if (!found) break;
+        barb& b = barbs[i];
+        expeditionReset(b);   // entry: moving/chopping/building/movingbspot/deertargeting cleared, any wander walk dropped
+        beginActivity(b, actGather);
+        b.order = needNone;
+        b.orderTicks = 0;
+        b.gatherX = b.targetx = (int)slot.x;
+        b.gatherY = b.targety = (int)slot.y;
+        b.gatherTicks = ticks;
+        b.gatherLabel = label ? label : "";
+        b.moving = true;
+        picked[sent] = i;
+        ids[sent] = b.id;
+        sent++;
+    }
+    if (sent > 0)
+        printf("GATHER - %d %s called to (%.0f, %.0f) for %d ticks (%s)\n", sent, racePlurals[r], pos.x, pos.y, ticks, label ? label : "");
+    return sent;
+}
+
+// R63-F5a: how many of the caller's gatherers are still gathered (arrivedOnly: and standing at their slot). Ids whose
+// barb is gone or no longer gathering are set to -1 here, so the caller's array never names a released barb.
+int gatherCount(const vector<barb>& barbs, int (&ids)[kGatherSlots], bool arrivedOnly) {
+    int c = 0;
+    for (auto& id : ids) {
+        int i = findBarbById(barbs, id);
+        if (i < 0 || barbs[i].activity != actGather) { id = -1; continue; }
+        if (!arrivedOnly || !barbs[i].moving) c++;
+    }
+    return c;
+}
+
+// R63-F5a: the caller ends its gathering early (fire out, vigil over): every listed gatherer is released where it stands
+void releaseGather(vector<barb>& barbs, int (&ids)[kGatherSlots], const char* why) {
+    int c = 0;
+    for (auto& id : ids) {
+        int i = findBarbById(barbs, id);
+        id = -1;
+        if (i < 0 || barbs[i].activity != actGather) continue;
+        endActivity(barbs[i], actGather);
+        c++;
+    }
+    if (c > 0) printf("GATHER RELEASED - %d barbs (%s)\n", c, why);
+}
+
+// R63-F5a: runs right after riteTick(). Owns every gatherer's walk: to its slot, then standing. Releases one that can no
+// longer gather (dead, owned by another tick, sheltering, below ground) or whose timer runs out. Claims and drafts end
+// it on their own (clearTraining()), and removeBarb() does on a death.
+void gatherTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (int i = 0; i < n; i++) {
+        barb& b = barbs[i];
+        if (b.activity != actGather) continue;
+        if (b.health <= 0 || !barbAvailable(b) || barbHidden(b) || barbUnderground(b) || b.inMine) {
+            printf("GATHER ENDED - barb %d (called away)\n", b.id);
+            endActivity(b, actGather);
+            continue;
+        }
+        if (--b.gatherTicks <= 0 || b.gatherX < 0 || b.gatherY < 0) {
+            printf("GATHER ENDED - barb %d (time)\n", b.id);
+            endActivity(b, actGather);
+            continue;
+        }
+        b.targetx = b.gatherX;   // the slot is the only walk a gatherer has
+        b.targety = b.gatherY;
+        b.wanderX = b.wanderY = -1;
+        Vector2f diff = Vector2f((float)b.targetx, (float)b.targety) - squares[i].getPosition();
+        if (diff.x * diff.x + diff.y * diff.y < 1.0f) {
+            if (b.moving) { b.moving = false; clearRoute(b); b.stepTimer = 0; }
+        } else {
+            b.moving = true;
+            walkStep(b, squares[i]);
+        }
+    }
 }
 
 // R45-F2: where member k of the party stands at the end of the current leg (hitbox top-left)
@@ -14134,7 +14292,7 @@ bool raidIdle(const barb& b) {
     if (b.chopping || b.building || b.movingbspot || b.deertargeting || b.jobKind != jobNone || b.carryKind != carryNone
         || atForgeTask(b) || b.timer > 0 || b.target != targetNone) return false;
     bool wandering = !b.moving || (b.targetx == b.wanderX && b.targety == b.wanderY);
-    return wandering || b.activity == actDrill;
+    return wandering || b.activity == actDrill || b.activity == actGather;   // R63-F5a: a draft outranks a gathering
 }
 bool raidRaiderOk(const barb& b, int r) {
     return b.race == r && b.hasSpear && raidIdle(b) && b.health >= kRaidMinHealth && !isHungry(b) && !isLeader(b) && !b.shinobi;
@@ -16575,7 +16733,7 @@ void barbmove(vector<RectangleShape>& squares, vector<barb>& barbs) {
         auto& b  = barbs[i];
         if (!barbAvailable(b) || b.chopping || b.timer > 0 || b.movingbspot || b.building || b.carryKind != carryNone || atForgeTask(b)) continue;   // R29-F1: haulTick() walks haulers; INBOX-F1: bellTick() walks garrisoned; R41-F2: temperTick() walks temperers (R47-F7: smeltTick() smelters); R45-F2: expeditionTick() walks parties
         if (b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb || b.activity == actStudy
-            || b.activity == actHeal) continue;   // R60-F2: healTick() walks healers. R47-F6: drillTick() walks drillers; R51-F1: watchTick() walks watchmen; R52-F3: riteTick() kneelers; R53-F2: herbTendTick() tenders; R59-F3: studyTick() scholars
+            || b.activity == actHeal || b.activity == actGather) continue;   // R63-F5a: gatherTick() walks gatherers. R60-F2: healTick() walks healers. R47-F6: drillTick() walks drillers; R51-F1: watchTick() walks watchmen; R52-F3: riteTick() kneelers; R53-F2: herbTendTick() tenders; R59-F3: studyTick() scholars
         Vector2f pos = sq.getPosition();
         if (!b.moving) {
             if (studyWanted(b, pos) && studyJoin(gen) == 0) {   // R59-F3: an idle elder near its Lore Hall sits to study
@@ -16628,7 +16786,7 @@ void buildWorkClaims(const vector<barb>& barbs, const vector<CircleShape>& tris,
         const barb& b = barbs[j];
         if (!barbAvailable(b) || b.targetx == -1 || b.target == targetBush || b.target == targetLake || b.target == targetField || b.target == targetDepot || b.deertargeting || b.movingbspot || b.building
             || b.activity == actDrill || b.activity == actWatch || b.activity == actKneel || b.activity == actHerb || b.activity == actStudy
-            || b.activity == actHeal) continue;   // R60-F2: nor a patient. R47-F6: a drill slot is not a tree spot (R51-F1: nor a patrol stop; R52-F3: nor a kneel slot; R53-F2: nor the herb bed; R59-F3: nor a bench)
+            || b.activity == actHeal || b.activity == actGather) continue;   // R63-F5a: nor a gathering slot. R60-F2: nor a patient. R47-F6: a drill slot is not a tree spot (R51-F1: nor a patrol stop; R52-F3: nor a kneel slot; R53-F2: nor the herb bed; R59-F3: nor a bench)
         (b.target == targetRock ? rockSpots : treeSpots).emplace(workSpotKey(b.targetx, b.targety), j); // first claimant kept
     }
     treeClaim.assign(tris.size(), -1);
@@ -17079,6 +17237,13 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 printf("HEAL INTERRUPTED - barb %d\n", b.id);
                 endActivity(b, actHeal);
             } else continue;   // healTick() walks the healer to its patient; no work search on a visit
+        }
+        if (b.activity == actGather) {   // R63-F5a: backstop: a gathering is exclusive with work, builds, timers, hunts and hauls
+            if (b.movingbspot || b.building || b.deertargeting || b.chopping || b.timer > 0 || b.jobKind != jobNone
+                || b.carryKind != carryNone || atForgeTask(b) || b.target != targetNone || b.inMine) {
+                printf("GATHER INTERRUPTED - barb %d\n", b.id);
+                endActivity(b, actGather);
+            } else continue;   // gatherTick() walks the gatherer to its slot; no work search while gathered
         }
         if (b.carryKind != carryNone) {   // R29-F1: any other state taken over the haul drops the load
             if (b.target != targetDepot || b.movingbspot || b.building || b.deertargeting || b.chopping || b.jobKind != jobNone) dropCarry(b);
@@ -19967,6 +20132,7 @@ int main() {
                 minematerials(squares, barbs, tris, stumps, trees, octs, rocks, rockGold, bushes, bushshapes, catchRings, fields, stores, dwarfForge);
                 barbmove(squares, barbs);
                 riteTick(barbs, squares, shrines);   // R52-F3: after the work search, so a barb between jobs is caught idle
+                gatherTick(barbs, squares);   // R63-F5a: walks and times out gatherers sent by gatherIdleAt()
                 studyTick(barbs, squares);   // R59-F3: bench upkeep, scholars' walk and study points; loreClock for the candles
                 wonderTick(barbs, squares, stores, bushshapes);   // R60-F3: a race with a tier-2 tech raises its wonder's next stage
                 shaftTick(barbs);   // R40-F1: dust puffs and lintel flash
