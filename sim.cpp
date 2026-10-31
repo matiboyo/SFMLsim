@@ -2304,6 +2304,18 @@ const Color kFordWaterColor(88, 118, 148);         // shallows over the ford, a 
 const Color kFordStoneColor(200, 194, 176);        // pale stepping stones
 const Color kFordStoneShadow(70, 88, 106);         // 1px wet underside below each stone
 const Color kFordBankColor(164, 160, 144);         // pale gravel landing: the ford rows' bank rim, so both ends read from afar
+// R62-F2 Winter Ice and Flood-Closed Fords, phase 1: in winter the whole band freezes (crossable anywhere, ford stones
+// hidden under the ice); on the first spring day after a winter the ford cells flood (closed to waders) and the rest
+// thaws back to water. riverSeasonTick() pushes anyone left standing in closed water to the nearest dry/ford cell.
+const Color kRiverIceA(196, 210, 218);             // pale ice-white, muted so it sits on the dark winter ground
+const Color kRiverIceB(188, 203, 212);             // checker partner, kept close to A
+const Color kRiverIceCrack(112, 134, 156);         // thin blue-grey crack lines on fresh ice
+const int kIceCrackTicks = ticksPerGameHour;       // fresh-ice cracks fade out over one game hour (visual timer only)
+const Color kRiverFloodA(34, 50, 82);              // murky deep blue: well below the normal river (62, 97, 138)
+const Color kRiverFloodB(38, 52, 78);
+const Color kRiverFloodSilt(76, 78, 66);           // one 3x1 silt streak per flooded cell, so it reads muddy
+const int kRiverBankSearchCells = 6;               // bank push: dry/ford cells searched within this many cells
+const Color kRiverTickerTint(150, 180, 214);       // cold river blue on the black ticker strip
 
 // Far Reaches (R45-F1b): one ruin site far out from the village (placed once at startup by spawnRuins, after the
 // quarters, lakes and bushes), a ridge of ordinary mineable rocks arcing behind it, and one lean-to camp per race beside
@@ -3682,7 +3694,16 @@ vector<Vector2f> shorePoints;     // 1px spots just outside each lake's rim at i
 bool riverPlaced = false;
 bool riverVertical = true;
 uint32_t riverSeed = 0;                                       // drawn from gen once per start; not saved
-vector<uint8_t> riverWet(trailGridN * trailGridN, 0);         // 0 dry, 1 water, 2 ford
+// R62-F2: riverWet is the live cell state (seasonal); riverBase is the carved layout (dry, water or ford only)
+enum class riverCell : uint8_t { dry, water, ford, ice, flood };
+// The one walkability test for a river cell: dry and ice always; a ford only for waders; water and flood never
+bool crossable(riverCell c, bool canWade) { return c == riverCell::dry || c == riverCell::ice || (c == riverCell::ford && canWade); }
+vector<riverCell> riverWet(trailGridN * trailGridN, riverCell::dry);
+vector<riverCell> riverBase(trailGridN * trailGridN, riverCell::dry);
+enum riverSeasonState { riverNormal, riverIced, riverFlooded };
+riverSeasonState riverState = riverNormal;
+int riverCrackTicks = 0;                                      // R62-F2: >0 while fresh-ice cracks fade (visual only)
+VertexArray riverCrackVerts(PrimitiveType::Triangles);        // R62-F2: crack quads, rebuilt with riverVerts while iced
 vector<uint8_t> riverSide(trailGridN * trailGridN, 0);        // 0 low-across bank, 1 high-across bank, 2 in the band
 vector<int> riverRegion(trailGridN * trailGridN, -1);         // 4-connected walkable region id, -1 = water/lake/unlabelled
 vector<int> riverLo(trailGridN, 0), riverHi(trailGridN, -1);
@@ -3710,7 +3731,7 @@ bool riverClear(const FloatRect& r, float pad) {
     int y1 = clamp((int)floor((r.position.y + r.size.y + pad - 0.001f) / trailCellSize), 0, trailGridN - 1);
     for (int y = y0; y <= y1; y++)
         for (int x = x0; x <= x1; x++)
-            if (riverWet[y * trailGridN + x] != 0) return false;
+            if (riverWet[y * trailGridN + x] != riverCell::dry) return false;   // R62-F2: ice too (it thaws)
     return true;
 }
 
@@ -5826,7 +5847,7 @@ void trailTick() {
 
 // R39-F1: path tier and road tier (paved cells included) shave trailSpeedBonus[tier] ticks off the step limit
 int stepLimit(const barb& b, Vector2f pos) {
-    if (riverPlaced && riverWet[riverCellAt(pos)] != 0) return stepLimit(b) * kFordWadeMult;   // R61-F3: waders slow
+    if (riverPlaced && riverWet[riverCellAt(pos)] != riverCell::dry) return stepLimit(b) * kFordWadeMult;   // R61-F3: waders slow (R62-F2: on ice too)
     int c = trailCell(pos);
     return max(1, stepLimit(b) - (c >= 0 ? trailSpeedBonus[trailTier[c]] : 0));
 }
@@ -5842,7 +5863,7 @@ int routeStamp = 0;
 
 // Lake water blocks a route cell (centre inside a lake rect); the bank zone stays walkable so shore spots are reachable
 bool routeCellBlocked(int c) {
-    if (riverPlaced && riverWet[c] == 1) return true;   // R61-F3: river water blocks; ford cells stay open
+    if (riverPlaced && !crossable(riverWet[c], true)) return true;   // R61-F3: river water blocks; fords (R62-F2: and ice) stay open
     Vector2f centre(((c % trailGridN) + 0.5f) * trailCellSize, ((c / trailGridN) + 0.5f) * trailCellSize);
     for (auto& l : lakes) if (l.contains(centre)) return true;
     return false;
@@ -5930,7 +5951,7 @@ Vector2f routeAim(barb& b, Vector2f pos, Vector2f goal) {
 // far-bank point. On a ford: on across to the goal's bank. Stranded in deep water: wade straight out to the goal's bank.
 // A goal inside the band counts as being on its nearer bank. O(kFordCount), no search.
 Vector2f crossingAim(Vector2f pos, Vector2f goal) {
-    if (!riverPlaced) return goal;
+    if (!riverPlaced || riverState == riverIced) return goal;   // R62-F2: the frozen river is crossable anywhere
     int sp = riverSideAt(pos), sg = riverSideAt(goal);
     if (sp == 2 && sg == 2) return goal;
     if (sg == 2) {
@@ -5940,7 +5961,7 @@ Vector2f crossingAim(Vector2f pos, Vector2f goal) {
     }
     if (sp == 2) {
         int row = riverRowAt(pos);
-        if (riverWet[riverCellAt(pos)] == 2)
+        if (riverWet[riverCellAt(pos)] == riverCell::ford)
             for (auto& f : fords)
                 if (row >= f.row0 && row < f.row0 + kFordRows) return f.bank[sg];
         float out = sg == 0 ? riverLo[row] * trailCellSize - 1.0f : (riverHi[row] + 1) * trailCellSize + 1.0f;
@@ -5954,6 +5975,7 @@ Vector2f crossingAim(Vector2f pos, Vector2f goal) {
         float len = hypot(a.x, a.y) + hypot(b.x, b.y);
         if (len < bestLen) { bestLen = len; best = k; }
     }
+    if (riverState == riverFlooded) return fords[best].bank[sp];   // R62-F2: fords closed: wait on the near bank
     Vector2f d = fords[best].bank[sp] - pos;
     return d.x * d.x + d.y * d.y <= kFordEnterPx * kFordEnterPx ? fords[best].bank[sg] : fords[best].bank[sp];
 }
@@ -5964,11 +5986,11 @@ Vector2f crossingAim(Vector2f pos, Vector2f goal) {
 Vector2f riverGuard(Vector2f pos, Vector2f d, Vector2f goal) {
     if (!riverPlaced) return d;
     int cur = riverCellAt(pos);
-    if (riverWet[cur] == 1 || riverWet[riverCellAt(pos + d)] != 1 || riverWet[riverCellAt(goal)] == 1) return d;
+    if (!crossable(riverWet[cur], true) || crossable(riverWet[riverCellAt(pos + d)], true) || !crossable(riverWet[riverCellAt(goal)], true)) return d;
     float al = riverAlong(d);
     if (fabs(al) > 0.001f) {
         Vector2f s = riverPoint(al > 0.0f ? 1.0f : -1.0f, 0.0f);
-        if (riverWet[riverCellAt(pos + s)] != 1) return s;
+        if (crossable(riverWet[riverCellAt(pos + s)], true)) return s;
     }
     int side = riverSide[cur];
     float away = side == 0 ? -1.0f : side == 1 ? 1.0f : (riverAcross(d) > 0.0f ? -1.0f : 1.0f);
@@ -17133,7 +17155,7 @@ bool riverCarve(uint32_t seed) {
         for (int x = 0; x < N; x++) {
             int c = riverCellOf(i, x);
             bool in = x >= riverLo[i] && x <= riverHi[i];
-            riverWet[c] = in ? (ford ? 2 : 1) : 0;
+            riverBase[c] = riverWet[c] = in ? (ford ? riverCell::ford : riverCell::water) : riverCell::dry;
             riverSide[c] = in ? 2 : x < riverLo[i] ? 0 : 1;
         }
     }
@@ -17160,7 +17182,7 @@ bool riverWalkTest(Vector2f from, Vector2f to) {
         Vector2f m = pathStep(p, to);
         if (m.x == 0.0f && m.y == 0.0f) return false;
         p += m;
-        if (riverWet[riverCellAt(p)] == 1) return false;
+        if (!crossable(riverWet[riverCellAt(p)], true)) return false;
     }
     return false;
 }
@@ -17174,7 +17196,7 @@ bool riverCheck() {
     vector<int> stack{riverCellAt(villageCenter)};
     seen[stack[0]] = 1;
     int reached = 0, open = 0;
-    for (int c = 0; c < N * N; c++) if (riverWet[c] != 1) open++;
+    for (int c = 0; c < N * N; c++) if (crossable(riverWet[c], true)) open++;
     while (!stack.empty()) {
         int c = stack.back();
         stack.pop_back();
@@ -17184,7 +17206,7 @@ bool riverCheck() {
         for (int k = 0; k < 4; k++) {
             if (nx[k] < 0 || ny[k] < 0 || nx[k] >= N || ny[k] >= N) continue;
             int m = ny[k] * N + nx[k];
-            if (seen[m] || riverWet[m] == 1) continue;
+            if (seen[m] || !crossable(riverWet[m], true)) continue;
             seen[m] = 1;
             stack.push_back(m);
         }
@@ -17222,7 +17244,8 @@ void spawnRiver() {
         riverPlaced = false;
         printf("River: seed %u offset %d failed the check, trying the next offset\n", riverSeed, t);
     }
-    fill(riverWet.begin(), riverWet.end(), 0);
+    fill(riverWet.begin(), riverWet.end(), riverCell::dry);
+    fill(riverBase.begin(), riverBase.end(), riverCell::dry);
     fill(riverSide.begin(), riverSide.end(), 0);
     printf("River: no layout passed in %d tries, none this game\n", kRiverGenTries);
 }
@@ -17376,8 +17399,12 @@ void drawLakes(RenderWindow& window) {
 // R61-F3: the river's static quads, built once after spawnRiver(), in lake style: a lakeBankPx bank round every band
 // cell (pale gravel on the ford rows), then 8px water cells in a near-flat muted checker, then the fords as lighter
 // shallows with two pale 3x2 stepping stones per cell (each with a 1px wet underside), mirrored on alternate cells.
+// R62-F2: rebuilt by riverApplyState() on every season state change. One colour per cell state: ice is a pale checker
+// (stones hidden) with thin crack quads in riverCrackVerts on about a third of the cells; flood is a murky deep-blue
+// checker with a silt streak. Banks follow riverBase, so the ford rows keep their gravel landings in every state.
 void buildRiverVerts() {
     riverVerts.clear();
+    riverCrackVerts.clear();
     if (!riverPlaced) return;
     const int N = trailGridN;
     const float cell = trailCellSize;
@@ -17385,12 +17412,29 @@ void buildRiverVerts() {
     auto cellPos = [&](int c) { return Vector2f((c % N) * cell, (c / N) * cell); };
     for (int pass = 0; pass < 2; pass++)   // plain banks, then ford banks over them
         for (int c = 0; c < N * N; c++)
-            if (riverWet[c] == (pass == 0 ? 1 : 2)) pushQuad(riverVerts, cellPos(c) - bank, tile + 2.0f * bank, pass == 0 ? lakeBankColor : kFordBankColor);
+            if (riverBase[c] == (pass == 0 ? riverCell::water : riverCell::ford)) pushQuad(riverVerts, cellPos(c) - bank, tile + 2.0f * bank, pass == 0 ? lakeBankColor : kFordBankColor);
     for (int c = 0; c < N * N; c++) {
-        if (riverWet[c] == 0) continue;
+        if (riverWet[c] == riverCell::dry) continue;
         Vector2f p = cellPos(c);
         int cx = c % N, cy = c / N;
-        if (riverWet[c] == 1) { pushQuad(riverVerts, p, tile, (cx + cy) % 2 == 0 ? kRiverWaterA : kRiverWaterB); continue; }
+        if (riverWet[c] == riverCell::water) { pushQuad(riverVerts, p, tile, (cx + cy) % 2 == 0 ? kRiverWaterA : kRiverWaterB); continue; }
+        if (riverWet[c] == riverCell::ice) {
+            pushQuad(riverVerts, p, tile, (cx + cy) % 2 == 0 ? kRiverIceA : kRiverIceB);
+            if ((cx * 7 + cy * 13) % 3 != 0) continue;
+            bool mirror = (cx + cy) % 2 != 0;   // a 1px staircase crack, mirrored on alternate cells
+            const Vector2f at[3] = {Vector2f(1.0f, 2.0f), Vector2f(3.0f, 3.0f), Vector2f(5.0f, 4.0f)};
+            const Vector2f sz[3] = {Vector2f(2.0f, 1.0f), Vector2f(2.0f, 1.0f), Vector2f(1.0f, 2.0f)};
+            for (int k = 0; k < 3; k++) {
+                Vector2f o = mirror ? Vector2f(cell - at[k].x - sz[k].x, at[k].y) : at[k];
+                pushQuad(riverCrackVerts, p + o, sz[k], kRiverIceCrack);
+            }
+            continue;
+        }
+        if (riverWet[c] == riverCell::flood) {
+            pushQuad(riverVerts, p, tile, (cx + cy) % 2 == 0 ? kRiverFloodA : kRiverFloodB);
+            pushQuad(riverVerts, p + Vector2f((cx + cy) % 2 == 0 ? 1.0f : 4.0f, (cx % 2 == 0) ? 2.0f : 5.0f), Vector2f(3.0f, 1.0f), kRiverFloodSilt);
+            continue;
+        }
         pushQuad(riverVerts, p, tile, kFordWaterColor);
         bool flip = (cx + cy) % 2 != 0;
         const Vector2f stones[2] = {Vector2f(flip ? 4.0f : 1.0f, 1.0f), Vector2f(flip ? 1.0f : 4.0f, 5.0f)};
@@ -17405,6 +17449,101 @@ void buildRiverVerts() {
 // R61-F3: ground layer, straight after the lakes (over trails and paving, under rocks, trees, buildings and barbs)
 void drawRiver(RenderWindow& window) {
     if (riverVerts.getVertexCount() > 0) window.draw(riverVerts);
+    if (riverState == riverIced && riverCrackTicks > 0 && riverCrackVerts.getVertexCount() > 0) {   // R62-F2: fading cracks
+        uint8_t a = (uint8_t)(255.0f * riverCrackTicks / kIceCrackTicks);
+        for (size_t v = 0; v < riverCrackVerts.getVertexCount(); v++) riverCrackVerts[v].color.a = a;
+        window.draw(riverCrackVerts);
+    }
+}
+
+// R62-F2: the river's state for the current day: iced all winter, flooded fords on the first spring day after a winter
+// (not the opening spring of a new game), normal otherwise
+riverSeasonState riverWantState() {
+    if (isWinter()) return riverIced;
+    if (seasonOf(game_day) == seasonSpring && dayInSeason(game_day) == 0 && game_day >= yearDays) return riverFlooded;
+    return riverNormal;
+}
+
+// R62-F2: rewrites every live cell from the carved layout for state s and rebuilds the quads
+void riverApplyState(riverSeasonState s) {
+    riverState = s;
+    for (int c = 0; c < trailGridN * trailGridN; c++) {
+        riverCell base = riverBase[c];
+        if (base == riverCell::dry) riverWet[c] = riverCell::dry;
+        else if (s == riverIced) riverWet[c] = riverCell::ice;
+        else if (s == riverFlooded && base == riverCell::ford) riverWet[c] = riverCell::flood;
+        else riverWet[c] = base;
+    }
+    buildRiverVerts();
+}
+
+// R62-F2: once per sim tick, after clockk(). Applies the day's river state when it changes (so a loaded save picks it
+// up on its first tick); after a thaw or flood every barb standing in closed water is moved to the nearest dry/ford cell
+// within kRiverBankSearchCells, its path and moving/chopping/building/movingbspot flags cleared (work it held is
+// released bellTick-style, so claims and reservations are freed), with one ticker line for the lot.
+void riverSeasonTick(vector<barb>& barbs, vector<RectangleShape>& squares, storehouse (&stores)[raceCount], smokehouseSet& sh,
+                     forge& fg, fieldGrid& fields, vector<tree>& trees, const vector<CircleShape>& tris, vector<rock>& rocks,
+                     const vector<CircleShape>& octs, vector<bush>& bushes) {
+    if (!riverPlaced) return;
+    static bool first = true;
+    if (riverCrackTicks > 0) riverCrackTicks--;
+    riverSeasonState want = riverWantState();
+    if (!first && want == riverState) return;
+    riverSeasonState was = riverState;
+    riverApplyState(want);
+    if (want == riverIced && was != riverIced && !first) riverCrackTicks = kIceCrackTicks;
+    first = false;
+    printf("RIVER - %s (day %d)\n", want == riverIced ? "frozen over" : want == riverFlooded ? "fords flooded" : "open water, fords open", game_day + 1);
+    if (want == riverIced) return;
+    const int N = trailGridN;
+    int pushed = 0;
+    for (int i = 0; i < (int)barbs.size() && i < (int)squares.size(); i++) {
+        barb& b = barbs[i];
+        if (barbHidden(b) || b.inMine) continue;
+        Vector2f pos = squares[i].getPosition();
+        int c = riverCellAt(pos);
+        if (crossable(riverWet[c], true)) continue;
+        int cx = c % N, cy = c / N, best = -1;
+        float bestDSq = 0.0f;
+        for (int dy = -kRiverBankSearchCells; dy <= kRiverBankSearchCells; dy++)
+            for (int dx = -kRiverBankSearchCells; dx <= kRiverBankSearchCells; dx++) {
+                int x = cx + dx, y = cy + dy;
+                if (x < 0 || y < 0 || x >= N || y >= N) continue;
+                int m = y * N + x;
+                if (riverWet[m] != riverCell::dry && riverWet[m] != riverCell::ford) continue;
+                Vector2f d = Vector2f((x + 0.5f) * trailCellSize, (y + 0.5f) * trailCellSize) - pos;
+                float dSq = d.x * d.x + d.y * d.y;
+                if (best < 0 || dSq < bestDSq) { best = m; bestDSq = dSq; }
+            }
+        if (best < 0) continue;
+        if (b.chopping || b.movingbspot || b.building) {   // drop the work the way bellTick() does
+            if (b.chopping && b.target == targetNone)
+                for (int k = 0; k < (int)trees.size() && k < (int)tris.size(); k++) {
+                    Vector2f p = tris[k].getPosition() + treeWorkOffset;
+                    if ((int)p.x == b.targetx && (int)p.y == b.targety) { trees[k].dying = false; break; }
+                }
+            if (b.chopping && b.target == targetRock)
+                for (int k = 0; k < (int)rocks.size() && k < (int)octs.size(); k++) {
+                    Vector2f p = octs[k].getPosition() + rockWorkOffset;
+                    if ((int)p.x == b.targetx && (int)p.y == b.targety) { rocks[k].dying = false; break; }
+                }
+            if (b.chopping && b.target == targetBush && b.targetBush >= 0 && b.targetBush < (int)bushes.size())
+                bushes[b.targetBush].picking = false;
+            releaseBarbWork(b, sh, fg, stores, fields);
+            b.target = targetNone;
+            b.targetBush = b.targetShore = -1;
+            b.wanderX = b.wanderY = -1;
+        }
+        b.moving = b.chopping = b.building = b.movingbspot = false; clearRoute(b);
+        b.stepTimer = 0;
+        squares[i].setPosition(Vector2f(((best % N) + 0.5f) * trailCellSize - 1.0f, ((best / N) + 0.5f) * trailCellSize - 1.0f));
+        pushed++;
+    }
+    if (pushed > 0) {
+        printf("RIVER PUSH - %d barbs moved to the bank\n", pushed);
+        logEvent(string(was == riverIced ? "The thaw drives " : "The flood drives ") + to_string(pushed)
+                 + (pushed == 1 ? " barb" : " barbs") + " to the bank", kRiverTickerTint);
+    }
 }
 
 // R30-F1: true if p is within dist of any race quarter's centre
@@ -18877,6 +19016,7 @@ int main() {
                         marriageDawn(barbs, squares, houses, stores);   // R59-F1: a leader's child may set out to wed
                     }
                 }
+                riverSeasonTick(barbs, squares, stores, smoke, dwarfForge, fields, trees, tris, rocks, octs, bushes);   // R62-F2: after clockk(), so ice/flood land at the midnight
                 weatherTick();
                 stormTick(trees, tris, stumps, barbs, fields, houses);   // R57-F3: after weatherTick, so a summer rain's first tick schedules its strike
                 relationTick();   // R51-F4: drift to neutral and clash cooldowns, before the trader prices a visit
