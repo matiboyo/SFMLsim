@@ -2446,6 +2446,21 @@ const Color kBridgeSootColor(22, 18, 16);          // laid over the deck, alpha 
 const float kBridgeSootMaxAlpha = 190.0f;
 const Color kBridgeStumpColor(46, 40, 36);         // 2x2 charred stumps where the posts and two pilings per rail stood
 const Color kBridgeStumpAshColor(84, 76, 68);      // 1px ash fleck on each stump's corner
+// R63-F3 Spring Salmon Run: once a year, on the spring day after the flood (dayInSeason kRunDay), from kRunStartHour to
+// kRunEndHour, kRunFishCount silver dashes swim slowly upstream along the river and the river's bank spots (runBanks,
+// rebuilt by riverApplyState() whenever ice/flood/bridges change the cells) join the fishing spots, a catch there
+// yielding kRunFishBonus extra food. Every end (normal or the river icing over) goes through endRun().
+const int kRunDay = 1;                             // spring day 0 is the flood; the run follows the day after
+const int kRunStartHour = nightEndHour;            // dawn
+const int kRunEndHour = nightStartHour;            // dusk
+const int kRunFishCount = 6;                       // hard cap on drawn fish
+const float kRunFishSpeed = 0.05f;                 // px per sim tick upstream (~3px/s at 1x): slow and steady
+const float kRunFishWeavePx = 1.0f;                // gentle sideways weave amplitude
+const float kRunFishWeaveRate = 0.02f;             // radians per tick of the weave
+const float kRunFishLaneFrac = 0.2f;            // lanes kept within this fraction of the band width from its centre
+const Color kRunFishColor(192, 200, 208, 230);     // silver, well above the river blue (62, 97, 138) and ford (88, 118, 148)
+const int kRunBankStride = 3;                      // one bank spot per this many river rows, on each bank
+const int kRunFishBonus = 1;                       // extra food per catch at a river bank spot during the run (lake: 1)
 
 // Far Reaches (R45-F1b): one ruin site far out from the village (placed once at startup by spawnRuins, after the
 // quarters, lakes and bushes), a ridge of ordinary mineable rocks arcing behind it, and one lean-to camp per race beside
@@ -3862,6 +3877,15 @@ int bridgeOnFord(int k) {
 // R62-F2c: whole and walkable (not alight, not charred stumps)
 bool bridgeStanding(const riverBridge& br) { return br.burnLeft <= 0 && br.charLeft <= 0; }
 bool fordBridged(int k) { int i = bridgeOnFord(k); return i >= 0 && bridgeStanding(bridges[i]); }
+// R63-F3: river bank fishing spots (same 1px shore-point convention as shorePoints; dir indexes shoreWaterDir's table),
+// rebuilt by runBankRebuild() from riverApplyState(). While the run is on they follow shorePoints in one index space:
+// shore index k >= shorePoints.size() is runBanks[k - shorePoints.size()].
+struct runBankSpot {Vector2f p; int dir = 0;};
+vector<runBankSpot> runBanks;
+struct salmonRun {bool active = false; int year = -1; int age = 0;};   // age: sim ticks since the run began (drives the fish)
+salmonRun salmon;
+int shoreCount() { return (int)shorePoints.size() + (salmon.active ? (int)runBanks.size() : 0); }
+bool isRunBank(int k) { return k >= (int)shorePoints.size() && k < shoreCount(); }
 
 int riverCellAt(Vector2f p) {
     int cx = clamp((int)floor(p.x / trailCellSize), 0, trailGridN - 1), cy = clamp((int)floor(p.y / trailCellSize), 0, trailGridN - 1);
@@ -7087,14 +7111,17 @@ Color hungryTint(Color c) {
 }
 
 // Direction from shore point k toward its water. spawnLakes() pushes each lake's points as top, bottom, left, right.
+// R63-F3: k past the lake points is a salmon-run river bank spot carrying its own direction.
 Vector2f shoreWaterDir(int k) {
     static const Vector2f dirs[4] = {{0.0f, 1.0f}, {0.0f, -1.0f}, {1.0f, 0.0f}, {-1.0f, 0.0f}};
-    return dirs[k % 4];
+    if (isRunBank(k)) return dirs[runBanks[k - (int)shorePoints.size()].dir & 3];
+    return dirs[max(k, 0) % 4];
 }
+Vector2f shorePointAt(int k) { return isRunBank(k) ? runBanks[k - (int)shorePoints.size()].p : shorePoints[k]; }
 
 // Hitbox top-left for an angler at shore point k: the body sits wholly on the bank, its water-facing edge on the point.
 Vector2f shoreStandSpot(int k, Vector2f bodySize) {
-    Vector2f p = shorePoints[k], w = shoreWaterDir(k);
+    Vector2f p = shorePointAt(k), w = shoreWaterDir(k);
     float x = w.x < 0.0f ? p.x : (w.x > 0.0f ? p.x - bodySize.x + 1.0f : p.x);
     float y = w.y < 0.0f ? p.y : p.y - bodySize.y + 1.0f;
     return Vector2f(x, y);
@@ -7329,7 +7356,7 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
 
         float side = base.x + bodySize.x;                // tool/arm sits just right of the body
         tool.setFillColor(tc);
-        if (b.chopping && b.target == targetLake && b.targetShore >= 0 && b.targetShore < (int)shorePoints.size()) {
+        if (b.chopping && b.target == targetLake && b.targetShore >= 0 && b.targetShore < shoreCount()) {
             fishPose f = fishPoseOf(b, squares[i]);
             Vertex line[2] = {Vertex{f.tip + Vector2f(0.5f, 0.5f), fishLineColor}, Vertex{f.lineEnd + Vector2f(0.5f, 0.5f), fishLineColor}};
             window.draw(line, 2, PrimitiveType::Lines);   // hairline under the rod so the tip pixel stays solid
@@ -11045,6 +11072,7 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
     resetHollowHunt(barbs);   // R62-F3b: nor the joint hunt
     resetGathers(barbs);      // R63-F5a: nor any gathering
     resetVigil();             // R63-F5: nor a vigil, nor its morale lift
+    salmon = salmonRun{};     // R63-F3: nor a salmon run (anglers on its banks quit through the fish path's range check)
     if (d.barbs.empty()) {
         for (auto& b : barbs) b.bornHour = chronicleNowHour() - founderAgeHours();   // founders arrive on the restored clock (R57-F1: grown)
         printf("CHRONICLE - no barbs saved: the %d founders stay\n", (int)barbs.size());
@@ -17295,7 +17323,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
     vector<int> treeClaim, rockClaim;   // parallel to trees/tris and rocks/octs for this tick
     buildWorkClaims(barbs, tris, octs, treeClaim, rockClaim);
     treeGridRebuild(tris);   // R47-F1: picks up every tree add/remove since last tick; chops below mark it stale
-    vector<int> shoreClaim(shorePoints.size(), -1);   // rebuilt every tick like the tree/rock claims, so no stale anglers
+    vector<int> shoreClaim(shoreCount(), -1);   // rebuilt every tick like the tree/rock claims, so no stale anglers (R63-F3: + run banks)
     for (int j = 0; j < (int)barbs.size(); j++) {
         int k = barbs[j].targetShore;
         if (barbs[j].target == targetLake && k >= 0 && k < (int)shoreClaim.size() && shoreClaim[k] == -1) shoreClaim[k] = j;
@@ -17584,9 +17612,10 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             // Nothing to chop, mine or pick in reach: walk to the nearest free shore point and fish
             if (best == -1 && !bestIsBush && !b.moving && !b.deertargeting) {
                 Vector2f size = sq.getSize();
-                int k = findNearest(bpos, fishSearchRadius, (int)shorePoints.size(),
+                int k = findNearest(bpos, fishSearchRadius, shoreCount(),
                                     [&](int s) { return shoreStandSpot(s, size); },
-                                    [&](int s) { return shoreClaim[s] != -1 && shoreClaim[s] != j; });
+                                    [&](int s) { return (shoreClaim[s] != -1 && shoreClaim[s] != j)
+                                                        || (isRunBank(s) && riverSideAt(shorePointAt(s)) != riverSideAt(bpos)); });   // R63-F3: own bank only
                 if (k != -1) {
                     Vector2f sp = shoreStandSpot(k, size);
                     b.targetx = (int)sp.x;
@@ -17657,7 +17686,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 b.target = targetNone;
                 b.targetShore = -1;
             };
-            if (k < 0 || k >= (int)shorePoints.size()) { quit(); continue; }
+            if (k < 0 || k >= shoreCount()) { quit(); continue; }   // R63-F3: a run bank spot is gone once the run ends
             Vector2f sp = shoreStandSpot(k, sq.getSize());
             if (b.targetx != (int)sp.x || b.targety != (int)sp.y) { quit(); continue; } // retargeted elsewhere
             float dx = sp.x - bpos.x, dy = sp.y - bpos.y;
@@ -17665,10 +17694,11 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             b.chopping = true;
             if (workTick(b)) b.timer++;
             if (b.timer >= fishCatchTicks) {
-                stockOf(b).food += fishFoodYield;   // RACE-F1: the angler's race
+                bool salmonCatch = isRunBank(k);   // R63-F3: a river bank spot during the run
+                stockOf(b).food += fishFoodYield + (salmonCatch ? kRunFishBonus : 0);   // RACE-F1: the angler's race
                 catchRings.push_back({fishPoseOf(b, sq).lineEnd + Vector2f(0.5f, 0.5f)});
                 quit();
-                printf("FISH CAUGHT - %s food: %d\n", racePlurals[clampRace(b.race)], stockOf(b).food);
+                printf("%s CAUGHT - %s food: %d\n", salmonCatch ? "SALMON" : "FISH", racePlurals[clampRace(b.race)], stockOf(b).food);
             }
             continue;
 	}
@@ -18636,8 +18666,40 @@ void buildRiverVerts() {
 }
 
 // R61-F3: ground layer, straight after the lakes (over trails and paving, under rocks, trees, buildings and barbs)
+// R63-F3: the across centre of the band at along px a, linearly between row centres so a fish never jumps a cell
+float riverCentreAt(float a) {
+    const int N = trailGridN;
+    float t = a / trailCellSize - 0.5f;
+    int i0 = clamp((int)floor(t), 0, N - 1), i1 = min(i0 + 1, N - 1);
+    float f = clamp(t - (float)i0, 0.0f, 1.0f);
+    float c0 = (riverLo[i0] + riverHi[i0] + 1) * 0.5f * trailCellSize, c1 = (riverLo[i1] + riverHi[i1] + 1) * 0.5f * trailCellSize;
+    return c0 + (c1 - c0) * f;
+}
+
+// R63-F3: kRunFishCount 2x1 silver dashes (long side with the flow), spread evenly along the whole river and swimming
+// upstream (toward along 0) at kRunFishSpeed, each in its own lane with a slow 1px weave. Positions come from salmon.age
+// alone (no per-fish state). Drawn over the water and under the bridges, so a deck covers a fish passing beneath.
+void drawSalmon(RenderWindow& window) {
+    if (!salmon.active || riverState != riverNormal) return;
+    static VertexArray fish(PrimitiveType::Triangles);
+    fish.clear();
+    const float len = trailGridN * trailCellSize;
+    const float lanes[kRunFishCount] = {-0.6f, 0.4f, -0.1f, 0.8f, -0.9f, 0.2f};   // fixed, in units of kRunFishLaneFrac
+    float bandW = kRiverWidthCells * trailCellSize;
+    for (int k = 0; k < kRunFishCount; k++) {
+        float a = fmod(len * (k + 0.37f * (k % 2)) / kRunFishCount - salmon.age * kRunFishSpeed, len);
+        if (a < 0.0f) a += len;
+        if (a < trailCellSize || a > len - 2.0f * trailCellSize) continue;   // off the map ends
+        float across = riverCentreAt(a) + lanes[k] * kRunFishLaneFrac * bandW
+                       + kRunFishWeavePx * sin(salmon.age * kRunFishWeaveRate + k * 1.7f);
+        pushQuad(fish, riverPoint(floor(a), floor(across)), riverPoint(2.0f, 1.0f), kRunFishColor);
+    }
+    if (fish.getVertexCount() > 0) window.draw(fish);
+}
+
 void drawRiver(RenderWindow& window) {
     if (riverVerts.getVertexCount() > 0) window.draw(riverVerts);
+    drawSalmon(window);   // R63-F3
     if (riverState == riverIced && riverCrackTicks > 0 && riverCrackVerts.getVertexCount() > 0) {   // R62-F2: fading cracks
         uint8_t a = (uint8_t)(255.0f * riverCrackTicks / kIceCrackTicks);
         for (size_t v = 0; v < riverCrackVerts.getVertexCount(); v++) riverCrackVerts[v].color.a = a;
@@ -18655,6 +18717,28 @@ riverSeasonState riverWantState() {
 
 // R62-F2: rewrites every live cell from the carved layout for state s and rebuilds the quads. R62-F2b: then every
 // standing bridge's ford cells become riverCell::bridge, whatever the season (call again after a bridge is added/removed)
+// R63-F3: every kRunBankStride-th river row, the dry cell just past each edge of the band gets one fishing spot when the
+// band cell beside it is open water (not ford, ice, flood or bridge). The point sits lakeBankPx + lakeShorePx out from the
+// water's edge at the row's middle, exactly as spawnLakes() places shorePoints, so shoreStandSpot() and the rod work as is.
+void runBankRebuild() {
+    runBanks.clear();
+    if (!riverPlaced) return;
+    const int N = trailGridN;
+    const float cell = trailCellSize, edge = lakeBankPx + lakeShorePx;
+    for (int i = 1; i < N - 1; i += kRunBankStride) {
+        int lo = riverLo[i], hi = riverHi[i];
+        if (lo < 1 || hi > N - 2) continue;
+        float along = round((i + 0.5f) * cell);
+        for (int s = 0; s < 2; s++) {
+            int water = s == 0 ? lo : hi, bank = s == 0 ? lo - 1 : hi + 1;
+            if (riverWet[riverCellOf(i, water)] != riverCell::water || riverWet[riverCellOf(i, bank)] != riverCell::dry) continue;
+            float across = s == 0 ? lo * cell - edge : (hi + 1) * cell + edge - 1.0f;
+            int dir = riverVertical ? (s == 0 ? 2 : 3) : (s == 0 ? 0 : 1);   // toward the water, in shoreWaterDir's table
+            runBanks.push_back({riverPoint(along, across), dir});
+        }
+    }
+}
+
 void riverApplyState(riverSeasonState s) {
     riverState = s;
     for (int c = 0; c < trailGridN * trailGridN; c++) {
@@ -18663,6 +18747,39 @@ void riverApplyState(riverSeasonState s) {
         for (auto& br : bridges) if (bridgeStanding(br) && fordHasCell(br.ford, c)) riverWet[c] = riverCell::bridge;   // R62-F2c
     }
     buildRiverVerts();
+    runBankRebuild();   // R63-F3: ice, flood and bridges all change which bank spots face open water
+}
+
+// R63-F3: the one way a salmon run ends. Dropping salmon.active shrinks shoreCount(), so every angler on a run bank spot
+// quits through the fish path's range check on its next tick (claims are rebuilt each tick; nothing else is stored).
+void endRun(bool early) {
+    if (!salmon.active) return;
+    salmon.active = false;
+    salmon.age = 0;
+    printf("SALMON RUN - %s (day %d)\n", early ? "ended early, the river iced over" : "over", game_day + 1);
+    if (early) logEvent("The river ices over - the salmon run ends early", kRiverTickerTint);
+}
+
+// R63-F3: once per sim tick, after riverSeasonTick() (so a state change this tick is already applied). Starts the year's
+// run on spring day kRunDay between kRunStartHour and kRunEndHour if the river is open water; ends it at kRunEndHour or
+// the day's end, or early if the river ices.
+void runTick() {
+    if (!riverPlaced) { endRun(false); return; }
+    bool inRun = seasonOf(game_day) == seasonSpring && dayInSeason(game_day) == kRunDay
+                 && game_time >= kRunStartHour && game_time < kRunEndHour;
+    if (salmon.active) {
+        if (riverState == riverIced) { endRun(true); return; }
+        if (!inRun) { endRun(false); return; }
+        salmon.age++;
+        return;
+    }
+    int year = game_day / yearDays;
+    if (!inRun || salmon.year == year || riverState != riverNormal || runBanks.empty()) return;
+    salmon.active = true;
+    salmon.year = year;
+    salmon.age = 0;
+    printf("SALMON RUN - %zu bank spots open (day %d)\n", runBanks.size(), game_day + 1);
+    logEvent("Salmon run up the river - good fishing from the banks", kRiverTickerTint);
 }
 
 // R62-F2 (R62-F2c: shared with the bridge torch): every barb whose cell satisfies onClosed(cell) is moved to the nearest
@@ -20336,6 +20453,7 @@ int main() {
                 }
                 vigilTick(barbs, squares);   // R63-F5: after clockk(): the year's first dusk lights the graveside vigil
                 riverSeasonTick(barbs, squares, stores, smoke, dwarfForge, fields, trees, tris, rocks, octs, bushes);   // R62-F2: after clockk(), so ice/flood land at the midnight
+                runTick();   // R63-F3: after riverSeasonTick(), so the run sees this tick's river state
                 bridgeTorchTick(barbs, squares, stores, smoke, dwarfForge, fields, trees, tris, rocks, octs, bushes);   // R62-F2c: burn timers, a won raid's torch
                 weatherTick();
                 snowTick();   // R63-F1: snow lying + footprint ageing, right after the weather turns
