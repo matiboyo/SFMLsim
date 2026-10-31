@@ -592,6 +592,24 @@ const int graveGlowTicks = 90;                    // brighten fades out over thi
 const Color graveGlowColor(232, 228, 212);        // pale stone the colour lifts toward while lit
 const float graveGlowMix = 0.45f;                 // at full glow
 const float graveSpreadPx = 4.0f;                 // a stone landing on another is nudged right by this much (a few tries)
+// R63-F5 Graveside Vigil: at the year turn (clockk) each race with a stone raised in the year just ended holds a vigil
+// on the first dusk of the new year: a tiny candle beside each of that year's stones (hero stones a taller flame, the
+// newest brightest) and a few idle mourners ringed round the newest stone via gatherIdleAt(). A race with no such stone
+// is skipped with no ticker line. A vigil with mourners leaves a small vigilMorale[r] that decays linearly to zero.
+const int kVigilEndHour = 23;                     // candles burn nightStartHour..kVigilEndHour-1 on the year's first day
+const int kVigilMourners = 6;                     // idle barbs called to the newest stone (<= kGatherSlots)
+const int kVigilTickerNames = 3;                  // names in the ticker line at most; the rest are "and N more"
+const float kVigilMorale = 0.02f;                 // the lift a held vigil adds to the race's grave morale term (half graveMoraleMax)
+const int kVigilMoraleTicks = 48 * realMinutesPerGameHour * ticksPerMinute;   // ...decaying linearly to 0 over 2 game days
+const Vector2f kVigilWaxSize(1.0f, 2.0f);         // candle stub, 1px right of the stone's foot (bonfire flame is 4x4)
+const Color kVigilWaxColor(206, 198, 176);        // old wax cream, a shade under graveGlowColor
+const Color kVigilFlameBright(255, 214, 128);     // the newest stone's flame
+const Color kVigilFlameDim(222, 160, 84);         // the other stones' flames (and the newest's flicker low)
+const Color kVigilGlowColor(110, 72, 28);         // additive halo tint (alpha set per candle)
+const uint8_t kVigilGlowNewestAlpha = 70;         // halo strength: newest stone...
+const uint8_t kVigilGlowAlpha = 36;               // ...and the rest
+const int kVigilFlickerFrames = 9;                // drawn frames per flicker step
+const Color kVigilTickerTint(226, 198, 150);      // warm candle cream on the black ticker strip
 // R56-F3 Deeds and Legends (phase 1): kills and raid wins add renown, a plain barb field that moves with the struct on
 // every swapRemove(barbs, i). At kTitleRenown a barb is hailed with a title (fixed char[], written only through snprintf)
 // once, with one ticker line; at most kTitleMaxLiving titled barbs live at once, so titles stay rare. A titled barb's
@@ -5980,6 +5998,32 @@ void deerwander(world& wd, const vector<RectangleShape>& squares, const vector<b
     }
 }
 
+// R63-F5: vigil state. Holds race, year and a grave index (validated against race/year every tick, never trusted
+// across a grave eviction) plus the mourners' barb ids. Never saved: resetVigil() on a chronicle load.
+struct vigilState {
+    bool due = false;                       // set by vigilYearTurn() at the year edge; consumed at that day's dusk
+    int year = -1;                          // the year mourned (game_day / yearDays at death), -1 = none
+    bool lit[raceCount] = {};               // race r's candles are burning
+    int focus[raceCount] = {};              // index into graves of r's newest stone of that year (re-checked every tick)
+    int ids[raceCount][kGatherSlots] = {};  // mourners' barb ids, -1 = none
+};
+vigilState vigil;
+float vigilMorale[raceCount] = {};          // the decaying lift, added to graveMorale by graveTick() (wonderMorale does not decay)
+
+// R63-F5: the year edge, from clockk(): the year just ended is the one mourned at the coming dusk
+void vigilYearTurn() {
+    vigil.due = true;
+    vigil.year = game_day / yearDays - 1;
+    printf("VIGIL - year %d turns; vigils at dusk for year %d's dead\n", game_day / yearDays + 1, vigil.year + 1);
+}
+
+// R63-F5: on a chronicle load (gatherers are already released by resetGathers()): no vigil, no lift carried over
+void resetVigil() {
+    vigil = vigilState{};
+    for (auto& row : vigil.ids) for (auto& id : row) id = -1;
+    for (auto& m : vigilMorale) m = 0.0f;
+}
+
 int clockk() {
     static int timer = 0;
     if (++timer >= ticksPerGameHour) {
@@ -5994,6 +6038,7 @@ int clockk() {
                 printf("SEASON - %s (day %d, year %d)\n", seasonDefs[now].name, game_day + 1, game_day / yearDays + 1);
                 logEvent(seasonDefs[now].arrivalLine, seasonDefs[now].ticker);
             }
+            if (game_day % yearDays == 0 && game_day > 0) vigilYearTurn();   // R63-F5: the year edge
         }
         if (game_time == nightEndHour && seasonOf(game_day) == seasonAutumn && dayInSeason(game_day) == daysPerSeason - 1)
             logEvent(frostLine, seasonDefs[seasonWinter].ticker);   // R51-F3: once, at dawn of autumn's last day
@@ -6625,6 +6670,8 @@ struct grave {
     bool hero = false;   // R56-F3: the barb held a title; stone is kHeroGraveH tall, growing up from the same base
     Color tint = graveStoneColor;   // R57-F1: stone colour, set once in addGrave() (race-tinted, or kElderGraveColor for
                                     // an elder); a plain field, so it moves with the stone on every erase/eviction
+    const char* name = "";          // R63-F5: the barb's name (points into barbNames, static), for the vigil ticker
+    int year = 0;                   // R63-F5: game_day / yearDays when it was raised
 };
 vector<grave> graves;                      // oldest first, at most graveMax
 float graveMorale[raceCount] = {};          // the one morale term per race, recomputed by graveTick() every tick
@@ -6851,6 +6898,8 @@ void addGrave(const barb& b, const RectangleShape& sq) {
     g.pos = p;
     g.race = clampRace(b.race);
     g.hero = hero;
+    g.name = b.name ? b.name : "";   // R63-F5
+    g.year = game_day / yearDays;
     bool elder = lifeStage(b) == stageElder;   // R57-F1: an elder's stone is plain grey
     g.tint = plagueGraveNext ? kPlagueGraveColor   // R59-F2: a plague victim's stone is dark, over the elder grey
            : elder ? kElderGraveColor : lerpColor(graveStoneColor, raceEventColors[g.race], graveRaceTint);
@@ -6876,12 +6925,18 @@ void graveTick(const vector<barb>& barbs, const vector<RectangleShape>& squares)
         }
     }
     for (int r = 0; r < raceCount; r++) {
-        graveMorale[r] = min(graveMoraleMax, own[r] * graveMoralePerStone) + wonderMorale(r);   // R60-F3: small wonder perk
+        graveMorale[r] = min(graveMoraleMax, own[r] * graveMoralePerStone) + wonderMorale(r)   // R60-F3: small wonder perk
+                       + vigilMorale[r];                                                       // R63-F5: decaying vigil lift
         graveRestAcc[r] += graveMorale[r];
         graveHungerRest[r] = graveRestAcc[r] >= 1.0f;
         if (graveHungerRest[r]) graveRestAcc[r] -= 1.0f;
     }
 }
+
+// R63-F5: a stone that carries a candle tonight: its race keeps a vigil, and it was raised in the year mourned
+bool vigilCandleAt(const grave& g) { return vigil.lit[clampRace(g.race)] && g.year == vigil.year; }
+// R63-F5: the stub's top-left, just in front of the stone's middle column (stones are nudged sideways, never down)
+Vector2f vigilWaxPos(const grave& g) { return g.pos + Vector2f(1.0f, graveSize.y); }
 
 // Returns true on ticks where the barb makes work progress; hungry barbs skip some ticks
 bool workTick(barb& b) {
@@ -10989,6 +11044,7 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
     truce = wyrmTruce{};  // R62-F3: nor the truce
     resetHollowHunt(barbs);   // R62-F3b: nor the joint hunt
     resetGathers(barbs);      // R63-F5a: nor any gathering
+    resetVigil();             // R63-F5: nor a vigil, nor its morale lift
     if (d.barbs.empty()) {
         for (auto& b : barbs) b.bornHour = chronicleNowHour() - founderAgeHours();   // founders arrive on the restored clock (R57-F1: grown)
         printf("CHRONICLE - no barbs saved: the %d founders stay\n", (int)barbs.size());
@@ -12027,7 +12083,53 @@ void drawGraves(RenderWindow& window, const FloatRect& camRect) {
         pushQuad(va, g.pos + Vector2f(1.0f, -extra), Vector2f(1.0f, 1.0f), c);          // rounded cap
         pushQuad(va, g.pos + Vector2f(0.0f, 1.0f - extra), Vector2f(graveSize.x, 2.0f + extra), c);   // slab
         pushQuad(va, g.pos + Vector2f(0.0f, 3.0f), Vector2f(graveSize.x, 1.0f), base);  // set in the ground
+        if (vigilCandleAt(g))   // R63-F5: the candle stub stands at the stone's foot; its flame is drawn over the overlay
+            pushQuad(va, vigilWaxPos(g), kVigilWaxSize, kVigilWaxColor);
     }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R63-F5: the flames and halos of a vigil's candles, after the overlays (like drawLoreCandles) so they read at night.
+// Tiny: a 1px flame (2px on a hero stone) over the stub, a 3px-wide additive halo; the newest stone of each race burns
+// brightest. Flicker is a hash of the frame and the stone position (no state). A candle under a house is skipped.
+void drawVigilCandles(RenderWindow& window, const View& worldView, const FloatRect& camRect,
+                      const vector<RectangleShape>& houseshapes, int frame) {
+    bool any = false;
+    for (int r = 0; r < raceCount; r++) any = any || vigil.lit[r];
+    if (!any || graves.empty()) return;
+    window.setView(worldView);
+    static VertexArray va(PrimitiveType::Triangles), glow(PrimitiveType::Triangles);
+    va.clear();
+    glow.clear();
+    int newest[raceCount];
+    for (int r = 0; r < raceCount; r++) newest[r] = -1;
+    for (int i = 0; i < (int)graves.size(); i++)
+        if (vigilCandleAt(graves[i])) newest[clampRace(graves[i].race)] = i;   // oldest first: the last match is the newest
+    for (int i = 0; i < (int)graves.size(); i++) {
+        const grave& g = graves[i];
+        if (!vigilCandleAt(g)) continue;
+        Vector2f wax = vigilWaxPos(g);
+        float fh = g.hero ? 2.0f : 1.0f;
+        Vector2f flame = wax - Vector2f(0.0f, fh);
+        FloatRect box(flame - Vector2f(1.0f, 1.0f), Vector2f(3.0f, fh + 2.0f));
+        if (!camRect.findIntersection(box)) continue;
+        bool covered = false;
+        for (auto& hs : houseshapes)
+            if (hs.getGlobalBounds().findIntersection(FloatRect(flame, Vector2f(1.0f, fh + kVigilWaxSize.y)))) { covered = true; break; }
+        if (covered) continue;
+        bool top = newest[clampRace(g.race)] == i;
+        unsigned h = (unsigned)(frame / kVigilFlickerFrames) * 2654435761u ^ ((unsigned)g.pos.x * 73856093u) ^ ((unsigned)g.pos.y * 19349663u);
+        bool low = (h >> 13) % 4 == 0;   // one step in four the flame dips
+        Color c = top && !low ? kVigilFlameBright : kVigilFlameDim;
+        if (!top && low) c = shade(kVigilFlameDim, 0.85f);
+        Color halo = kVigilGlowColor;
+        halo.a = top ? kVigilGlowNewestAlpha : kVigilGlowAlpha;
+        if (low) halo.a = (uint8_t)(halo.a * 3 / 4);
+        pushQuad(glow, box.position, box.size, halo);
+        pushQuad(va, flame, Vector2f(1.0f, fh), c);
+        if (g.hero) pushQuad(va, flame, Vector2f(1.0f, 1.0f), lerpColor(c, Color(255, 240, 200), 0.4f));   // paler tip
+    }
+    if (glow.getVertexCount() > 0) window.draw(glow, BlendAdd);
     if (va.getVertexCount() > 0) window.draw(va);
 }
 
@@ -13975,6 +14077,65 @@ void gatherTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
             b.moving = true;
             walkStep(b, squares[i]);
         }
+    }
+}
+
+// R63-F5: index of race r's newest stone raised in year y, -1 = none (graves is oldest first)
+int vigilNewestGrave(int r, int y) {
+    for (int i = (int)graves.size() - 1; i >= 0; i--)
+        if (graves[i].race == r && graves[i].year == y) return i;
+    return -1;
+}
+
+// R63-F5: the one way a race's vigil ends (the hour, its stones gone): mourners released, the lift granted if any stood
+void endVigil(vector<barb>& barbs, int r, const char* why) {
+    if (!vigil.lit[r]) return;
+    int stood = gatherCount(barbs, vigil.ids[r], true);
+    releaseGather(barbs, vigil.ids[r], "vigil over");
+    vigil.lit[r] = false;
+    vigil.focus[r] = -1;
+    if (stood > 0) vigilMorale[r] = max(vigilMorale[r], kVigilMorale);
+    printf("VIGIL END - %s (%s): %d mourners stood, morale lift %.3f\n", racePlurals[r], why, stood, vigilMorale[r]);
+}
+
+// R63-F5: once per sim tick, after clockk(). Decays the lift; on the year's first dusk lights each race's candles and
+// calls mourners; each tick re-checks the focus stone index (a death can evict the oldest and shift every index);
+// at kVigilEndHour the vigil ends.
+void vigilTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
+    for (auto& m : vigilMorale) m = max(0.0f, m - kVigilMorale / (float)kVigilMoraleTicks);   // linear decay to 0
+    if (vigil.due && game_time == nightStartHour && game_day % yearDays == 0) {
+        vigil.due = false;
+        int ticks = (kVigilEndHour - nightStartHour + 1) * ticksPerGameHour;   // an hour past the end: endVigil() releases first
+        for (int r = 0; r < raceCount; r++) {
+            int gi = vigilNewestGrave(r, vigil.year);
+            if (gi < 0) { printf("VIGIL - %s: no one fell in year %d, no vigil\n", racePlurals[r], vigil.year + 1); continue; }
+            vigil.lit[r] = true;
+            vigil.focus[r] = gi;
+            int sent = gatherIdleAt(barbs, squares, r, graves[gi].pos + graveSize / 2.0f, vigil.ids[r], kVigilMourners, ticks,
+                                    "keeping vigil");
+            string names;
+            int n = 0, total = 0;
+            for (int i = (int)graves.size() - 1; i >= 0; i--) {   // newest first
+                if (graves[i].race != r || graves[i].year != vigil.year) continue;
+                total++;
+                if (n >= kVigilTickerNames) continue;
+                names += (n > 0 ? ", " : "") + string(graves[i].name[0] ? graves[i].name : "one unnamed");
+                n++;
+            }
+            if (total > n) names += " and " + to_string(total - n) + " more";
+            logEvent(string("The ") + racePlurals[r] + " light candles for " + names, kVigilTickerTint);
+            printf("VIGIL - %s: %d stones lit, %d mourners called\n", racePlurals[r], total, sent);
+        }
+    }
+    if (vigil.due && game_day % yearDays != 0) vigil.due = false;   // the dusk was missed (a load): no late vigil
+    for (int r = 0; r < raceCount; r++) {
+        if (!vigil.lit[r]) continue;
+        int gi = vigil.focus[r];
+        if (gi < 0 || gi >= (int)graves.size() || graves[gi].race != r || graves[gi].year != vigil.year) {
+            gi = vigil.focus[r] = vigilNewestGrave(r, vigil.year);   // the index shifted (eviction) or the stone is gone
+            if (gi < 0) { endVigil(barbs, r, "stones gone"); continue; }
+        }
+        if (game_time >= kVigilEndHour || game_time < nightStartHour) endVigil(barbs, r, "the hour");
     }
 }
 
@@ -20173,6 +20334,7 @@ int main() {
                         marriageDawn(barbs, squares, houses, stores);   // R59-F1: a leader's child may set out to wed
                     }
                 }
+                vigilTick(barbs, squares);   // R63-F5: after clockk(): the year's first dusk lights the graveside vigil
                 riverSeasonTick(barbs, squares, stores, smoke, dwarfForge, fields, trees, tris, rocks, octs, bushes);   // R62-F2: after clockk(), so ice/flood land at the midnight
                 bridgeTorchTick(barbs, squares, stores, smoke, dwarfForge, fields, trees, tris, rocks, octs, bushes);   // R62-F2c: burn timers, a won raid's torch
                 weatherTick();
@@ -20375,6 +20537,7 @@ int main() {
         drawNightLife(window, worldView, camRect, bushshapes, nightVerts, frameCount,   // R63-F4: fireflies / aurora, night only
                       max(hudBarHeight, stockRect.position.y + stockRect.size.y));      // aurora starts under last frame's stock panel
         drawLoreCandles(window, worldView, barbs, isNightHour(t));   // R59-F3: study candles at any hour, halo at night
+        drawVigilCandles(window, worldView, camRect, houseshapes, frameCount);   // R63-F5: graveside flames over the overlay
         drawProwlerOverlay(window, worldView, prowlers, fire);   // R48-F1: red eyes + safe-zone ring, above the night overlay
         drawHouseFires(window, worldView, houses, houseshapes, frameCount);   // R61-F1: flames on torched roofs, above the overlay
         drawBridgeFires(window, worldView, frameCount);   // R62-F2c: flames on a torched bridge deck, above the overlay
