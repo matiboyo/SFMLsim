@@ -1123,6 +1123,34 @@ const Color kTruceArcColor(198, 192, 140);                 // remaining time: pa
 const Color kTruceArcTrackColor(58, 60, 48);               // the spent part of the ring: dark olive, opaque
 const Color kTruceFlagColor(238, 236, 226);                // the white flag
 const Color kTrucePoleColor(150, 138, 112);
+// R62-F3b Wyrm Truce, phase 2: the joint Hollow hunt. Once per truce, huntTick() calls up kHuntPerRace (at least
+// kHuntMinPerRace) armed, drilled barbs from each race that can spare them (at least kHuntMinRaces races). Each race's
+// group walks under its own banner to its stand spot round the Hollow mouth and waits there; at night, once all have
+// gathered, they march out together and strike the wyrm through wyrmFightable(). The hunt is one activity
+// (actHollowHunt): entering saves the barb's moving/chopping/building/movingbspot/deertargeting state (and its walk) in
+// barb::huntSave and clears them; a release restores them, and endActivity() wipes the save, so a death or swapRemove
+// never leaves stale data. The truce clock is held while the hunt is out. A kill drops a gold hoard: credited to the
+// slayer's race and split with every other hunting race through transferCoin(); that ends the hunt and the truce. If
+// the wyrm outlasts kHuntMaxTicks, the hunt and the truce both end. A barb death, the wyrm leaving (slain by the watch,
+// gone back to sleep) or the truce ending releases the hunters. Never saved: resetHollowHunt() on a chronicle load.
+const int kHuntPerRace = 3;                         // hunters per race at most
+const int kHuntMinPerRace = 2;                      // a race sends none unless it can spare this many
+const int kHuntMinRaces = 2;                        // a joint hunt: at least this many races, or nobody goes
+const int kHuntMinStanding = 2;                     // fewer hunters left than this: the hunt breaks up
+const int kHuntCheckTicks = 600;                    // muster check throttle (~10s at 1x)
+const int kHuntMaxTicks = 30 * ticksPerGameHour;    // from the muster: through the next full night, then the wyrm wins
+const int kHuntGatherMaxTicks = 6 * ticksPerGameHour;   // backstop: by night after this long, the hunt marches with whoever is there
+const float kHuntStandPx = 14.0f;                   // each race's stand spot, mouth centre to group centre
+const float kHuntRowGapPx = 6.0f;                   // hunters of a group stand in a short row this far apart
+const int kHuntSpotTries = 12;                      // angles tried round the mouth for a dry stand spot
+const int kHuntHoardGold = 12;                      // nuggets in the hoard (2 gold rocks' worth per hunter race at 3 races)
+const int kHuntRenown = 4;                          // every hunter standing at the kill (the slayer also gets kRenownWyrm)
+const int kHoardGlintTicks = 2 * ticksPerGameHour;  // the glint stays over the Hollow this long after the kill
+const int kHoardGlintFrames = 48;                   // one twinkle cycle in drawn frames (~0.8s); the glint hops each cycle
+const Color kHoardGlintColor(236, 206, 112);        // pale gold, a shade above keepGildColor so it reads over the lintel
+const Color kHoardGlintArmColor(212, 188, 118, 170);// the cross arms: goldFleckColor, translucent
+const Color kHoardGlowColor(120, 96, 40, 40);       // faint 5x5 additive halo, night only
+const Color kHoardTickerTint(212, 188, 118);        // hudGoldColor
 // R61-F2 Field Hosts and Pitched Battles, phase 1: while a war is in its window, warTick() may muster one host per side
 // (up to kHostMax drilled, armed barbs each) under a race banner. Both columns march to the field between the two crates
 // and clash through raidFightStep(); a side with fewer than kHostMinStanding unbeaten fighters breaks, drops its banner
@@ -3917,7 +3945,7 @@ enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
 // R53-F4: the one exclusive state a barb is in (work flags like chopping/building stay separate). Set only by
 // beginActivity(), cleared only by endActivity(), which also runs the activity's cleanup.
 enum barbActivity { actNone, actShelter, actExpedition, actRaidAttack, actRaidDefend, actTemper, actSmelt, actDrill, actWatch,
-                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, actHeal, actHost, activityCount };   // R61-F2: actHost = a field host fighter. R60-F2: actHeal = an elf walking to cure a patient   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
+                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, actHeal, actHost, actHollowHunt, activityCount };   // R62-F3b: actHollowHunt = a joint wyrm hunter   // R61-F2: actHost = a field host fighter. R60-F2: actHeal = an elf walking to cure a patient   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
 struct activityDef {
     const char* name;
     bool ownsBarb;    // its tick owns the barb outright: every job selector skips it (barbAvailable() false)
@@ -3943,6 +3971,15 @@ const activityDef activityDefs[activityCount] = {
     {"study",         false, false, true},   // R59-F3: any claim outranks study, like the drill; studyTick() walks the scholar
     {"heal",          false, false, true},   // R60-F2: any claim outranks the visit; healTick() walks the healer
     {"host",          true,  false, false},  // R61-F2: hostTick() owns the fighter from muster to release
+    {"wyrm hunt",     true,  false, false},  // R62-F3b: huntTick() owns the hunter from muster to release
+};
+
+// R62-F3b: what a hunter was doing when the hunt took it. Written only by the muster, read by releaseHuntBarb(), wiped
+// by endActivity() (every exit, death included), so it never outlives the hunt or follows a swapRemove'd slot.
+struct huntSaveState {
+    bool valid = false;
+    bool moving = false, chopping = false, building = false, movingbspot = false, deertargeting = false;
+    int targetx = -1, targety = -1, wanderX = -1, wanderY = -1;   // the walk a restored `moving` resumes
 };
 
 struct barb {
@@ -4031,6 +4068,7 @@ struct barb {
                                  //         set only by startHeal(), cleared only by releaseHealPatient()
     int healWalkTicks = 0;       // R60-F2: ticks since the visit began; reset by releaseHealPatient()
     int healImmuneUntil = 0;     // R60-F2: healClock tick a cure's immunity runs to (0 = none); 0 after makeBarb() and any load
+    huntSaveState huntSave;      // R62-F3b: flags saved at the hunt muster; valid only while activity == actHollowHunt
 };
 // R57-F1: age and stage from bornHour on the live clock (same hour count as chronicleNowHour())
 enum lifeStageKind { stageChild, stageAdult, stageElder };
@@ -4323,8 +4361,34 @@ struct wyrmTruce {
     bool active = false;
     int ticksLeft = 0;                      // kTruceTicks at the call
     int cooldown = 0;                       // after a truce ends, before a torching may call the next
+    bool huntSent = false;                  // R62-F3b: one joint hunt per truce (cleared by callTruce())
 };
 wyrmTruce truce;
+// R62-F3b: the one joint Hollow hunt. Hunters are held by barb id (never an index) per race and re-resolved by huntTick()
+// every tick; removeBarb() drops a dying hunter's id through huntMemberLost(). One explicit phase: Gather (walk to the
+// stand spots and wait) -> March (out after the wyrm at night, back to the spots while it is below).
+struct hollowHuntParty {
+    enum Phase {Gather, March} phase = Gather;
+    bool active = false;
+    int wyrmId = -1;                        // the wyrm it hunts; a different (or no) wyrm ends the hunt
+    int memberIds[raceCount][kHuntPerRace];
+    Vector2f spot[raceCount];               // each race's group centre round the mouth (picked dry at the muster)
+    Vector2f across[raceCount];             // unit vector along which the group's row is laid out
+    int ticks = 0;                          // since the muster (kHuntMaxTicks)
+    hollowHuntParty() { for (auto& row : memberIds) for (auto& id : row) id = -1; }
+};
+hollowHuntParty hollowHunt;
+int hoardGlintTicks = 0;                    // R62-F3b: > 0 = the glint lingers over the Hollow after a kill
+bool inHollowHunt(const barb& b) { return b.activity == actHollowHunt; }
+void huntMemberLost(const barb& b) {
+    if (!hollowHunt.active || !inHollowHunt(b)) return;
+    for (auto& row : hollowHunt.memberIds) for (auto& id : row) if (id == b.id) id = -1;
+}
+void resetHollowHunt(vector<barb>& barbs) {   // chronicle load: hunts are never saved; endActivity() wipes the saves
+    for (auto& b : barbs) endActivity(b, actHollowHunt);
+    hollowHunt = hollowHuntParty{};
+    hoardGlintTicks = 0;
+}
 bool anyWarActive() {
     for (auto& w : wars) if (w.active) return true;
     return false;
@@ -4663,6 +4727,10 @@ void endActivity(barb& b) {
             b.raidCooldown = 0;
             b.raidBeaten = false;
             break;
+        case actHollowHunt:  // R62-F3b: the strike cooldown, and the saved flags (restored first by releaseHuntBarb())
+            b.raidCooldown = 0;
+            b.huntSave = huntSaveState{};
+            break;
         case actKneel:     // R52-F3: nothing else to reset
         case actCaravan:     // R54-F1: the cart's goods live on the caravan entry, not the barb
         case actExile:       // R54-F3: the trip lives on the exile entry; exileTick() resets the walk
@@ -4861,6 +4929,7 @@ void callTruce() {
     if (truce.active || truce.cooldown > 0 || !anyWarActive()) return;
     truce.active = true;
     truce.ticksLeft = kTruceTicks;
+    truce.huntSent = false;   // R62-F3b: this truce may send its one joint hunt
     string pairs;
     for (auto& w : wars)
         if (w.active) pairs += string(pairs.empty() ? "" : " and ") + racePlurals[w.lo] + " and " + racePlurals[w.hi];
@@ -5322,6 +5391,9 @@ const char* barbTaskName(const barb& b) {
         return host.phase == warHost::Home ? "field host: marching home"
              : host.phase == warHost::Clash ? (b.raidPreyId >= 0 ? "field host: fighting" : "field host: holding the line")
              : "field host: marching to battle";
+    if (inHollowHunt(b))   // R62-F3b
+        return hollowHunt.phase == hollowHuntParty::Gather ? (b.moving ? "wyrm hunt: to the Hollow" : "wyrm hunt: waiting at the Hollow")
+             : wyrmFightable() ? "wyrm hunt: after the wyrm" : "wyrm hunt: watching the Hollow";
     if (b.chopping && b.target == targetBush) return "picking";
     if (b.chopping && b.target == targetField) return "harvesting";
     if (b.chopping && b.target == targetLake) return "fishing";
@@ -10534,6 +10606,7 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
     resetClaims();        // R62-F1: nor the borders; claims start again from the base disc round each crate
     for (auto& row : wonderEnvy) for (auto& e : row) e = 0.0f;   // R61-F4b: envy is never saved
     truce = wyrmTruce{};  // R62-F3: nor the truce
+    resetHollowHunt(barbs);   // R62-F3b: nor the joint hunt
     if (d.barbs.empty()) {
         for (auto& b : barbs) b.bornHour = chronicleNowHour() - founderAgeHours();   // founders arrive on the restored clock (R57-F1: grown)
         printf("CHRONICLE - no barbs saved: the %d founders stay\n", (int)barbs.size());
@@ -11670,7 +11743,9 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     endActivity(b, actCaravan);
     hostMemberLost(b);                            // R61-F2: drops its host id before the swapRemove; hostTick() may break the host
     endActivity(b, actHost);
-    envoyMemberLost(b);                           // R56-F2: drops the envoy id; envoyTick() aborts unpaid next tick
+    huntMemberLost(b);                            // R62-F3b: drops its hunt id; endActivity() wipes its saved flags (no restore)
+    endActivity(b, actHollowHunt);
+    envoyMemberLost(b);                         // R56-F2: drops the envoy id; envoyTick() aborts unpaid next tick
     endActivity(b, actEnvoy);
     marriageMemberLost(b);                        // R59-F1: drops its procession id; marriageTick() aborts the trip next tick
     endActivity(b, actProcession);
@@ -13857,7 +13932,7 @@ void warTick(vector<barb>& barbs, const vector<RectangleShape>& squares, const s
     for (auto& row : wonderEnvy) for (auto& e : row) e = max(0.0f, e - kEnvyDecayPerTick);   // R61-F4b: envy fades
     if (!truce.active && truce.cooldown > 0) truce.cooldown--;   // R62-F3: truce clock, timeout and cooldown
     if (truce.active && !anyWarActive()) endTruce("no war is left to pause");
-    else if (truce.active && --truce.ticksLeft <= 0) endTruce("the wars resume");
+    else if (truce.active && !hollowHunt.active && --truce.ticksLeft <= 0) endTruce("the wars resume");   // R62-F3b: held while the hunt is out
     bool check = --checkTimer <= 0;
     if (check) checkTimer = kWarCheckTicks;
     int living[raceCount] = {};
@@ -14845,6 +14920,317 @@ void drawHostBanners(RenderWindow& window, const vector<barb>& barbs, const vect
     }
     hostDusts.erase(remove_if(hostDusts.begin(), hostDusts.end(), [](const hostDust& p) { return p.frames <= 0; }), hostDusts.end());
     if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R62-F3b: one hunter leaves the hunt standing where it is. restore = hand back the flags and walk saved at the muster
+// (every exit but a death; removeBarb() goes straight to endActivity(), which only wipes the save). Recruits pass
+// hostRecruitOk() (raidIdle(): no chop, build, build-walk or deer hunt), so in practice only a wander walk comes back.
+void releaseHuntBarb(barb& b, bool restore) {
+    if (!inHollowHunt(b)) return;
+    huntSaveState s = b.huntSave;
+    expeditionReset(b);               // drops the hunt walk and route
+    endActivity(b, actHollowHunt);    // wipes b.huntSave
+    if (!restore || !s.valid) return;
+    b.moving = s.moving && s.targetx >= 0 && s.targety >= 0;
+    b.chopping = s.chopping;
+    b.building = s.building;
+    b.movingbspot = s.movingbspot;
+    b.deertargeting = s.deertargeting;
+    b.targetx = s.targetx;
+    b.targety = s.targety;
+    b.wanderX = s.wanderX;
+    b.wanderY = s.wanderY;
+}
+// R62-F3b: the one way a hunt ends: every hunter still listed is released (restored) where it stands
+void endHollowHunt(vector<barb>& barbs, const char* why) {
+    for (auto& row : hollowHunt.memberIds)
+        for (auto& id : row) {
+            int i = findBarbById(barbs, id);
+            id = -1;
+            if (i >= 0) releaseHuntBarb(barbs[i], barbs[i].health > 0);
+        }
+    printf("---HUNT ENDS--- %s after %d ticks\n", why, hollowHunt.ticks);
+    hollowHunt = hollowHuntParty{};
+}
+// R62-F3b: hunter k of race r's stand spot (hitbox centre): a short row across the race's spot round the mouth
+Vector2f huntStandPos(int r, int k) {
+    return hollowHunt.spot[r] + hollowHunt.across[r] * (kHuntRowGapPx * (k - (kHuntPerRace - 1) / 2.0f));
+}
+
+// R62-F3b: called by huntTick() on its throttled check. Once per truce, while the Hollow's wyrm is awake: every race with
+// a silent bell and nobody out in a party sends its nearest kHuntPerRace eligible fighters (hostRecruitOk(), at least
+// kHuntMinPerRace); with fewer than kHuntMinRaces races able to send, nobody goes and the check runs again later.
+bool tryMusterHollowHunt(vector<barb>& barbs, const vector<RectangleShape>& squares) {
+    if (!truce.active || truce.huntSent || hollowHunt.active || !hollowPlaced || !wyrm.awake || wyrm.hp <= 0) return false;
+    int n = min((int)barbs.size(), (int)squares.size());
+    int pick[raceCount][kHuntPerRace];
+    int count[raceCount] = {};
+    int races = 0;
+    for (int r = 0; r < raceCount; r++) {
+        for (auto& p : pick[r]) p = -1;
+        if (raceBell[r] > 0 || raceInParty(r)) continue;
+        for (int k = 0; k < kHuntPerRace; k++) {
+            pick[r][k] = findNearest(quarterCentre(r), kRaidRecruitRadius, n,
+                                     [&](int i) { return raidCentre(squares[i]); },
+                                     [&](int i) {
+                                         for (int q = 0; q < k; q++) if (pick[r][q] == i) return true;
+                                         return !hostRecruitOk(barbs[i], r);
+                                     });
+            if (pick[r][k] < 0) break;
+            count[r]++;
+        }
+        if (count[r] < kHuntMinPerRace) count[r] = 0;
+        else races++;
+    }
+    if (races < kHuntMinRaces) return false;
+    Vector2f mouth = hollowPos + hollowSize / 2.0f;
+    hollowHunt = hollowHuntParty{};
+    hollowHunt.active = true;
+    hollowHunt.wyrmId = wyrm.id;
+    hollowHunt.phase = hollowHuntParty::Gather;
+    truce.huntSent = true;
+    string names;
+    for (int r = 0; r < raceCount; r++) {
+        if (count[r] == 0) continue;
+        float base = 6.2831853f * r / raceCount - 1.5707963f;   // races spread round the mouth, the first above it
+        for (int t = 0; t < kHuntSpotTries; t++) {               // turn until the whole row stands dry (else keep the first)
+            float a = base + 6.2831853f * t / kHuntSpotTries;
+            Vector2f dir(cos(a), sin(a));
+            hollowHunt.spot[r] = mouth + dir * kHuntStandPx;
+            hollowHunt.across[r] = Vector2f(-dir.y, dir.x);
+            bool ok = true;
+            for (int k = 0; k < kHuntPerRace && ok; k++) ok = watchStopOk(huntStandPos(r, k), squares[pick[r][0]].getSize());
+            if (ok) break;
+            if (t == kHuntSpotTries - 1) {
+                hollowHunt.spot[r] = mouth + Vector2f(cos(base), sin(base)) * kHuntStandPx;
+                hollowHunt.across[r] = Vector2f(-sin(base), cos(base));
+            }
+        }
+        for (int k = 0; k < count[r]; k++) {
+            barb& m = barbs[pick[r][k]];
+            huntSaveState s;
+            s.valid = true;
+            s.moving = m.moving; s.chopping = m.chopping; s.building = m.building;
+            s.movingbspot = m.movingbspot; s.deertargeting = m.deertargeting;
+            s.targetx = m.targetx; s.targety = m.targety; s.wanderX = m.wanderX; s.wanderY = m.wanderY;
+            expeditionReset(m);   // clears the five flags, ends any drill or wander walk
+            beginActivity(m, actHollowHunt);
+            m.huntSave = s;
+            m.order = needNone;
+            m.orderTicks = 0;
+            m.raidCooldown = 0;
+            hollowHunt.memberIds[r][k] = m.id;
+        }
+        names += string(names.empty() ? "" : " and the ") + racePlurals[r] + " (" + to_string(count[r]) + ")";
+    }
+    printf("---HUNT MUSTER--- %s, Hollow mouth (%.0f, %.0f), wyrm %d at %d hp\n", names.c_str(), mouth.x, mouth.y, wyrm.id, wyrm.hp);
+    logEvent("Under the truce, the " + names + " gather at the Hollow to hunt the wyrm", kTruceTickerTint);
+    return true;
+}
+
+// R62-F3b: the killing blow by hunter i. The slayer's race takes the hoard and splits it evenly with every other race
+// still in the hunt through transferCoin() (the slayer keeps the remainder); the hunt and the truce end.
+void huntKill(vector<barb>& barbs, int i, const int (&hi)[raceCount][kHuntPerRace]) {
+    int slayer = clampRace(barbs[i].race);
+    slayWyrm(barbs, i);   // ticker line, kRenownWyrm and the death fade
+    bool in[raceCount] = {};
+    int races = 0;
+    for (int r = 0; r < raceCount; r++)
+        for (int k = 0; k < kHuntPerRace; k++) {
+            int j = hi[r][k];
+            if (j < 0) continue;
+            if (!in[r]) { in[r] = true; races++; }
+            if (j != i) addRenown(barbs, j, kHuntRenown, deedWatch);
+        }
+    if (!in[slayer]) { in[slayer] = true; races++; }
+    purse[slayer] += kHuntHoardGold;
+    int share = kHuntHoardGold / max(1, races);
+    string split;
+    for (int r = 0; r < raceCount; r++)
+        if (r != slayer && in[r] && transferCoin(slayer, r, share)) split += string(split.empty() ? "" : " and ") + racePlurals[r];
+    string line = string("The wyrm's hoard: ") + to_string(kHuntHoardGold) + " gold to the " + racePlurals[slayer]
+                  + (split.empty() ? "" : ", " + to_string(share) + " each passed to the " + split);
+    printf("---HUNT HOARD--- %s (purses %d / %d / %d)\n", line.c_str(), purse[0], purse[1], purse[2]);
+    logEvent(line, kHoardTickerTint);
+    hoardGlintTicks = kHoardGlintTicks;
+    endHollowHunt(barbs, "the wyrm is slain");
+    endTruce("the wyrm is slain");
+}
+
+// R62-F3b: runs right after hostTick(), before raidTick(). Owns every hunter's movement. Re-resolves every id each tick:
+// a missing hunter is dropped, a dead one released without its save. The hunt ends (hunters restored) when the truce
+// ends, the wyrm it hunts is gone, too few hunters are left, or kHuntMaxTicks pass (which ends the truce too). Gather:
+// each hunter walks to its stand spot and waits; by night, once all stand there (or after kHuntGatherMaxTicks), March.
+// March: while the wyrm is fightable every hunter closes on it and strikes (pinning it like a watchman); while it is
+// below, they return to their spots. A gathering hunter only fights a wyrm that comes within watchEngagePx.
+void huntTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
+    static int checkTimer = 0;
+    if (hoardGlintTicks > 0) hoardGlintTicks--;
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (int i = 0; i < n; i++) {   // backstop: a hunt flag with no hunt entry behind it is cleared
+        barb& b = barbs[i];
+        if (!inHollowHunt(b)) continue;
+        bool listed = false;
+        if (hollowHunt.active) for (auto& row : hollowHunt.memberIds) for (int id : row) listed = listed || id == b.id;
+        if (!listed) { printf("HUNT FLAG CLEARED - barb %d (no hunt entry)\n", b.id); releaseHuntBarb(b, b.health > 0); }
+    }
+    if (!hollowHunt.active) {
+        if (--checkTimer <= 0) { checkTimer = kHuntCheckTicks; tryMusterHollowHunt(barbs, squares); }
+        return;
+    }
+    hollowHunt.ticks++;
+    int hi[raceCount][kHuntPerRace];
+    int standing = 0;
+    for (int r = 0; r < raceCount; r++)
+        for (int k = 0; k < kHuntPerRace; k++) {
+            int& id = hollowHunt.memberIds[r][k];
+            int i = findBarbById(barbs, id);
+            bool bad = i < 0 || i >= n || !inHollowHunt(barbs[i]) || barbs[i].race != r || barbs[i].health <= 0;
+            if (bad) {
+                if (id >= 0) printf("HUNTER DROPPED - barb %d\n", id);
+                if (i >= 0 && i < n) releaseHuntBarb(barbs[i], barbs[i].health > 0);   // a death keeps nothing
+                id = hi[r][k] = -1;
+                continue;
+            }
+            hi[r][k] = i;
+            standing++;
+            if (barbs[i].raidCooldown > 0) barbs[i].raidCooldown--;
+        }
+    const char* why = nullptr;
+    bool endsTruce = false;
+    if (!truce.active) why = "the truce is over";
+    else if (!wyrm.awake || wyrm.id != hollowHunt.wyrmId || wyrm.hp <= 0) why = "the wyrm is gone";
+    else if (standing < kHuntMinStanding) why = "too few hunters are left";
+    else if (hollowHunt.ticks > kHuntMaxTicks) { why = "the wyrm outlasts the hunt"; endsTruce = true; }
+    if (why) {
+        logEvent(string("The Hollow hunt breaks up: ") + why, kTruceTickerTint);
+        endHollowHunt(barbs, why);
+        if (endsTruce) endTruce("the wyrm outlasts the hunt");
+        return;
+    }
+
+    if (hollowHunt.phase == hollowHuntParty::Gather && isNightHour(game_time)) {
+        bool all = true;
+        for (int r = 0; r < raceCount && all; r++)
+            for (int k = 0; k < kHuntPerRace && all; k++) {
+                int i = hi[r][k];
+                if (i < 0) continue;
+                Vector2f d = snapPx(huntStandPos(r, k) - squares[i].getSize() / 2.0f) - squares[i].getPosition();
+                all = d.x * d.x + d.y * d.y < 1.0f;
+            }
+        if (all || hollowHunt.ticks > kHuntGatherMaxTicks) {
+            hollowHunt.phase = hollowHuntParty::March;
+            printf("HUNT MARCHES - %d hunters out from the Hollow after %d ticks (%s)\n", standing, hollowHunt.ticks,
+                   all ? "all gathered" : "gather backstop");
+            logEvent("The hunters march out from the Hollow together", kTruceTickerTint);
+        }
+    }
+
+    bool march = hollowHunt.phase == hollowHuntParty::March;
+    for (int r = 0; r < raceCount; r++)
+        for (int k = 0; k < kHuntPerRace; k++) {
+            int i = hi[r][k];
+            if (i < 0) continue;
+            barb& b = barbs[i];
+            RectangleShape& sq = squares[i];
+            Vector2f c = raidCentre(sq);
+            if (wyrmFightable()) {
+                Vector2f np(clamp(c.x, wyrm.pos.x, wyrm.pos.x + kWyrmSize.x), clamp(c.y, wyrm.pos.y, wyrm.pos.y + kWyrmSize.y));
+                Vector2f d = np - c;
+                float dSq = d.x * d.x + d.y * d.y;
+                bool near = dSq <= watchEngagePx * watchEngagePx;
+                if (march || near) {
+                    if (dSq <= watchStrikeRangePx * watchStrikeRangePx) {
+                        if (b.moving) { b.moving = false; clearRoute(b); b.stepTimer = 0; }
+                        wyrm.heldTicks = kWyrmHeldTicks;
+                        if (b.raidCooldown == 0) {
+                            b.raidCooldown = watchStrikeCooldownTicks;
+                            int dmg = weaponDamage(b);
+                            wyrm.hp = max(0, wyrm.hp - dmg);
+                            wyrm.flashFrames = kWyrmFlashFrames;
+                            printf("HUNT HIT - %s (id %d, %s) hits wyrm %d for %d, %d hp left\n", b.name, b.id, racePlurals[r],
+                                   wyrm.id, dmg, wyrm.hp);
+                            if (wyrm.hp <= 0) { huntKill(barbs, i, hi); return; }
+                        }
+                    } else {
+                        // far off: a coarse 16px goal, so the route is not replanned for every step the wyrm takes
+                        Vector2f goal = np - sq.getSize() / 2.0f;
+                        if (!near) goal = Vector2f(floor(goal.x / 16.0f) * 16.0f + 8.0f, floor(goal.y / 16.0f) * 16.0f + 8.0f);
+                        b.targetx = (int)goal.x;
+                        b.targety = (int)goal.y;
+                        b.moving = true;
+                        walkStep(b, sq, near);
+                    }
+                    continue;
+                }
+            }
+            Vector2f goal = snapPx(huntStandPos(r, k) - sq.getSize() / 2.0f);   // to the stand spot, or wait on it
+            b.targetx = (int)goal.x;
+            b.targety = (int)goal.y;
+            Vector2f diff = goal - sq.getPosition();
+            if (diff.x * diff.x + diff.y * diff.y < 1.0f) {
+                if (b.moving) { b.moving = false; clearRoute(b); b.stepTimer = 0; }
+            } else {
+                b.moving = true;
+                walkStep(b, sq);
+            }
+        }
+}
+
+// R62-F3b: world layer, with the host banners: each hunting race's banner on its bearer (the first hunter still listed),
+// the same pole and flag as a field host
+void drawHuntBanners(RenderWindow& window, const vector<barb>& barbs, const vector<RectangleShape>& squares) {
+    if (!hollowHunt.active) return;
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (int r = 0; r < raceCount; r++) {
+        int bearer = -1;
+        for (int k = 0; k < kHuntPerRace && bearer < 0; k++) bearer = findBarbById(barbs, hollowHunt.memberIds[r][k]);
+        if (bearer < 0 || bearer >= (int)squares.size() || !inHollowHunt(barbs[bearer])) continue;
+        Vector2f base = snapPx(squares[bearer].getPosition());
+        float feet = base.y + squares[bearer].getSize().y;
+        float poleX = base.x - 2.0f, poleTop = feet - kHostPoleH;
+        pushQuad(va, Vector2f(poleX, poleTop), Vector2f(1.0f, kHostPoleH), kHostPoleColor);
+        for (int row = 0; row < kHostFlagRows; row++)
+            for (int c = 0; c < kHostFlagCols; c++)
+                if (kHostFlagMask[r][row][c] == '#')
+                    pushQuad(va, Vector2f(poleX - 1.0f - c, poleTop + row), Vector2f(1.0f, 1.0f), kHostBannerColors[r]);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R62-F3b: above the night overlay, like the wyrm's eye: a gold glint twinkling over the Hollow lintel while the hunt is
+// out (the hoard waits below) and for kHoardGlintTicks after a kill (fading over its last quarter). A 1px pale-gold core
+// one row of grass above the lintel, a translucent 3x3 cross at the peak of each twinkle, hopping between the mouth's
+// two middle columns each cycle; a faint additive halo at night.
+void drawHoardGlint(RenderWindow& window, const View& worldView, int frame) {
+    if (!hollowPlaced || (!hollowHunt.active && hoardGlintTicks <= 0)) return;
+    window.setView(worldView);
+    float fade = hollowHunt.active ? 1.0f : min(1.0f, hoardGlintTicks / (kHoardGlintTicks / 4.0f));
+    int cyc = frame / kHoardGlintFrames;
+    float wave = sin(3.14159265f * (float)(frame % kHoardGlintFrames) / kHoardGlintFrames);   // 0 -> 1 -> 0 per cycle
+    Vector2f c = snapPx(hollowPos) + Vector2f(cyc % 2 == 0 ? 2.0f : 3.0f, -3.0f);
+    static VertexArray va(PrimitiveType::Triangles), glow(PrimitiveType::Triangles);
+    va.clear();
+    glow.clear();
+    if (isNightHour(game_time)) {
+        Color g = kHoardGlowColor;
+        g.a = (uint8_t)(g.a * wave * fade);
+        pushQuad(glow, c - Vector2f(2.0f, 2.0f), Vector2f(5.0f, 5.0f), g);
+    }
+    Color core = kHoardGlintColor;
+    core.a = (uint8_t)((70.0f + 185.0f * wave) * fade);
+    pushQuad(va, c, Vector2f(1.0f, 1.0f), core);
+    if (wave > 0.6f) {
+        Color arm = kHoardGlintArmColor;
+        arm.a = (uint8_t)(arm.a * fade);
+        pushQuad(va, c + Vector2f(-1.0f, 0.0f), Vector2f(1.0f, 1.0f), arm);
+        pushQuad(va, c + Vector2f(1.0f, 0.0f), Vector2f(1.0f, 1.0f), arm);
+        pushQuad(va, c + Vector2f(0.0f, -1.0f), Vector2f(1.0f, 1.0f), arm);
+        pushQuad(va, c + Vector2f(0.0f, 1.0f), Vector2f(1.0f, 1.0f), arm);
+    }
+    if (glow.getVertexCount() > 0) window.draw(glow, BlendAdd);
+    window.draw(va);
 }
 
 // R52-F1: world layer, beside the bell marker: a pulsing red marker on the target crate while a raid marches or fights
@@ -18996,6 +19382,7 @@ int main() {
                 watchTick(barbs, squares, prowlers);   // R51-F1: watchmen patrol and fight; slain prowlers fade, prowlerTick() removes them
                 warTick(barbs, squares, stores);   // R60-F1: declarations, muster and treaties, before the raid launcher reads the wars
                 hostTick(barbs, squares, stores);   // R61-F2: field hosts march, clash and go home; before the raids and the bell
+                huntTick(barbs, squares);   // R62-F3b: the truce's joint Hollow hunt (muster, gather, march, hoard)
                 raidTick(barbs, squares, stores);   // R52-F1: raid march and fight; sets raidThreat[] for bellTick() just below
                 caravanTick(barbs, squares, stores);   // R54-F1: caravans, swaps and the friendly timers, once per sim tick
                 campTick(barbs, squares, wd);   // R55-F1: wildfolk hunters, deer trade, trespass and tents
@@ -19163,6 +19550,7 @@ int main() {
         drawSiegeGate(window);   // R57-F2: gate flash + one red bar over the gatehouse, over the barbs, under trees and overlays
         for (auto& f : gateFlash) if (f > 0 && !paused) f--;
         drawHostBanners(window, barbs, squares, paused);   // R61-F2: host banners + clash dust, over the barbs, under trees and overlays
+        drawHuntBanners(window, barbs, squares);   // R62-F3b: each hunting race's banner, same layer
 	if (activeTrader) drawSnapped(window, activeTrader->shape);
 	drawTrees(window, tris, treeVerts, camRect);
 	drawFires(window, trees, fireVerts, camRect, frameCount);   // R57-F3: flames on the burning canopy + faint smoke, under the overlay
@@ -19214,6 +19602,7 @@ int main() {
         drawProwlerOverlay(window, worldView, prowlers, fire);   // R48-F1: red eyes + safe-zone ring, above the night overlay
         drawHouseFires(window, worldView, houses, houseshapes, frameCount);   // R61-F1: flames on torched roofs, above the overlay
         drawWyrmOverlay(window, worldView);   // R61-F1: ember eye + hp bar
+        drawHoardGlint(window, worldView, frameCount);   // R62-F3b: gold glint over the Hollow (hunt out, or a fresh kill)
         if (wyrm.flashFrames > 0 && !paused) wyrm.flashFrames--;   // the hit flash lasts 2 drawn frames
         drawWatchTorches(window, worldView, frameCount);   // R51-F1: torches glow above the overlay (prowler hp bars are drawn in the call above)
         drawBallots(window, worldView, zoom, barbs, squares); // above the overlays so the pips read true; under hover marks
