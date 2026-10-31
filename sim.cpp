@@ -2364,6 +2364,17 @@ const Color kBridgePlankB(142, 121, 93);
 const Color kBridgeRailColor(92, 72, 50);          // 1px rails along both deck edges
 const Color kBridgePostColor(70, 52, 36);          // 2x2 posts at the four deck corners
 const Color kBridgeShadowColor(18, 28, 40, 120);   // 1px translucent shadow on the water past the far rail
+// R62-F2c Bridge torching, phase 3: a won raid walking home torches the beaten race's bridge behind it once a raider
+// reaches the landing on the far side from that race's quarter (one roll per raid). The bridge burns kHouseBurnTicks
+// (impassable at once; anyone on the deck is pushed to the nearest dry bank cell), then stands as charred stumps for
+// kHouseCharTicks, then clears and the ford may be bridged again.
+const float kBridgeTorchPx = 6.0f;                 // raider centre to the far-side landing point (= kWyrmTorchRangePx)
+const float kBridgeTorchChance = 0.5f;             // rolled once per won raid, at the first raider to reach the landing
+const int kBridgeFlameTongues = 6;                 // flame pixels over a burning deck (thins over the last quarter)
+const Color kBridgeSootColor(22, 18, 16);          // laid over the deck, alpha rising to kBridgeSootMaxAlpha as it burns
+const float kBridgeSootMaxAlpha = 190.0f;
+const Color kBridgeStumpColor(46, 40, 36);         // 2x2 charred stumps where the posts and two pilings per rail stood
+const Color kBridgeStumpAshColor(84, 76, 68);      // 1px ash fleck on each stump's corner
 
 // Far Reaches (R45-F1b): one ruin site far out from the village (placed once at startup by spawnRuins, after the
 // quarters, lakes and bushes), a ridge of ordinary mineable rocks arcing behind it, and one lean-to camp per race beside
@@ -3764,14 +3775,19 @@ VertexArray riverVerts(PrimitiveType::Triangles);             // built once by b
 // R62-F2b: one entry per standing bridge. Everything it needs is inside the struct (ford index into the fixed fords[]
 // array, its own deck quads), so a swapRemove moves the whole bridge and leaves nothing stale; after any add or remove,
 // riverApplyState(riverState) rewrites the cells. id is stable (nextBridgeId, never reused). Cleared in spawnRiver().
-struct riverBridge {int id = -1; int race = -1; int ford = -1; VertexArray verts{PrimitiveType::Triangles};};
+// R62-F2c: burnLeft > 0 = alight, then charLeft > 0 = charred stumps (the wyrm's house timers); either way not crossable.
+// The entry stays (so the ford is not re-bridged) until the stumps clear, then bridgeTorchTick() swapRemoves it.
+struct riverBridge {int id = -1; int race = -1; int ford = -1; VertexArray verts{PrimitiveType::Triangles}; int burnLeft = 0; int charLeft = 0;};
 vector<riverBridge> bridges;
 int nextBridgeId = 0;
-// Index into bridges of the bridge on ford k, or -1
+// Index into bridges of the bridge on ford k (standing, burning or charred), or -1
 int bridgeOnFord(int k) {
     for (int i = 0; i < (int)bridges.size(); i++) if (bridges[i].ford == k) return i;
     return -1;
 }
+// R62-F2c: whole and walkable (not alight, not charred stumps)
+bool bridgeStanding(const riverBridge& br) { return br.burnLeft <= 0 && br.charLeft <= 0; }
+bool fordBridged(int k) { int i = bridgeOnFord(k); return i >= 0 && bridgeStanding(bridges[i]); }
 
 int riverCellAt(Vector2f p) {
     int cx = clamp((int)floor(p.x / trailCellSize), 0, trailGridN - 1), cy = clamp((int)floor(p.y / trailCellSize), 0, trailGridN - 1);
@@ -4222,6 +4238,7 @@ struct raidParty {
     bool won = false;                       // outcome, for the walk home
     bool gateBroken = false;                // R58-F1: the Siege broke the gate (a won raid then makes a vassal)
     int id = 0;                             // R60-F1: raid serial, set at launch (0 = none); wars log raids by this id
+    bool torchRolled = false;               // R62-F2c: the one bridge-torch roll this raid has been made
 };
 raidParty raid;
 int raidSerial = 0;                         // R60-F1: last raid id handed out
@@ -6142,7 +6159,7 @@ Vector2f crossingAim(Vector2f pos, Vector2f goal) {
     float bestLen = numeric_limits<float>::infinity();
     bool anyOpen = false;   // R62-F2b: in a flood only bridged fords are open; with none, the nearest is waited at
     for (int k = 0; k < kFordCount; k++) {
-        bool open = riverState != riverFlooded || bridgeOnFord(k) >= 0;
+        bool open = riverState != riverFlooded || fordBridged(k);   // R62-F2c: a burning or charred bridge is no way over
         if (anyOpen && !open) continue;
         Vector2f a = fords[k].bank[sp] - pos, b = goal - fords[k].bank[sg];
         float len = hypot(a.x, a.y) + hypot(b.x, b.y);
@@ -17936,8 +17953,79 @@ void buildBridgeVerts(riverBridge& br) {
 }
 
 // R62-F2b: ground layer straight after drawRiver(), so the deck sits over the water and under rocks, buildings and barbs
+// R62-F2c: the deck's along (a0..a1) and across (c0..c1) bounds, the same span buildBridgeVerts() lays
+void bridgeDeckSpan(const riverBridge& br, float& a0, float& a1, float& c0, float& c1) {
+    const riverFord& f = fords[br.ford];
+    a0 = f.row0 * trailCellSize + kBridgeInsetPx;
+    a1 = (f.row0 + kFordRows) * trailCellSize - kBridgeInsetPx;
+    c0 = f.lo * trailCellSize - kBridgeAbutPx;
+    c1 = (f.hi + 1) * trailCellSize + kBridgeAbutPx;
+}
+
+// R62-F2c: a burning deck darkens under a soot quad (alpha rising over the burn); a burnt-out bridge is drawn only as
+// 2x2 charred stumps where its four posts stood plus two pilings along each rail, fading over the last quarter
 void drawBridges(RenderWindow& window) {
-    for (auto& br : bridges) if (br.verts.getVertexCount() > 0) window.draw(br.verts);
+    static VertexArray soot(PrimitiveType::Triangles), stumps(PrimitiveType::Triangles);
+    soot.clear();
+    stumps.clear();
+    for (auto& br : bridges) {
+        if (br.ford < 0 || br.ford >= kFordCount) continue;
+        float a0, a1, c0, c1;
+        bridgeDeckSpan(br, a0, a1, c0, c1);
+        if (br.charLeft > 0) {
+            float left = (float)br.charLeft / kHouseCharTicks;
+            float fade = left < 0.25f ? left / 0.25f : 1.0f;
+            Color st = kBridgeStumpColor, ash = kBridgeStumpAshColor;
+            st.a = ash.a = (uint8_t)(255.0f * fade);
+            float third = floor((c1 - c0) / 3.0f);
+            for (float pa : {a0 - 1.0f, a1 - 1.0f})
+                for (float pc : {c0, c0 + third, c1 - third - 2.0f, c1 - 2.0f}) {
+                    Vector2f p = riverPoint(pa, pc);
+                    pushQuad(stumps, p, Vector2f(2.0f, 2.0f), st);
+                    pushQuad(stumps, p, Vector2f(1.0f, 1.0f), ash);
+                }
+            continue;
+        }
+        if (br.verts.getVertexCount() > 0) window.draw(br.verts);
+        if (br.burnLeft > 0) {
+            Color c = kBridgeSootColor;
+            c.a = (uint8_t)(kBridgeSootMaxAlpha * (1.0f - (float)br.burnLeft / kHouseBurnTicks));
+            pushQuad(soot, riverPoint(a0 - 1.0f, c0), riverPoint(a1 - a0 + 1.0f, c1 - c0), c);
+        }
+    }
+    if (soot.getVertexCount() > 0) window.draw(soot);
+    if (stumps.getVertexCount() > 0) window.draw(stumps);
+}
+
+// R62-F2c: above the night overlay, like drawHouseFires(): flickering flame pixels over each burning deck (thinning over
+// the last quarter of the burn) and a faint additive glow at night
+void drawBridgeFires(RenderWindow& window, const View& worldView, int frame) {
+    bool any = false;
+    for (auto& br : bridges) any = any || br.burnLeft > 0;
+    if (!any) return;
+    window.setView(worldView);
+    static VertexArray flames(PrimitiveType::Triangles), glow(PrimitiveType::Triangles);
+    flames.clear();
+    glow.clear();
+    bool night = isNightHour(game_time);
+    uint32_t cyc = (uint32_t)(frame / kFlameFlickerFrames);
+    for (auto& br : bridges) {
+        if (br.burnLeft <= 0 || br.ford < 0 || br.ford >= kFordCount) continue;
+        float a0, a1, c0, c1;
+        bridgeDeckSpan(br, a0, a1, c0, c1);
+        float left = (float)br.burnLeft / kHouseBurnTicks;
+        int n = left < 0.25f ? max(1, (int)ceil(kBridgeFlameTongues * left / 0.25f)) : kBridgeFlameTongues;
+        if (night) pushQuad(glow, riverPoint(a0 - 3.0f, c0 - 3.0f), riverPoint(a1 - a0 + 6.0f, c1 - c0 + 6.0f), kHouseFireGlowColor);
+        uint32_t alongN = (uint32_t)max(1.0f, a1 - a0 - 1.0f), acrossN = (uint32_t)max(1.0f, c1 - c0 - 1.0f);
+        for (int k = 0; k < n; k++) {
+            uint32_t h = fireHash(0x8000u + (uint32_t)br.id * 16u + (uint32_t)k, cyc);
+            Vector2f p = riverPoint(a0 + (float)(h % alongN), c0 + (float)((h >> 8) % acrossN));
+            bool tall = (h >> 20) & 1u;
+            pushQuad(flames, p - Vector2f(0.0f, tall ? 1.0f : 0.0f), Vector2f(1.0f, tall ? 2.0f : 1.0f), kFlameColors[(h >> 21) & 1u]);
+        }
+    }
+    if (glow.getVertexCount() > 0) window.draw(glow, BlendAdd);
+    if (flames.getVertexCount() > 0) window.draw(flames);
 }
 
 // R62-F2: rebuilt by riverApplyState() on every season state change. One colour per cell state: ice is a pale checker
@@ -18015,29 +18103,19 @@ void riverApplyState(riverSeasonState s) {
     for (int c = 0; c < trailGridN * trailGridN; c++) {
         riverWet[c] = riverCellFor(riverBase[c], s);
         if (riverBase[c] != riverCell::ford) continue;
-        for (auto& br : bridges) if (fordHasCell(br.ford, c)) riverWet[c] = riverCell::bridge;
+        for (auto& br : bridges) if (bridgeStanding(br) && fordHasCell(br.ford, c)) riverWet[c] = riverCell::bridge;   // R62-F2c
     }
     buildRiverVerts();
 }
 
-// R62-F2: once per sim tick, after clockk(). Applies the day's river state when it changes (so a loaded save picks it
-// up on its first tick); after a thaw or flood every barb standing in closed water is moved to the nearest dry/ford cell
-// within kRiverBankSearchCells, its path and moving/chopping/building/movingbspot flags cleared (work it held is
-// released bellTick-style, so claims and reservations are freed), with one ticker line for the lot.
-void riverSeasonTick(vector<barb>& barbs, vector<RectangleShape>& squares, storehouse (&stores)[raceCount], smokehouseSet& sh,
-                     forge& fg, fieldGrid& fields, vector<tree>& trees, const vector<CircleShape>& tris, vector<rock>& rocks,
-                     const vector<CircleShape>& octs, vector<bush>& bushes) {
-    if (!riverPlaced) return;
-    static bool first = true;
-    if (riverCrackTicks > 0) riverCrackTicks--;
-    riverSeasonState want = riverWantState();
-    if (!first && want == riverState) return;
-    riverSeasonState was = riverState;
-    riverApplyState(want);
-    if (want == riverIced && was != riverIced && !first) riverCrackTicks = kIceCrackTicks;
-    first = false;
-    printf("RIVER - %s (day %d)\n", want == riverIced ? "frozen over" : want == riverFlooded ? "fords flooded" : "open water, fords open", game_day + 1);
-    if (want == riverIced) return;
+// R62-F2 (R62-F2c: shared with the bridge torch): every barb whose cell satisfies onClosed(cell) is moved to the nearest
+// cell within kRiverBankSearchCells that is dry (dryOnly) or dry/ford/bridge, its path and moving/chopping/building/
+// movingbspot flags cleared (work it held is released bellTick-style, so claims and reservations are freed). Returns
+// how many were moved.
+template <class F>
+int riverBankPush(vector<barb>& barbs, vector<RectangleShape>& squares, storehouse (&stores)[raceCount], smokehouseSet& sh,
+                  forge& fg, fieldGrid& fields, vector<tree>& trees, const vector<CircleShape>& tris, vector<rock>& rocks,
+                  const vector<CircleShape>& octs, vector<bush>& bushes, F onClosed, bool dryOnly) {
     const int N = trailGridN;
     int pushed = 0;
     for (int i = 0; i < (int)barbs.size() && i < (int)squares.size(); i++) {
@@ -18045,7 +18123,7 @@ void riverSeasonTick(vector<barb>& barbs, vector<RectangleShape>& squares, store
         if (barbHidden(b) || b.inMine) continue;
         Vector2f pos = squares[i].getPosition();
         int c = riverCellAt(pos);
-        if (crossable(riverWet[c], true)) continue;
+        if (!onClosed(c)) continue;
         int cx = c % N, cy = c / N, best = -1;
         float bestDSq = 0.0f;
         for (int dy = -kRiverBankSearchCells; dy <= kRiverBankSearchCells; dy++)
@@ -18053,7 +18131,7 @@ void riverSeasonTick(vector<barb>& barbs, vector<RectangleShape>& squares, store
                 int x = cx + dx, y = cy + dy;
                 if (x < 0 || y < 0 || x >= N || y >= N) continue;
                 int m = y * N + x;
-                if (!crossable(riverWet[m], true)) continue;   // dry, ford or (R62-F2b) bridge: never iced here
+                if (dryOnly ? riverWet[m] != riverCell::dry : !crossable(riverWet[m], true)) continue;   // dry, ford or (R62-F2b) bridge: never iced here
                 Vector2f d = Vector2f((x + 0.5f) * trailCellSize, (y + 0.5f) * trailCellSize) - pos;
                 float dSq = d.x * d.x + d.y * d.y;
                 if (best < 0 || dSq < bestDSq) { best = m; bestDSq = dSq; }
@@ -18082,11 +18160,89 @@ void riverSeasonTick(vector<barb>& barbs, vector<RectangleShape>& squares, store
         squares[i].setPosition(Vector2f(((best % N) + 0.5f) * trailCellSize - 1.0f, ((best / N) + 0.5f) * trailCellSize - 1.0f));
         pushed++;
     }
+    return pushed;
+}
+
+// R62-F2: once per sim tick, after clockk(). Applies the day's river state when it changes (so a loaded save picks it
+// up on its first tick); after a thaw or flood every barb standing in closed water is pushed to the bank by
+// riverBankPush(), with one ticker line for the lot.
+void riverSeasonTick(vector<barb>& barbs, vector<RectangleShape>& squares, storehouse (&stores)[raceCount], smokehouseSet& sh,
+                     forge& fg, fieldGrid& fields, vector<tree>& trees, const vector<CircleShape>& tris, vector<rock>& rocks,
+                     const vector<CircleShape>& octs, vector<bush>& bushes) {
+    if (!riverPlaced) return;
+    static bool first = true;
+    if (riverCrackTicks > 0) riverCrackTicks--;
+    riverSeasonState want = riverWantState();
+    if (!first && want == riverState) return;
+    riverSeasonState was = riverState;
+    riverApplyState(want);
+    if (want == riverIced && was != riverIced && !first) riverCrackTicks = kIceCrackTicks;
+    first = false;
+    printf("RIVER - %s (day %d)\n", want == riverIced ? "frozen over" : want == riverFlooded ? "fords flooded" : "open water, fords open", game_day + 1);
+    if (want == riverIced) return;
+    int pushed = riverBankPush(barbs, squares, stores, sh, fg, fields, trees, tris, rocks, octs, bushes,
+                               [](int c) { return !crossable(riverWet[c], true); }, false);
     if (pushed > 0) {
         printf("RIVER PUSH - %d barbs moved to the bank\n", pushed);
         logEvent(string(was == riverIced ? "The thaw drives " : "The flood drives ") + to_string(pushed)
                  + (pushed == 1 ? " barb" : " barbs") + " to the bank", kRiverTickerTint);
     }
+}
+
+// R62-F2c: once per sim tick, after riverSeasonTick(). Ages every torched bridge (alight -> charred stumps -> cleared,
+// then swapRemoved: the struct holds everything, so nothing else needs syncing), then lets a won raid on its way home
+// torch the beaten race's standing bridge once a raider reaches the landing on the far side from that race's quarter.
+// One roll per raid. A torched bridge is impassable at once: riverApplyState() reverts its cells to ford (or flood) and
+// everyone on the span is pushed to dry bank by riverBankPush() (path and work flags cleared).
+void bridgeTorchTick(vector<barb>& barbs, vector<RectangleShape>& squares, storehouse (&stores)[raceCount], smokehouseSet& sh,
+                     forge& fg, fieldGrid& fields, vector<tree>& trees, const vector<CircleShape>& tris, vector<rock>& rocks,
+                     const vector<CircleShape>& octs, vector<bush>& bushes) {
+    if (!riverPlaced) return;
+    for (int i = (int)bridges.size() - 1; i >= 0; i--) {
+        riverBridge& br = bridges[i];
+        if (br.burnLeft > 0) {
+            if (--br.burnLeft == 0) {
+                br.charLeft = kHouseCharTicks;
+                printf("BRIDGE CHARRED - bridge %d over ford %d burns out\n", br.id, br.ford);
+            }
+            continue;
+        }
+        if (br.charLeft > 0 && --br.charLeft == 0) {
+            printf("BRIDGE STUMPS CLEARED - bridge %d over ford %d is gone\n", br.id, br.ford);
+            swapRemove(bridges, i);
+        }
+    }
+    if (!raid.active || raid.phase != raidParty::Home || !raid.won || raid.torchRolled) return;
+    int att = clampRace(raid.att), def = clampRace(raid.def);
+    int bi = -1;
+    for (int i = 0; i < (int)bridges.size(); i++) if (bridges[i].race == def && bridgeStanding(bridges[i])) { bi = i; break; }
+    if (bi < 0) return;
+    int k = bridges[bi].ford;
+    if (k < 0 || k >= kFordCount) return;
+    int s = 1 - riverSideAt(quarterCentre(def));   // the landing on the far side from the beaten race
+    if (s < 0 || s > 1) return;                    // quarter in the band: no far side
+    Vector2f land = fords[k].bank[s];
+    int torcher = -1;
+    for (int id : raid.raiderIds) {
+        int i = findBarbById(barbs, id);
+        if (i < 0 || i >= (int)squares.size() || barbs[i].raidBeaten) continue;
+        Vector2f d = raidCentre(squares[i]) - land;
+        if (d.x * d.x + d.y * d.y < kBridgeTorchPx * kBridgeTorchPx) { torcher = i; break; }
+    }
+    if (torcher < 0) return;
+    raid.torchRolled = true;
+    if (uniform_real_distribution<float>(0.0f, 1.0f)(gen) >= kBridgeTorchChance) {
+        printf("BRIDGE SPARED - %s (id %d) passes the %s bridge %d\n", barbs[torcher].name, barbs[torcher].id, racePlurals[def], bridges[bi].id);
+        return;
+    }
+    bridges[bi].burnLeft = kHouseBurnTicks;
+    riverApplyState(riverState);   // the span is ford (or flood) again from this tick
+    int pushed = riverBankPush(barbs, squares, stores, sh, fg, fields, trees, tris, rocks, octs, bushes,
+                               [k](int c) { return fordHasCell(k, c); }, true);
+    printf("---BRIDGE TORCHED--- %s (id %d) fires the %s bridge %d over ford %d; %d barb(s) pushed to the bank\n",
+           barbs[torcher].name, barbs[torcher].id, racePlurals[def], bridges[bi].id, k, pushed);
+    logEvent(string(racePlurals[att]) + " torch the " + racePlurals[def] + "' bridge"
+             + (pushed > 0 ? " (" + to_string(pushed) + (pushed == 1 ? " barb flees" : " barbs flee") + " the deck)" : ""), kRaidTickerTint);
 }
 
 // R30-F1: true if p is within dist of any race quarter's centre
@@ -19620,6 +19776,7 @@ int main() {
                     }
                 }
                 riverSeasonTick(barbs, squares, stores, smoke, dwarfForge, fields, trees, tris, rocks, octs, bushes);   // R62-F2: after clockk(), so ice/flood land at the midnight
+                bridgeTorchTick(barbs, squares, stores, smoke, dwarfForge, fields, trees, tris, rocks, octs, bushes);   // R62-F2c: burn timers, a won raid's torch
                 weatherTick();
                 stormTick(trees, tris, stumps, barbs, fields, houses);   // R57-F3: after weatherTick, so a summer rain's first tick schedules its strike
                 relationTick();   // R51-F4: drift to neutral and clash cooldowns, before the trader prices a visit
@@ -19818,6 +19975,7 @@ int main() {
         drawLoreCandles(window, worldView, barbs, isNightHour(t));   // R59-F3: study candles at any hour, halo at night
         drawProwlerOverlay(window, worldView, prowlers, fire);   // R48-F1: red eyes + safe-zone ring, above the night overlay
         drawHouseFires(window, worldView, houses, houseshapes, frameCount);   // R61-F1: flames on torched roofs, above the overlay
+        drawBridgeFires(window, worldView, frameCount);   // R62-F2c: flames on a torched bridge deck, above the overlay
         drawWyrmOverlay(window, worldView);   // R61-F1: ember eye + hp bar
         drawHoardGlint(window, worldView, frameCount);   // R62-F3b: gold glint over the Hollow (hunt out, or a fresh kill)
         if (wyrm.flashFrames > 0 && !paused) wyrm.flashFrames--;   // the hit flash lasts 2 drawn frames
