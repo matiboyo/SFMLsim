@@ -1108,6 +1108,21 @@ constexpr bool warReparationsKeepFloor() {
 }
 static_assert(warReparationsKeepFloor(), "war reparations must never push the loser below kWarStarveFloor food");
 static_assert(kMaxWars == 1, "warState muster and chip code is written for one war at a time");
+// R62-F3 Wyrm Truce, phase 1: when the wyrm torches a house while a war is on, one truce flag pauses the wars for
+// kTruceTicks: warTick() freezes the war clocks and holds declarations and musters (field hosts too), hostTick() sends a
+// host on the field home, raidTick() launches no raids. One truce at a time; after it ends (timeout, or no war left to
+// pause) kTruceCooldownTicks must pass before a torching can call another, so a surviving wyrm cannot pause wars forever.
+// Flag only (no barb state); unsaved, cleared on a chronicle load.
+const int kTruceTicks = 18 * ticksPerGameHour;             // the night's torching through the following day
+const int kTruceCooldownTicks = 2 * 24 * ticksPerGameHour; // ~2 game days of war before the next truce
+const Color kTruceTickerTint(198, 192, 140);               // pale olive, a shade lighter than the wyrm lines
+const float kTrucePipPx = 9.0f;                            // white-flag pip box (about one text line), left of the WAR chip
+const float kTrucePipGap = 3.0f;                           // pip -> WAR chip
+const int kTruceArcSamples = 28;                           // pixel samples round the radius-4 ring (~25px circumference)
+const Color kTruceArcColor(198, 192, 140);                 // remaining time: pale olive ring, shrinking clockwise from the top
+const Color kTruceArcTrackColor(58, 60, 48);               // the spent part of the ring: dark olive, opaque
+const Color kTruceFlagColor(238, 236, 226);                // the white flag
+const Color kTrucePoleColor(150, 138, 112);
 // R61-F2 Field Hosts and Pitched Battles, phase 1: while a war is in its window, warTick() may muster one host per side
 // (up to kHostMax drilled, armed barbs each) under a race banner. Both columns march to the field between the two crates
 // and clash through raidFightStep(); a side with fewer than kHostMinStanding unbeaten fighters breaks, drops its banner
@@ -4264,6 +4279,17 @@ bool raceEnvious(int r) {                     // the red pip shows only while th
 }
 float pairEnvy(int a, int b) { return max(wonderEnvy[a][b], wonderEnvy[b][a]); }
 int warEnemyOf(const warState& w) { return w.declarer == w.lo ? w.hi : w.lo; }
+// R62-F3: the one truce flag; read only by warTick(), hostTick() and raidTick() (and the HUD pip)
+struct wyrmTruce {
+    bool active = false;
+    int ticksLeft = 0;                      // kTruceTicks at the call
+    int cooldown = 0;                       // after a truce ends, before a torching may call the next
+};
+wyrmTruce truce;
+bool anyWarActive() {
+    for (auto& w : wars) if (w.active) return true;
+    return false;
+}
 // the war whose canonical pair is (min(a,b), max(a,b)), or -1
 int warIndexOf(int a, int b) {
     if (a < 0 || a >= raceCount || b < 0 || b >= raceCount || a == b) return -1;
@@ -4732,6 +4758,26 @@ void pushEvent(const string& text, Color tint, bool quickFade) {
 }
 
 void logEvent(const string& text, Color tint = Color::Transparent) { pushEvent(text, tint, false); }
+// R62-F3: called at the wyrm's torching; one truce at a time, none on cooldown, and only while there is a war to pause
+void callTruce() {
+    if (truce.active || truce.cooldown > 0 || !anyWarActive()) return;
+    truce.active = true;
+    truce.ticksLeft = kTruceTicks;
+    string pairs;
+    for (auto& w : wars)
+        if (w.active) pairs += string(pairs.empty() ? "" : " and ") + racePlurals[w.lo] + " and " + racePlurals[w.hi];
+    printf("---TRUCE--- %s lay down their banners while the wyrm burns (%d ticks)\n", pairs.c_str(), kTruceTicks);
+    logEvent(pairs + " call a truce against the wyrm", kTruceTickerTint);
+}
+// R62-F3: the one way a truce ends (timeout, or no war left to pause); starts the cooldown
+void endTruce(const char* why) {
+    if (!truce.active) return;
+    truce.active = false;
+    truce.ticksLeft = 0;
+    truce.cooldown = kTruceCooldownTicks;
+    printf("---TRUCE ENDS--- %s\n", why);
+    logEvent(string("The wyrm truce ends: ") + why, kTruceTickerTint);
+}
 
 // POL-F2: a line about race r's barbs, tinted with that race's ticker colour
 void logRaceEvent(const string& text, int r) { pushEvent(text, raceEventColors[clampRace(r)], true); }
@@ -7653,6 +7699,7 @@ struct hudValues {
     int day;                 // R51-F3: game_day; the season comes from seasonOf()
     bool atWar[raceCount];   // R60-F1: race is one of the two sides of a war (WAR chip in its stock panel row)
     int frame;               // R60-F1: drawn frame count, for the chip's slow pulse
+    float truceFrac;         // R62-F3: wyrm truce time left, 0..1 (0 = no truce): white-flag pip left of each WAR chip
 };
 
 // Draws one table icon at pos (top-left, screen px), one quad per filled cell
@@ -8059,6 +8106,8 @@ FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues
     FloatRect wb = warText.getLocalBounds();
     Vector2f chipSize(round(wb.size.x + 2 * kWarChipPad.x), round(wb.size.y + 2 * kWarChipPad.y));
     if (warCol) innerW += stockCellGap + chipSize.x;
+    bool truceCol = warCol && v.truceFrac > 0.0f;   // R62-F3: white-flag pip just left of the chip, same column
+    if (truceCol) innerW += kTrucePipPx + kTrucePipGap;
     float barRowH = rowH + larderBarGap + larderBarH;   // R52-F2: each race row carries its 2px larder bar underneath
     Vector2f size(round(innerW + 2 * stockPad.x), round(raceCount * barRowH + (raceCount - 1) * stockRowGap + 2 * stockPad.y));
     Vector2f pos(round(stockMargin), round(hudBarHeight + stockMargin));
@@ -8163,7 +8212,25 @@ FloatRect drawStockPanel(RenderWindow& window, const Font& font, const hudValues
             float wave = 0.5f + 0.5f * sin(6.2831853f * (v.frame % (int)kWarChipPulseFrames) / kWarChipPulseFrames);
             Color fill = kWarChipColor;
             fill.a = (uint8_t)round(kWarChipAlphaMin + (kWarChipAlphaMax - kWarChipAlphaMin) * wave);
+            if (truceCol) fill.a = kWarChipAlphaMin;   // R62-F3: the chip stops breathing while the war is paused
             Vector2f cp(round(pos.x + stockPad.x + innerW - chipSize.x), round(y + (rowH - chipSize.y) / 2.0f));
+            if (truceCol) {   // R62-F3: 9x9 pip: dark ring track, pale olive arc for the time left (clockwise from the top),
+                              // a 1x5 pole and 3x2 white flag inside it
+                Vector2f pp(cp.x - kTrucePipGap - kTrucePipPx, round(y + (rowH - kTrucePipPx) / 2.0f));
+                VertexArray va(PrimitiveType::Triangles);
+                float half = floor(kTrucePipPx / 2.0f);   // centre pixel 4, ring radius 4: pixels 0..8
+                int lit = max(1, (int)ceil(v.truceFrac * kTruceArcSamples));
+                for (int pass = 0; pass < 2; pass++)   // track first, then the lit arc over any pixel the two share
+                    for (int k = 0; k < kTruceArcSamples; k++) {
+                        if ((k < lit) != (pass == 1)) continue;
+                        float a = -1.5707963f + 6.2831853f * k / kTruceArcSamples;
+                        Vector2f px(round(half + half * cos(a)), round(half + half * sin(a)));
+                        pushQuad(va, pp + px, Vector2f(1.0f, 1.0f), pass == 1 ? kTruceArcColor : kTruceArcTrackColor);
+                    }
+                pushQuad(va, pp + Vector2f(3.0f, 2.0f), Vector2f(1.0f, 5.0f), empty ? stockEmptyRaceColor : kTrucePoleColor);
+                pushQuad(va, pp + Vector2f(4.0f, 2.0f), Vector2f(3.0f, 2.0f), empty ? stockEmptyRaceColor : kTruceFlagColor);
+                window.draw(va);
+            }
             RectangleShape chip(chipSize);
             chip.setPosition(cp);
             chip.setFillColor(fill);
@@ -10366,6 +10433,7 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
     resetHeal(barbs);     // R60-F2: nor a cure's immunity or its ring
     resetHosts(barbs);    // R61-F2: hosts are never saved; any on the field dissolve
     for (auto& row : wonderEnvy) for (auto& e : row) e = 0.0f;   // R61-F4b: envy is never saved
+    truce = wyrmTruce{};  // R62-F3: nor the truce
     if (d.barbs.empty()) {
         for (auto& b : barbs) b.bornHour = chronicleNowHour() - founderAgeHours();   // founders arrive on the restored clock (R57-F1: grown)
         printf("CHRONICLE - no barbs saved: the %d founders stay\n", (int)barbs.size());
@@ -12200,6 +12268,7 @@ void wyrmTick(const vector<house>& houses, const vector<RectangleShape>& housesh
             wyrm.restTicks = kWyrmLoiterRestTicks;
             printf("WYRM %d TORCHES house %d (%s) at (%d, %d)\n", wyrm.id, h.id + 1, racePlurals[r], h.x, h.y);
             logEvent(string("The wyrm sets a house of the ") + racePlurals[r] + " ablaze", kWyrmTickerColor);
+            callTruce();   // R62-F3: wars pause while the wyrm burns (one truce, cooldown, timeout)
             return;
         }
     } else if (wyrm.phase == wyrmLoiter) {
@@ -13686,6 +13755,9 @@ void warTick(vector<barb>& barbs, const vector<RectangleShape>& squares, const s
         for (int b = a + 1; b < raceCount; b++)
             if (warCooldown[a][b] > 0) warCooldown[a][b] = --warCooldown[b][a];
     for (auto& row : wonderEnvy) for (auto& e : row) e = max(0.0f, e - kEnvyDecayPerTick);   // R61-F4b: envy fades
+    if (!truce.active && truce.cooldown > 0) truce.cooldown--;   // R62-F3: truce clock, timeout and cooldown
+    if (truce.active && !anyWarActive()) endTruce("no war is left to pause");
+    else if (truce.active && --truce.ticksLeft <= 0) endTruce("the wars resume");
     bool check = --checkTimer <= 0;
     if (check) checkTimer = kWarCheckTicks;
     int living[raceCount] = {};
@@ -13701,6 +13773,7 @@ void warTick(vector<barb>& barbs, const vector<RectangleShape>& squares, const s
             continue;
         }
         if (isAllied(d, e)) { endWar(w, false, "the two are allied now"); openSlots++; continue; }
+        if (truce.active) continue;   // R62-F3: clocks frozen, no treaty, muster or field host while the truce holds
         war.ticks++;
         if (war.bypassTicks > 0) war.bypassTicks--;
         if (war.gapTicks < kWarRaidGapTicks) war.gapTicks++;
@@ -13727,7 +13800,7 @@ void warTick(vector<barb>& barbs, const vector<RectangleShape>& squares, const s
         }
         tryMusterHost(barbs, squares, stores, w);   // R61-F2: the field host, on the same throttled check
     }
-    if (!check || openSlots <= 0) return;
+    if (!check || openSlots <= 0 || truce.active) return;   // R62-F3: no declarations during a truce
     for (int a = 0; a < raceCount; a++)
         for (int b = a + 1; b < raceCount; b++) {
             float v = raceRelation[a][b];
@@ -14115,6 +14188,7 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
     }
 
     if (!raid.active) {
+        if (truce.active) return;   // R62-F3: the truce holds every raid launch (a raid already out plays on to its end)
         if (--checkTimer <= 0) { checkTimer = kRaidCheckTicks; tryLaunchRaid(barbs, squares, stores); }
         return;
     }
@@ -14461,9 +14535,11 @@ void hostTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
     if (host.phase != warHost::Home) {
         int w = host.war;
         bool warOn = w >= 0 && w < kMaxWars && wars[w].active && wars[w].lo == min(r0, r1) && wars[w].hi == max(r0, r1);
-        if (!warOn || !stores[r0].built || !stores[r1].built) {
-            printf("---HOST DISSOLVED--- %s (%s)\n", pairText.c_str(), warOn ? "crate gone" : "the war is over");
-            logEvent(pairText + " leave the field", kHostTickerTint);
+        if (!warOn || !stores[r0].built || !stores[r1].built || truce.active) {   // R62-F3: or the wyrm truce calls them off
+            printf("---HOST DISSOLVED--- %s (%s)\n", pairText.c_str(),
+                   !warOn ? "the war is over" : truce.active ? "wyrm truce" : "crate gone");
+            logEvent(pairText + (truce.active && warOn ? " leave the field for the truce" : " leave the field"),
+                     truce.active && warOn ? kTruceTickerTint : kHostTickerTint);
             endHost(barbs, squares);
             return;
         }
@@ -18923,6 +18999,7 @@ int main() {
             for (int r = 0; r < raceCount; r++) hv.atWar[r] = false;   // R60-F1
             for (auto& w : wars) if (w.active) hv.atWar[w.lo] = hv.atWar[w.hi] = true;
             hv.frame = frameCount;
+            hv.truceFrac = truce.active ? clamp((float)truce.ticksLeft / kTruceTicks, 0.0f, 1.0f) : 0.0f;   // R62-F3
             for (int r = 0; r < raceCount; r++)   // R55-F2: one pip row per race
                 for (int k = 0; k < techCount; k++) {
                     hv.learned[r][k] = know[r].learned[k];
