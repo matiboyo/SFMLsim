@@ -1163,6 +1163,24 @@ const char* const kHostFlagMask[raceCount][kHostFlagRows] = {
 const float kHostDroppedDim = 0.45f;            // a dropped banner's colour, lerped this far toward the pole brown
 const Color kHostTickerTint(214, 150, 96);      // muted amber: muster, battle and homecoming lines
 
+// R62-F1 Border Cairns, phase 1: each race claims a disc of radius claimR[r] round its crate centre, ringed by stone
+// cairns at fixed angles. A field host win moves kClaimPushPx of border from the loser to the winner (each race kept
+// within kClaimShiftMaxPx of kClaimBaseRadius); the drawn ring slides there over kClaimSlideFrames. The loser's cairn
+// facing the winner topples into a grey smudge for a day (a timer on that cairn's entry). Not saved: resetClaims().
+const float kClaimBaseRadius = 150.0f;          // px from the crate centre; two base discs stay clear (crates >= ~360 apart)
+const float kClaimPushPx = 10.0f;               // border moved per field win
+const float kClaimShiftMaxPx = 30.0f;           // total shift either way per race, so a disc stays within 120..180
+const int kClaimSlideFrames = 60;               // ~1s at 60fps for one push to slide (drawn frames, frozen while paused)
+const int kClaimDiscSegs = 96;                  // disc / edge ring segments
+const uint8_t kClaimDiscAlpha = 14;             // very faint fill
+const uint8_t kClaimEdgeAlpha = 40;             // the 1px border ring, still faint
+const int kCairnsPerRace = 12;                  // ~78px apart on the base ring
+const int kCairnSmudgeTicks = 24 * ticksPerGameHour;   // a toppled cairn's smudge fades out over one game day
+const Color kCairnStoneColor(150, 146, 134);    // pale weathered stone, reads on the dark grass
+const Color kCairnShadeColor(108, 104, 96);     // the cairn's base row
+const Color kCairnSmudgeColor(118, 116, 110);   // toppled: a flat grey smear
+const uint8_t kCairnSmudgeAlpha = 150;          // smudge alpha at the moment it falls
+
 // Skittish deer: bolt away from a nearby barb for a short, capped time, then a cooldown so hunts can still land
 const int deerStepInterval = 3;            // ticks per 1px step while wandering (deer row of speciesDefs)
 const int deerFleeStepInterval = 1;        // ticks per 1px step while fleeing (3x wander speed; barbs step every 10)
@@ -4363,6 +4381,65 @@ void resetHosts(vector<barb>& barbs) {
     hostCooldown = 0;
     for (auto& d : droppedBanners) d = droppedBanner{};
     hostDusts.clear();
+}
+
+// R62-F1: per race claim radius (the target) and the radius drawn (slides toward it); cairn k of race r stands at
+// quarterCentre(r) + claimShownR[r] * dir(k), so the cairns are derived from the claim. A toppled cairn's entry holds its
+// smudge: smudgeTicks > 0 means it is down, smudgePos where it fell. One timer per entry, so smudges never pile up.
+struct claimCairn { int smudgeTicks = 0; Vector2f smudgePos; };
+float claimR[raceCount] = {kClaimBaseRadius, kClaimBaseRadius, kClaimBaseRadius};
+float claimShownR[raceCount] = {kClaimBaseRadius, kClaimBaseRadius, kClaimBaseRadius};
+claimCairn cairns[raceCount][kCairnsPerRace];
+// R62-F1: the one reset (startup and chronicle load): claims back to the base disc round each crate, every cairn standing.
+// Phase 2 resets plotOwner[] here with claimR.
+void resetClaims() {
+    for (int r = 0; r < raceCount; r++) {
+        claimR[r] = claimShownR[r] = kClaimBaseRadius;
+        for (auto& c : cairns[r]) c = claimCairn{};
+    }
+}
+Vector2f cairnDir(int k) {
+    float a = 6.2831853f * k / kCairnsPerRace;
+    return Vector2f(cos(a), sin(a));
+}
+// R62-F1: squared-distance claim test: the race whose claim disc holds p (nearest crate when two overlap), else -1
+int claimOwnerAt(Vector2f p) {
+    int best = -1;
+    float bestD = 0.0f;
+    for (int r = 0; r < raceCount; r++) {
+        Vector2f d = p - quarterCentre(r);
+        float d2 = d.x * d.x + d.y * d.y;
+        if (d2 < claimR[r] * claimR[r] && (best < 0 || d2 < bestD)) { best = r; bestD = d2; }
+    }
+    return best;
+}
+// R62-F1: the cairn of race r that faces race toward (largest dot with the crate-to-crate direction)
+int cairnFacing(int r, int toward) {
+    Vector2f d = quarterCentre(toward) - quarterCentre(r);
+    int best = 0;
+    float bestDot = -1e9f;
+    for (int k = 0; k < kCairnsPerRace; k++) {
+        Vector2f u = cairnDir(k);
+        float dot = u.x * d.x + u.y * d.y;
+        if (dot > bestDot) { bestDot = dot; best = k; }
+    }
+    return best;
+}
+// R62-F1: called by hostTick() when a field is won. Moves border from loser to winner within the per-race cap; the
+// loser's facing cairn topples where it stood (its one timer restarts), the winner's facing cairn is raised again.
+void pushClaim(int win, int lose) {
+    if (win < 0 || win >= raceCount || lose < 0 || lose >= raceCount || win == lose) return;
+    float oldW = claimR[win], oldL = claimR[lose];
+    claimR[win] = min(claimR[win] + kClaimPushPx, kClaimBaseRadius + kClaimShiftMaxPx);
+    claimR[lose] = max(claimR[lose] - kClaimPushPx, kClaimBaseRadius - kClaimShiftMaxPx);
+    if (claimR[lose] < oldL) {
+        int k = cairnFacing(lose, win);
+        cairns[lose][k].smudgeTicks = kCairnSmudgeTicks;
+        cairns[lose][k].smudgePos = quarterCentre(lose) + cairnDir(k) * claimShownR[lose];
+    }
+    cairns[win][cairnFacing(win, lose)].smudgeTicks = 0;
+    printf("BORDER PUSH - %s claim %.0f -> %.0f, %s claim %.0f -> %.0f\n", racePlurals[win], oldW, claimR[win],
+           racePlurals[lose], oldL, claimR[lose]);
 }
 
 // R52-F1: the one way out of the raid state, on every exit (outcome, abort, beaten defender, removeBarb, backstop)
@@ -10432,6 +10509,7 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
     resetPlague(barbs);   // R59-F2: no case, immunity or outbreak survives a load (returners are cleared again in makeBarb())
     resetHeal(barbs);     // R60-F2: nor a cure's immunity or its ring
     resetHosts(barbs);    // R61-F2: hosts are never saved; any on the field dissolve
+    resetClaims();        // R62-F1: nor the borders; claims start again from the base disc round each crate
     for (auto& row : wonderEnvy) for (auto& e : row) e = 0.0f;   // R61-F4b: envy is never saved
     truce = wyrmTruce{};  // R62-F3: nor the truce
     if (d.barbs.empty()) {
@@ -14505,6 +14583,7 @@ bool tryMusterHost(vector<barb>& barbs, const vector<RectangleShape>& squares, c
 void hostTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
     if (hostCooldown > 0) hostCooldown--;
     for (auto& d : droppedBanners) if (d.ticks > 0) d.ticks--;
+    for (auto& row : cairns) for (auto& c : row) if (c.smudgeTicks > 0) c.smudgeTicks--;   // R62-F1: smudges fade within their day
     int n = min((int)barbs.size(), (int)squares.size());
     for (int i = 0; i < n; i++) {   // backstop: a host flag with no host entry behind it is cleared
         barb& b = barbs[i];
@@ -14606,6 +14685,7 @@ void hostTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
         printf("---HOST BATTLE--- %s (%d vs %d standing, %d ticks, wins %d / %d)\n", line.c_str(), standing[win], standing[lose],
                host.ticks, war.wins[0], war.wins[1]);
         logEvent(line, kHostTickerTint);
+        pushClaim(clampRace(host.race[win]), clampRace(host.race[lose]));   // R62-F1: the winner's border moves toward the loser
         releaseHostSide(barbs, squares, lose, true);
         if (standing[win] <= 0) { endHost(barbs, squares); return; }
         host.phase = warHost::Home;
@@ -14648,6 +14728,68 @@ void drawHostGround(RenderWindow& window) {
             for (int c = 0; c < kHostFlagCols; c++)
                 if (kHostFlagMask[d.race][row][c] == '#')
                     pushQuad(va, Vector2f(fx - c, p.y - kHostFlagRows + row), Vector2f(1.0f, 1.0f), flag);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R62-F1: ground layer, under lakes and buildings: each built crate's claim disc in its lifted crate colour, a very faint
+// fill with a faint 1px edge ring. The drawn radius slides toward claimR (one push over kClaimSlideFrames).
+void drawClaimDiscs(RenderWindow& window, const storehouse (&stores)[raceCount], const FloatRect& camRect, bool paused) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    const float slide = kClaimPushPx / kClaimSlideFrames;
+    for (int r = 0; r < raceCount; r++) {
+        if (!paused) {
+            float d = claimR[r] - claimShownR[r];
+            claimShownR[r] += clamp(d, -slide, slide);
+        }
+        if (!stores[r].built) continue;
+        float R = claimShownR[r];
+        Vector2f c = quarterCentre(r);
+        if (!camRect.findIntersection(FloatRect(c - Vector2f(R, R), Vector2f(2.0f * R, 2.0f * R))).has_value()) continue;
+        Color fill = MM_STORE_COLORS[r], edge = MM_STORE_COLORS[r];
+        fill.a = kClaimDiscAlpha;
+        edge.a = kClaimEdgeAlpha;
+        for (int s = 0; s < kClaimDiscSegs; s++) {
+            float a0 = 6.2831853f * s / kClaimDiscSegs, a1 = 6.2831853f * (s + 1) / kClaimDiscSegs;
+            Vector2f u0(cos(a0), sin(a0)), u1(cos(a1), sin(a1));
+            Vector2f i0 = c + u0 * (R - 0.5f), i1 = c + u1 * (R - 0.5f), o0 = c + u0 * (R + 0.5f), o1 = c + u1 * (R + 0.5f);
+            va.append(Vertex{c, fill}); va.append(Vertex{i0, fill}); va.append(Vertex{i1, fill});   // fill stops at the ring
+            va.append(Vertex{i0, edge}); va.append(Vertex{o0, edge}); va.append(Vertex{o1, edge});
+            va.append(Vertex{i0, edge}); va.append(Vertex{o1, edge}); va.append(Vertex{i1, edge});
+        }
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R62-F1: with the grave stones, under the buildings: each built crate's standing cairns on its drawn ring (3x3: a 1px
+// cap in the race colour, a stone row, a shaded base row) and its toppled cairns as flat 3x2 grey smudges fading out
+// over their day. A cairn whose spot lies in water or inside a rival's claim is not drawn.
+void drawClaimCairns(RenderWindow& window, const storehouse (&stores)[raceCount], const FloatRect& camRect) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (int r = 0; r < raceCount; r++) {
+        if (!stores[r].built) continue;
+        for (int k = 0; k < kCairnsPerRace; k++) {
+            const claimCairn& cc = cairns[r][k];
+            if (cc.smudgeTicks > 0) {
+                Vector2f p = snapPx(cc.smudgePos - Vector2f(1.5f, 1.0f));
+                if (!camRect.contains(p) || !lakeClear(FloatRect(p, Vector2f(3.0f, 2.0f)))) continue;
+                Color c = kCairnSmudgeColor;
+                c.a = (uint8_t)(kCairnSmudgeAlpha * (float)cc.smudgeTicks / kCairnSmudgeTicks);
+                pushQuad(va, p, Vector2f(3.0f, 2.0f), c);
+                continue;
+            }
+            Vector2f spot = quarterCentre(r) + cairnDir(k) * claimShownR[r];
+            Vector2f p = snapPx(spot - Vector2f(1.5f, 1.5f));
+            if (!camRect.contains(p) || !lakeClear(FloatRect(p, Vector2f(3.0f, 3.0f)))) continue;
+            int owner = claimOwnerAt(spot);
+            if (owner >= 0 && owner != r) continue;
+            Color cap = MM_STORE_COLORS[r];
+            pushQuad(va, p + Vector2f(1.0f, 0.0f), Vector2f(1.0f, 1.0f), cap);
+            pushQuad(va, p + Vector2f(0.0f, 1.0f), Vector2f(3.0f, 1.0f), kCairnStoneColor);
+            pushQuad(va, p + Vector2f(0.0f, 2.0f), Vector2f(3.0f, 1.0f), kCairnShadeColor);
+        }
     }
     if (va.getVertexCount() > 0) window.draw(va);
 }
@@ -18465,6 +18607,7 @@ int main() {
     barbs.reserve(numbarbs);
     squares.reserve(numbarbs);
     placeQuarters();  // R30-F1: crates first, so founders, lakes and bushes can use the quarters
+    resetClaims();    // R62-F1: base claim discs round the crates just placed
     if (quarterFallbackUsed) logEvent("Quarters: random layout failed, fixed layout used");   // INBOX-F3: once per layout
     spawnRiver();     // R61-F3: after the crates (it keeps clear of every quarter), before anything else is placed
     buildRiverVerts();   // R61-F3: static quads, empty when no river passed the check
@@ -18806,6 +18949,7 @@ int main() {
         drawWalls(window, wallVerts);    // R31-F2: under paving, quarter marks, buildings and barbs
         drawPaving(window, paveVerts);   // over the trail tint, under everything else
         drawQuarters(window, zoom);   // R30-F1: ground marks, under lakes, houses and crates
+        drawClaimDiscs(window, stores, camRect, paused);   // R62-F1: faint claim discs, under lakes and buildings
         drawLakes(window);
         drawRiver(window);   // R61-F3: with the lakes, under the lens, rocks, buildings and barbs
         drawLens(window, lensVerts, worldView, lens, barbs, squares, houses, houseshapes, stores);   // UIO-F3: under rocks, buildings and barbs
@@ -18813,6 +18957,7 @@ int main() {
 	drawRocks(window, octs, rockGold, rockVerts, camRect);   // R46-F1a: gold rocks get one pale-gold fleck pixel
 	drawBushes(window, bushshapes, bushVerts, camRect);
 	drawGraves(window, camRect);   // R47-F9: ancestor stones, on the ground under the buildings
+	drawClaimCairns(window, stores, camRect);   // R62-F1: border cairns + toppled smudges, with the stones, under the buildings
 	drawWonder(window);   // R60-F3: muted wonder silhouette behind every building, barb and tree
 
 	{
