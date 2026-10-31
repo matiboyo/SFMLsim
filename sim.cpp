@@ -1202,6 +1202,10 @@ const int kClaimSlideFrames = 60;               // ~1s at 60fps for one push to 
 const int kClaimDiscSegs = 96;                  // disc / edge ring segments
 const uint8_t kClaimDiscAlpha = 14;             // very faint fill
 const uint8_t kClaimEdgeAlpha = 40;             // the 1px border ring, still faint
+// R62-F1b Border Cairns, phase 2: a push that takes ground from the loser seizes its tree or bush (by work spot) in that
+// lost ring nearest the winner's crate; plotOwner[] holds it and the gather search lets only the winner's barbs take it.
+const int kSeizedPlotsMax = 16;                 // seized work spots held at once (oldest overwritten when full)
+const float kSeizeMatchPx = 1.5f;               // a candidate's work spot within this of a seized spot is that plot
 const int kCairnsPerRace = 12;                  // ~78px apart on the base ring
 const int kCairnSmudgeTicks = 24 * ticksPerGameHour;   // a toppled cairn's smudge fades out over one game day
 const Color kCairnStoneColor(150, 146, 134);    // pale weathered stone, reads on the dark grass
@@ -4475,14 +4479,36 @@ struct claimCairn { int smudgeTicks = 0; Vector2f smudgePos; };
 float claimR[raceCount] = {kClaimBaseRadius, kClaimBaseRadius, kClaimBaseRadius};
 float claimShownR[raceCount] = {kClaimBaseRadius, kClaimBaseRadius, kClaimBaseRadius};
 claimCairn cairns[raceCount][kCairnsPerRace];
+// R62-F1b: one seized tree/bush plot, keyed by its work spot (never an index, so swapRemove leaves nothing stale; a felled
+// tree's entry just matches nothing). owner < 0 = free slot; from = the race it was taken from.
+struct seizedPlot { Vector2f spot; int owner = -1; int from = -1; };
+seizedPlot plotOwner[kSeizedPlotsMax];
+int plotOwnerNext = 0;    // ring slot overwritten when every entry is taken
+int plotsSeized = 0;      // live entries, so the gather filters cost nothing before the first seizure
 // R62-F1: the one reset (startup and chronicle load): claims back to the base disc round each crate, every cairn standing.
-// Phase 2 resets plotOwner[] here with claimR.
+// R62-F1b: plotOwner[] is reset here with claimR.
 void resetClaims() {
     for (int r = 0; r < raceCount; r++) {
         claimR[r] = claimShownR[r] = kClaimBaseRadius;
         for (auto& c : cairns[r]) c = claimCairn{};
     }
+    for (auto& p : plotOwner) p = seizedPlot{};
+    plotOwnerNext = plotsSeized = 0;
 }
+// R62-F1b: the seized entry whose spot is p (squared-distance match), or -1
+int seizedPlotAt(Vector2f p) {
+    if (plotsSeized == 0) return -1;
+    for (int k = 0; k < kSeizedPlotsMax; k++) {
+        if (plotOwner[k].owner < 0) continue;
+        Vector2f d = p - plotOwner[k].spot;
+        if (d.x * d.x + d.y * d.y < kSeizeMatchPx * kSeizeMatchPx) return k;
+    }
+    return -1;
+}
+// R62-F1b: gather filters. Held off: seized by a race other than race. Seized by: held by race itself.
+bool plotHeldOff(Vector2f p, int race) { int k = seizedPlotAt(p); return k >= 0 && plotOwner[k].owner != race; }
+bool plotSeizedBy(Vector2f p, int race) { int k = seizedPlotAt(p); return k >= 0 && plotOwner[k].owner == race; }
+Vector2f bushWorkSpot(const CircleShape& bs);
 Vector2f cairnDir(int k) {
     float a = 6.2831853f * k / kCairnsPerRace;
     return Vector2f(cos(a), sin(a));
@@ -4512,15 +4538,53 @@ int cairnFacing(int r, int toward) {
 }
 // R62-F1: called by hostTick() when a field is won. Moves border from loser to winner within the per-race cap; the
 // loser's facing cairn topples where it stood (its one timer restarts), the winner's facing cairn is raised again.
-void pushClaim(int win, int lose) {
+// R62-F1b: the loser's tree or bush whose work spot lies in the ring it just lost (newR..oldR round its crate), nearest
+// the winner's crate, is seized for the winner. One scan per push (an event), nothing per tick.
+void seizePlot(int win, int lose, float oldR, float newR, const vector<CircleShape>& tris, const vector<CircleShape>& bushshapes) {
+    Vector2f lc = quarterCentre(lose), wc = quarterCentre(win);
+    Vector2f best;
+    float bestD = numeric_limits<float>::infinity();
+    bool isBush = false;
+    auto consider = [&](Vector2f p, bool bush) {
+        Vector2f d = p - lc;
+        float d2 = d.x * d.x + d.y * d.y;
+        if (d2 < newR * newR || d2 >= oldR * oldR || seizedPlotAt(p) >= 0) return;
+        Vector2f w = p - wc;
+        float w2 = w.x * w.x + w.y * w.y;
+        if (w2 < bestD) { bestD = w2; best = p; isBush = bush; }
+    };
+    for (const auto& t : tris) consider(t.getPosition() + treeWorkOffset, false);
+    for (const auto& bs : bushshapes) consider(bushWorkSpot(bs), true);
+    if (bestD == numeric_limits<float>::infinity()) {
+        printf("PLOT SEIZE - no tree or bush in the %s' lost ground\n", racePlurals[lose]);
+        return;
+    }
+    int slot = -1;
+    for (int k = 0; k < kSeizedPlotsMax && slot < 0; k++) if (plotOwner[k].owner < 0) slot = k;
+    if (slot < 0) { slot = plotOwnerNext; plotOwnerNext = (plotOwnerNext + 1) % kSeizedPlotsMax; plotsSeized--; }
+    plotOwner[slot].spot = best;
+    plotOwner[slot].owner = win;
+    plotOwner[slot].from = lose;
+    plotsSeized++;
+    printf("PLOT SEIZED - %s take a %s at %d,%d from the %s (%d held)\n", racePlurals[win], isBush ? "bush" : "tree",
+           (int)best.x, (int)best.y, racePlurals[lose], plotsSeized);
+}
+void pushClaim(int win, int lose, const vector<CircleShape>& tris, const vector<CircleShape>& bushshapes) {
     if (win < 0 || win >= raceCount || lose < 0 || lose >= raceCount || win == lose) return;
     float oldW = claimR[win], oldL = claimR[lose];
     claimR[win] = min(claimR[win] + kClaimPushPx, kClaimBaseRadius + kClaimShiftMaxPx);
     claimR[lose] = max(claimR[lose] - kClaimPushPx, kClaimBaseRadius - kClaimShiftMaxPx);
+    for (auto& p : plotOwner)   // R62-F1b: a border swinging back hands the winner's own seized plots home again
+        if (p.owner == lose && p.from == win) {
+            printf("PLOT RETURNED - %s regain the plot at %d,%d\n", racePlurals[win], (int)p.spot.x, (int)p.spot.y);
+            p = seizedPlot{};
+            plotsSeized--;
+        }
     if (claimR[lose] < oldL) {
         int k = cairnFacing(lose, win);
         cairns[lose][k].smudgeTicks = kCairnSmudgeTicks;
         cairns[lose][k].smudgePos = quarterCentre(lose) + cairnDir(k) * claimShownR[lose];
+        seizePlot(win, lose, oldL, claimR[lose], tris, bushshapes);   // R62-F1b
     }
     cairns[win][cairnFacing(win, lose)].smudgeTicks = 0;
     printf("BORDER PUSH - %s claim %.0f -> %.0f, %s claim %.0f -> %.0f\n", racePlurals[win], oldW, claimR[win],
@@ -14677,7 +14741,8 @@ bool tryMusterHost(vector<barb>& barbs, const vector<RectangleShape>& squares, c
 // fighter goes for the nearest unbeaten foe through raidFightStep(); a beaten one leaves the host at once. A side under
 // kHostMinStanding breaks; kHostStallTicks forces the outcome as the field stands. The war scores it, the losers drop
 // their banner and are released, and the winners march home (released at their crate, or after kHostHomeMaxTicks).
-void hostTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
+void hostTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount],
+              const vector<CircleShape>& tris, const vector<CircleShape>& bushshapes) {   // R62-F1b: tris/bushes for pushClaim
     if (hostCooldown > 0) hostCooldown--;
     for (auto& d : droppedBanners) if (d.ticks > 0) d.ticks--;
     for (auto& row : cairns) for (auto& c : row) if (c.smudgeTicks > 0) c.smudgeTicks--;   // R62-F1: smudges fade within their day
@@ -14782,7 +14847,7 @@ void hostTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
         printf("---HOST BATTLE--- %s (%d vs %d standing, %d ticks, wins %d / %d)\n", line.c_str(), standing[win], standing[lose],
                host.ticks, war.wins[0], war.wins[1]);
         logEvent(line, kHostTickerTint);
-        pushClaim(clampRace(host.race[win]), clampRace(host.race[lose]));   // R62-F1: the winner's border moves toward the loser
+        pushClaim(clampRace(host.race[win]), clampRace(host.race[lose]), tris, bushshapes);   // R62-F1: the winner's border moves toward the loser
         releaseHostSide(barbs, squares, lose, true);
         if (standing[win] <= 0) { endHost(barbs, squares); return; }
         host.phase = warHost::Home;
@@ -16740,6 +16805,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             float treeDSq, rockDSq, bushDSq;
             int bestTree = findNearestTree(tris, bpos, barbWorkSearchRadius,   // R47-F1: grid, nearby cells only
                                        [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j)
+                                                           || plotHeldOff(tris[i].getPosition() + treeWorkOffset, b.race)   // R62-F1b
                                                            || !regionReachable(bpos, tris[i].getPosition() + treeWorkOffset); }, &treeDSq);   // R61-F3
             int bestRock = findNearest(bpos, barbWorkSearchRadius, (int)rocks.size(),
                                        [&](int k) { return octs[k].getPosition() + rockWorkOffset; },
@@ -16757,7 +16823,8 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             bool anyRock = bestRock != -1 || shaftPick;
             int bestBush = findNearest(bpos, barbWorkSearchRadius, (int)bushes.size(),
                                        [&](int k) { return bushWorkSpot(bushshapes[k]); },
-                                       [&](int k) { return !bushes[k].ripe || bushes[k].picking; }, &bushDSq);
+                                       [&](int k) { return !bushes[k].ripe || bushes[k].picking
+                                                           || plotHeldOff(bushWorkSpot(bushshapes[k]), b.race); }, &bushDSq);   // R62-F1b
             // need weighting: wood short of a house makes trees count as nearer. Scores are squared
             // distances divided by weight^2; not-found stays infinite so a boosted miss never wins.
             float woodShort = clamp((float)(houseWoodCost - stockOf(b).wood) / (float)houseWoodCost, 0.0f, 1.0f);   // RACE-F1: own race
@@ -16823,6 +16890,7 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                     if (m.kind == memTree)
                         hit = findNearestTree(tris, m.pos, memSpotRadius,
                                           [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j)
+                                                              || plotHeldOff(tris[i].getPosition() + treeWorkOffset, b.race)   // R62-F1b
                                                               || !regionReachable(bpos, tris[i].getPosition() + treeWorkOffset); });   // R61-F3
                     else if (m.kind == memRock)
                         hit = findNearest(m.pos, memSpotRadius, (int)rocks.size(),
@@ -16831,7 +16899,8 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                     else
                         hit = findNearest(m.pos, memSpotRadius, (int)bushes.size(),
                                           [&](int i) { return bushWorkSpot(bushshapes[i]); },
-                                          [&](int i) { return !bushes[i].ripe || bushes[i].picking; });
+                                          [&](int i) { return !bushes[i].ripe || bushes[i].picking
+                                                              || plotHeldOff(bushWorkSpot(bushshapes[i]), b.race); });   // R62-F1b
                     if (hit == -1) { memDrop(b, k); memStale = true; continue; }   // stale: cleared, [k] now holds the next
                     if (m.kind == memTree) {
                         Vector2f tp = tris[hit].getPosition();
@@ -16923,7 +16992,9 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 // R47-F3: race-aware: the wide look never reaches into another race's frontier
                 int wTree = findNearestTree(tris, bpos, barbWorkFallbackRadius,
                                         [&](int i) { return trees[i].dying || (treeClaim[i] != -1 && treeClaim[i] != j)
-                                                            || inOtherFrontier(tris[i].getPosition() + treeWorkOffset, b.race)
+                                                            || plotHeldOff(tris[i].getPosition() + treeWorkOffset, b.race)   // R62-F1b
+                                                            || (inOtherFrontier(tris[i].getPosition() + treeWorkOffset, b.race)
+                                                                && !plotSeizedBy(tris[i].getPosition() + treeWorkOffset, b.race))
                                                             || !regionReachable(bpos, tris[i].getPosition() + treeWorkOffset); }, &wTreeDSq);   // R61-F3
                 int wRock = findNearest(bpos, barbWorkFallbackRadius, (int)rocks.size(),
                                         [&](int k) { return octs[k].getPosition() + rockWorkOffset; },
@@ -16932,7 +17003,9 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
                 int wBush = findNearest(bpos, barbWorkFallbackRadius, (int)bushes.size(),
                                         [&](int k) { return bushWorkSpot(bushshapes[k]); },
                                         [&](int k) { return !bushes[k].ripe || bushes[k].picking
-                                                            || inOtherFrontier(bushWorkSpot(bushshapes[k]), b.race); }, &wBushDSq);
+                                                            || plotHeldOff(bushWorkSpot(bushshapes[k]), b.race)   // R62-F1b
+                                                            || (inOtherFrontier(bushWorkSpot(bushshapes[k]), b.race)
+                                                                && !plotSeizedBy(bushWorkSpot(bushshapes[k]), b.race)); }, &wBushDSq);
                 float wTreeScore = wTree != -1 ? wTreeDSq / (treeW * treeW) : notFound;
                 float wRockScore = wRock != -1 ? wRockDSq / (rockW * rockW) : notFound;
                 float wBushScore = wBush != -1 ? wBushDSq / (bushW * bushW) : notFound;
@@ -19381,7 +19454,7 @@ int main() {
                 wyrmTick(houses, houseshapes);   // R61-F1: house burns, wake, the night's torching; wyrmThreat[] for bellTick()
                 watchTick(barbs, squares, prowlers);   // R51-F1: watchmen patrol and fight; slain prowlers fade, prowlerTick() removes them
                 warTick(barbs, squares, stores);   // R60-F1: declarations, muster and treaties, before the raid launcher reads the wars
-                hostTick(barbs, squares, stores);   // R61-F2: field hosts march, clash and go home; before the raids and the bell
+                hostTick(barbs, squares, stores, tris, bushshapes);   // R61-F2: field hosts march, clash and go home; before the raids and the bell
                 huntTick(barbs, squares);   // R62-F3b: the truce's joint Hollow hunt (muster, gather, march, hoard)
                 raidTick(barbs, squares, stores);   // R52-F1: raid march and fight; sets raidThreat[] for bellTick() just below
                 caravanTick(barbs, squares, stores);   // R54-F1: caravans, swaps and the friendly timers, once per sim tick
