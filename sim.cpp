@@ -2348,6 +2348,22 @@ const Color kRiverFloodB(38, 52, 78);
 const Color kRiverFloodSilt(76, 78, 66);           // one 3x1 silt streak per flooded cell, so it reads muddy
 const int kRiverBankSearchCells = 6;               // bank push: dry/ford cells searched within this many cells
 const Color kRiverTickerTint(150, 180, 214);       // cold river blue on the black ticker strip
+// R62-F2b Bridges, phase 2: a race whose crate stands and that has kBridgeMinHouses houses sends one builder to the
+// near-bank landing of its ford (the ford nearest its crate) through buildOneOff (jobBridge), paying kBridgeWoodCost at
+// claim with a house's wood kept back. A built bridge turns that ford's cells into riverCell::bridge: crossable in every
+// season (flood included) and walked at full speed. One bridge per ford; a race whose ford is already spanned uses it.
+const int kBridgeWoodCost = 40;
+const int kBridgeMinHouses = 4;
+const int kBridgeBuildTicks = 800;                 // a bigger job than a house (600)
+const float kBridgeAbutPx = 3.0f;                  // deck runs this far onto each bank past the band (over the 2px bank)
+const float kBridgeInsetPx = 2.0f;                 // deck inset from the ford's along-river edges: 16px ford -> 12px deck
+const float kBridgePlankPx = 2.0f;                 // plank width along the walk, alternating A/B
+const float kBridgeLandStandPx = 2.0f;             // builder stands this far back from the low-side landing point
+const Color kBridgePlankA(156, 134, 104);          // weathered grey-tan timber: paler and greyer than every hut/pole brown
+const Color kBridgePlankB(142, 121, 93);
+const Color kBridgeRailColor(92, 72, 50);          // 1px rails along both deck edges
+const Color kBridgePostColor(70, 52, 36);          // 2x2 posts at the four deck corners
+const Color kBridgeShadowColor(18, 28, 40, 120);   // 1px translucent shadow on the water past the far rail
 
 // Far Reaches (R45-F1b): one ruin site far out from the village (placed once at startup by spawnRuins, after the
 // quarters, lakes and bushes), a ridge of ordinary mineable rocks arcing behind it, and one lean-to camp per race beside
@@ -2742,8 +2758,8 @@ static_assert(weaponTierBonus[0] == 0, "an untiered weapon hits for its base dam
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
 // jobPave (R20-F2) is run by paveTick(): movingbspot while walking, building/timer while laying the cobbles.
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, jobHerbHut, jobLoreHall, jobWonder, buildJobCount};
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks, herbHutBuildTicks, loreHallBuildTicks, wonderBuildTicks};
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, jobHerbHut, jobLoreHall, jobWonder, jobBridge, buildJobCount};
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks, herbHutBuildTicks, loreHallBuildTicks, wonderBuildTicks, kBridgeBuildTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -3727,9 +3743,12 @@ bool riverPlaced = false;
 bool riverVertical = true;
 uint32_t riverSeed = 0;                                       // drawn from gen once per start; not saved
 // R62-F2: riverWet is the live cell state (seasonal); riverBase is the carved layout (dry, water or ford only)
-enum class riverCell : uint8_t { dry, water, ford, ice, flood };
-// The one walkability test for a river cell: dry and ice always; a ford only for waders; water and flood never
-bool crossable(riverCell c, bool canWade) { return c == riverCell::dry || c == riverCell::ice || (c == riverCell::ford && canWade); }
+// R62-F2b: bridge is a live-only state (never in riverBase), written over a spanned ford's cells by riverApplyState()
+enum class riverCell : uint8_t { dry, water, ford, ice, flood, bridge };
+// The one walkability test for a river cell: dry, ice and bridge always; a ford only for waders; water and flood never
+bool crossable(riverCell c, bool canWade) {
+    return c == riverCell::dry || c == riverCell::ice || c == riverCell::bridge || (c == riverCell::ford && canWade);
+}
 vector<riverCell> riverWet(trailGridN * trailGridN, riverCell::dry);
 vector<riverCell> riverBase(trailGridN * trailGridN, riverCell::dry);
 enum riverSeasonState { riverNormal, riverIced, riverFlooded };
@@ -3742,6 +3761,17 @@ vector<int> riverLo(trailGridN, 0), riverHi(trailGridN, -1);
 struct riverFord {int row0 = 0, lo = 0, hi = 0; Vector2f bank[2];};   // bank[s]: 1px off the band on side s, mid-ford
 riverFord fords[kFordCount];
 VertexArray riverVerts(PrimitiveType::Triangles);             // built once by buildRiverVerts()
+// R62-F2b: one entry per standing bridge. Everything it needs is inside the struct (ford index into the fixed fords[]
+// array, its own deck quads), so a swapRemove moves the whole bridge and leaves nothing stale; after any add or remove,
+// riverApplyState(riverState) rewrites the cells. id is stable (nextBridgeId, never reused). Cleared in spawnRiver().
+struct riverBridge {int id = -1; int race = -1; int ford = -1; VertexArray verts{PrimitiveType::Triangles};};
+vector<riverBridge> bridges;
+int nextBridgeId = 0;
+// Index into bridges of the bridge on ford k, or -1
+int bridgeOnFord(int k) {
+    for (int i = 0; i < (int)bridges.size(); i++) if (bridges[i].ford == k) return i;
+    return -1;
+}
 
 int riverCellAt(Vector2f p) {
     int cx = clamp((int)floor(p.x / trailCellSize), 0, trailGridN - 1), cy = clamp((int)floor(p.y / trailCellSize), 0, trailGridN - 1);
@@ -5983,7 +6013,10 @@ void trailTick() {
 
 // R39-F1: path tier and road tier (paved cells included) shave trailSpeedBonus[tier] ticks off the step limit
 int stepLimit(const barb& b, Vector2f pos) {
-    if (riverPlaced && riverWet[riverCellAt(pos)] != riverCell::dry) return stepLimit(b) * kFordWadeMult;   // R61-F3: waders slow (R62-F2: on ice too)
+    if (riverPlaced) {   // R61-F3: waders slow (R62-F2: on ice too; R62-F2b: a bridge is walked like dry ground)
+        riverCell rc = riverWet[riverCellAt(pos)];
+        if (rc != riverCell::dry && rc != riverCell::bridge) return stepLimit(b) * kFordWadeMult;
+    }
     int c = trailCell(pos);
     return max(1, stepLimit(b) - (c >= 0 ? trailSpeedBonus[trailTier[c]] : 0));
 }
@@ -6097,7 +6130,8 @@ Vector2f crossingAim(Vector2f pos, Vector2f goal) {
     }
     if (sp == 2) {
         int row = riverRowAt(pos);
-        if (riverWet[riverCellAt(pos)] == riverCell::ford)
+        riverCell rc = riverWet[riverCellAt(pos)];
+        if (rc == riverCell::ford || rc == riverCell::bridge)   // R62-F2b: on a bridge, on across like a ford
             for (auto& f : fords)
                 if (row >= f.row0 && row < f.row0 + kFordRows) return f.bank[sg];
         float out = sg == 0 ? riverLo[row] * trailCellSize - 1.0f : (riverHi[row] + 1) * trailCellSize + 1.0f;
@@ -6106,12 +6140,16 @@ Vector2f crossingAim(Vector2f pos, Vector2f goal) {
     if (sp == sg) return goal;
     int best = 0;
     float bestLen = numeric_limits<float>::infinity();
+    bool anyOpen = false;   // R62-F2b: in a flood only bridged fords are open; with none, the nearest is waited at
     for (int k = 0; k < kFordCount; k++) {
+        bool open = riverState != riverFlooded || bridgeOnFord(k) >= 0;
+        if (anyOpen && !open) continue;
         Vector2f a = fords[k].bank[sp] - pos, b = goal - fords[k].bank[sg];
         float len = hypot(a.x, a.y) + hypot(b.x, b.y);
-        if (len < bestLen) { bestLen = len; best = k; }
+        if ((open && !anyOpen) || len < bestLen) { bestLen = len; best = k; }
+        anyOpen = anyOpen || open;
     }
-    if (riverState == riverFlooded) return fords[best].bank[sp];   // R62-F2: fords closed: wait on the near bank
+    if (!anyOpen) return fords[best].bank[sp];   // R62-F2: fords closed: wait on the near bank
     Vector2f d = fords[best].bank[sp] - pos;
     return d.x * d.x + d.y * d.y <= kFordEnterPx * kFordEnterPx ? fords[best].bank[sg] : fords[best].bank[sp];
 }
@@ -17693,6 +17731,7 @@ bool riverCheck() {
 // R61-F3: once at startup, right after placeQuarters(): carve and check the river from riverSeed + offset, moving to the
 // next offset on a failed check. No passing layout = no river this game (riverPlaced false, the map stays as before).
 void spawnRiver() {
+    bridges.clear();   // R62-F2b: no bridges on a fresh river
     riverSeed = (uint32_t)gen();
     for (int t = 0; t < kRiverGenTries; t++) {
         if (riverCarve(riverSeed + (uint32_t)t) && riverCheck()) {
@@ -17704,8 +17743,7 @@ void spawnRiver() {
         printf("River: seed %u offset %d failed the check, trying the next offset\n", riverSeed, t);
     }
     fill(riverWet.begin(), riverWet.end(), riverCell::dry);
-    fill(riverBase.begin(), riverBase.end(), riverCell::dry);
-    fill(riverSide.begin(), riverSide.end(), 0);
+    fill(riverBase.begin(), riverBase.end(), riverCell::dry);    fill(riverSide.begin(), riverSide.end(), 0);
     printf("River: no layout passed in %d tries, none this game\n", kRiverGenTries);
 }
 
@@ -17858,6 +17896,50 @@ void drawLakes(RenderWindow& window) {
 // R61-F3: the river's static quads, built once after spawnRiver(), in lake style: a lakeBankPx bank round every band
 // cell (pale gravel on the ford rows), then 8px water cells in a near-flat muted checker, then the fords as lighter
 // shallows with two pale 3x2 stepping stones per cell (each with a 1px wet underside), mirrored on alternate cells.
+// R62-F2: a carved cell's live state in season state s (bridges aside): iced all over, flooded fords, else as carved
+riverCell riverCellFor(riverCell base, riverSeasonState s) {
+    if (base == riverCell::dry) return riverCell::dry;
+    if (s == riverIced) return riverCell::ice;
+    if (s == riverFlooded && base == riverCell::ford) return riverCell::flood;
+    return base;
+}
+
+// R62-F2b: true if cell c lies on ford k's span (its kFordRows rows, lo..hi across)
+bool fordHasCell(int k, int c) {
+    const riverFord& f = fords[k];
+    int x = c % trailGridN, y = c / trailGridN;
+    int along = riverVertical ? y : x, across = riverVertical ? x : y;
+    return along >= f.row0 && along < f.row0 + kFordRows && across >= f.lo && across <= f.hi;
+}
+
+// R62-F2b: a bridge's deck quads over ford k, built once into the bridge's own verts. Worked in along/across terms so
+// either river direction comes out right: a 12px deck (kBridgeInsetPx in from the ford's edges) running kBridgeAbutPx
+// onto each bank, 2px planks laid across the walk in two close tints, 1px dark rails along both edges, 2x2 corner posts,
+// and a 1px translucent shadow on the water past the far rail.
+void buildBridgeVerts(riverBridge& br) {
+    br.verts.clear();
+    const riverFord& f = fords[br.ford];
+    const float cell = trailCellSize;
+    float a0 = f.row0 * cell + kBridgeInsetPx, a1 = (f.row0 + kFordRows) * cell - kBridgeInsetPx;   // along: deck edges
+    float c0 = f.lo * cell - kBridgeAbutPx, c1 = (f.hi + 1) * cell + kBridgeAbutPx;                // across: deck ends
+    auto quad = [&](float along, float across, float alongLen, float acrossLen, Color col) {
+        pushQuad(br.verts, riverPoint(along, across), riverPoint(alongLen, acrossLen), col);
+    };
+    quad(a1, c0 + kBridgeAbutPx, 1.0f, c1 - c0 - 2.0f * kBridgeAbutPx, kBridgeShadowColor);   // over water only
+    int n = 0;
+    for (float c = c0; c < c1; c += kBridgePlankPx, n++)
+        quad(a0, c, a1 - a0, min(kBridgePlankPx, c1 - c), n % 2 == 0 ? kBridgePlankA : kBridgePlankB);
+    quad(a0, c0, 1.0f, c1 - c0, kBridgeRailColor);
+    quad(a1 - 1.0f, c0, 1.0f, c1 - c0, kBridgeRailColor);
+    for (float pa : {a0 - 1.0f, a1 - 1.0f})
+        for (float pc : {c0, c1 - 2.0f}) quad(pa, pc, 2.0f, 2.0f, kBridgePostColor);
+}
+
+// R62-F2b: ground layer straight after drawRiver(), so the deck sits over the water and under rocks, buildings and barbs
+void drawBridges(RenderWindow& window) {
+    for (auto& br : bridges) if (br.verts.getVertexCount() > 0) window.draw(br.verts);
+}
+
 // R62-F2: rebuilt by riverApplyState() on every season state change. One colour per cell state: ice is a pale checker
 // (stones hidden) with thin crack quads in riverCrackVerts on about a third of the cells; flood is a murky deep-blue
 // checker with a silt streak. Banks follow riverBase, so the ford rows keep their gravel landings in every state.
@@ -17876,8 +17958,10 @@ void buildRiverVerts() {
         if (riverWet[c] == riverCell::dry) continue;
         Vector2f p = cellPos(c);
         int cx = c % N, cy = c / N;
-        if (riverWet[c] == riverCell::water) { pushQuad(riverVerts, p, tile, (cx + cy) % 2 == 0 ? kRiverWaterA : kRiverWaterB); continue; }
-        if (riverWet[c] == riverCell::ice) {
+        bool bridged = riverWet[c] == riverCell::bridge;   // R62-F2b: draw what lies under the deck (drawBridges() covers it)
+        riverCell w = bridged ? riverCellFor(riverBase[c], riverState) : riverWet[c];
+        if (w == riverCell::water) { pushQuad(riverVerts, p, tile, (cx + cy) % 2 == 0 ? kRiverWaterA : kRiverWaterB); continue; }
+        if (w == riverCell::ice) {
             pushQuad(riverVerts, p, tile, (cx + cy) % 2 == 0 ? kRiverIceA : kRiverIceB);
             if ((cx * 7 + cy * 13) % 3 != 0) continue;
             bool mirror = (cx + cy) % 2 != 0;   // a 1px staircase crack, mirrored on alternate cells
@@ -17889,12 +17973,13 @@ void buildRiverVerts() {
             }
             continue;
         }
-        if (riverWet[c] == riverCell::flood) {
+        if (w == riverCell::flood) {
             pushQuad(riverVerts, p, tile, (cx + cy) % 2 == 0 ? kRiverFloodA : kRiverFloodB);
             pushQuad(riverVerts, p + Vector2f((cx + cy) % 2 == 0 ? 1.0f : 4.0f, (cx % 2 == 0) ? 2.0f : 5.0f), Vector2f(3.0f, 1.0f), kRiverFloodSilt);
             continue;
         }
         pushQuad(riverVerts, p, tile, kFordWaterColor);
+        if (bridged) continue;   // no stepping stones peeking out from under the deck
         bool flip = (cx + cy) % 2 != 0;
         const Vector2f stones[2] = {Vector2f(flip ? 4.0f : 1.0f, 1.0f), Vector2f(flip ? 1.0f : 4.0f, 5.0f)};
         for (const Vector2f& s : stones) {
@@ -17923,15 +18008,14 @@ riverSeasonState riverWantState() {
     return riverNormal;
 }
 
-// R62-F2: rewrites every live cell from the carved layout for state s and rebuilds the quads
+// R62-F2: rewrites every live cell from the carved layout for state s and rebuilds the quads. R62-F2b: then every
+// standing bridge's ford cells become riverCell::bridge, whatever the season (call again after a bridge is added/removed)
 void riverApplyState(riverSeasonState s) {
     riverState = s;
     for (int c = 0; c < trailGridN * trailGridN; c++) {
-        riverCell base = riverBase[c];
-        if (base == riverCell::dry) riverWet[c] = riverCell::dry;
-        else if (s == riverIced) riverWet[c] = riverCell::ice;
-        else if (s == riverFlooded && base == riverCell::ford) riverWet[c] = riverCell::flood;
-        else riverWet[c] = base;
+        riverWet[c] = riverCellFor(riverBase[c], s);
+        if (riverBase[c] != riverCell::ford) continue;
+        for (auto& br : bridges) if (fordHasCell(br.ford, c)) riverWet[c] = riverCell::bridge;
     }
     buildRiverVerts();
 }
@@ -17969,7 +18053,7 @@ void riverSeasonTick(vector<barb>& barbs, vector<RectangleShape>& squares, store
                 int x = cx + dx, y = cy + dy;
                 if (x < 0 || y < 0 || x >= N || y >= N) continue;
                 int m = y * N + x;
-                if (riverWet[m] != riverCell::dry && riverWet[m] != riverCell::ford) continue;
+                if (!crossable(riverWet[m], true)) continue;   // dry, ford or (R62-F2b) bridge: never iced here
                 Vector2f d = Vector2f((x + 0.5f) * trailCellSize, (y + 0.5f) * trailCellSize) - pos;
                 float dSq = d.x * d.x + d.y * d.y;
                 if (best < 0 || dSq < bestDSq) { best = m; bestDSq = dSq; }
@@ -18632,6 +18716,64 @@ void buildcamps(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
         camps.push_back(leanTo{r, campSpot[r]});
         printf("---LEAN-TO BUILT--- %s camp at the ruins (%.0f, %.0f)\n", raceDefs[r].name, campSpot[r].x, campSpot[r].y);
         logRaceEvent(string(racePlurals[r]) + " pitch a lean-to by the ruins", r);
+    }
+}
+
+// R62-F2b: race r's ford: the one whose landing on r's bank is nearest its crate (-1 with no river)
+int bridgeFordOf(int r) {
+    if (!riverPlaced) return -1;
+    Vector2f crate = quarterCentre(r);
+    int s = riverSideAt(crate);
+    if (s == 2) return -1;
+    int best = -1;
+    float bestDSq = 0.0f;
+    for (int k = 0; k < kFordCount; k++) {
+        Vector2f d = fords[k].bank[s] - crate;
+        float dSq = d.x * d.x + d.y * d.y;
+        if (best < 0 || dSq < bestDSq) { best = k; bestDSq = dSq; }
+    }
+    return best;
+}
+
+// R62-F2b: runs after buildcamps(). Each race with a standing crate and kBridgeMinHouses houses of its own spans its ford
+// through buildOneOff (jobBridge) by a builder of that race standing at the near-bank landing, paid at claim with a
+// house's wood kept back. The claim is not stored ("a barb of this race holds jobBridge"), so a lost builder frees it
+// through releaseBarbWork()'s reset. A ford already spanned, or with another race's builder on it, is left alone.
+void buildbridges(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, const storehouse (&stores)[raceCount]) {
+    if (!riverPlaced) return;
+    int fordOf[raceCount];
+    for (int r = 0; r < raceCount; r++) fordOf[r] = bridgeFordOf(r);
+    for (int r = 0; r < raceCount; r++) {
+        int k = fordOf[r];
+        if (k < 0 || !stores[r].built || bridgeOnFord(k) >= 0) continue;
+        bool claimed = false, rival = false;
+        for (auto& b : barbs) {
+            if (b.jobKind != jobBridge) continue;
+            if (b.race == r) claimed = true;
+            else if (b.race >= 0 && b.race < raceCount && fordOf[b.race] == k) rival = true;
+        }
+        if (rival && !claimed) continue;
+        int s = riverSideAt(quarterCentre(r));
+        Vector2f stand = fords[k].bank[s] + riverPoint(0.0f, s == 0 ? -kBridgeLandStandPx : 0.0f);   // 2x2 barb clear of the band
+        bool done = buildOneOff(barbs, squares, claimed, jobBridge, stand, "BRIDGE",
+            [&](const barb&) {
+                int raceHouses = 0;
+                for (auto& h : houses) if (h.race == r) raceHouses++;
+                if (raceHouses < kBridgeMinHouses) return -1;
+                if (!canAfford(stock[r], kBridgeWoodCost + houseWoodCost, 0)) return -1;
+                spend(stock[r], kBridgeWoodCost, 0);
+                return 1;
+            }, r);
+        if (!done || bridgeOnFord(k) >= 0) continue;
+        bridges.push_back(riverBridge{});
+        riverBridge& br = bridges.back();
+        br.id = nextBridgeId++;
+        br.race = r;
+        br.ford = k;
+        buildBridgeVerts(br);
+        riverApplyState(riverState);   // the ford's cells become bridge cells, open through the flood
+        printf("---BRIDGE BUILT--- %s timber bridge %d over ford %d (%.0f, %.0f)\n", raceDefs[r].name, br.id, k, stand.x, stand.y);
+        logRaceEvent(string(racePlurals[r]) + " span the river with a timber bridge", r);
     }
 }
 
@@ -19423,6 +19565,7 @@ int main() {
                 buildstorehouses(barbs, squares, houses, stores, fields);
                 buildshafts(barbs, squares, stores);   // R34-F1
                 buildcamps(barbs, squares, houses, stores);   // R45-F1b: lean-tos at the ruins
+                buildbridges(barbs, squares, houses, stores);   // R62-F2b: timber bridges over each race's ford
                 buildfield(barbs, squares, houses, shrines, stores, fields);
                 buildmills(barbs, squares, fields);   // FARM-F2
                 buildkeeps(barbs, squares, stores);   // R31-F1: Town era
@@ -19552,6 +19695,7 @@ int main() {
         drawClaimDiscs(window, stores, camRect, paused);   // R62-F1: faint claim discs, under lakes and buildings
         drawLakes(window);
         drawRiver(window);   // R61-F3: with the lakes, under the lens, rocks, buildings and barbs
+        drawBridges(window);   // R62-F2b: decks over the river, still under the lens, rocks, buildings and barbs
         drawLens(window, lensVerts, worldView, lens, barbs, squares, houses, houseshapes, stores);   // UIO-F3: under rocks, buildings and barbs
 
 	drawRocks(window, octs, rockGold, rockVerts, camRect);   // R46-F1a: gold rocks get one pale-gold fleck pixel
