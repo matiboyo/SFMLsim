@@ -406,6 +406,32 @@ const int kFootprintMax = 3000;                    // fixed ring buffer; the old
 const int kFootprintLife = 2 * ticksPerMinute;     // ticks a print takes to fade out (2 real minutes at 1x)
 const float kFootprintStridePx = 6.0f;             // one print each time the feet cross into a new 6px cell
 const Color kFootprintColor(150, 170, 195, 45);    // grey-blue, alpha < 50; fades toward 0 over its life
+// R63-F4 Night Sky: draw-only drawNightLife() after the night overlay, no stored state (all hashed from the frame index).
+// Summer nights (not in rain): pulsing yellow-green fireflies hosted by bushes and lake banks in view. Winter nights:
+// soft green/violet aurora ribbons in screen space, below the HUD strip and stock panel, far above the ticker.
+const int kFireflyCount = 20;                      // hard cap per frame, however many hosts are in view
+const int kFireflyLifeFrames = 300;                // one ~5 s glow per host cycle, then the host re-rolls
+const int kFireflyPulseFrames = 70;                // blink period inside a life
+const int kFireflyBushOdds = 6;                    // a bush hosts a firefly this cycle 1 in N (~1 per 5-bush clump)
+const int kFireflyLakeSlots = 3;                   // per lake in view: up to this many bank fireflies...
+const int kFireflyLakeOdds = 2;                    // ...each lit 1 in N cycles
+const float kFireflyDriftPx = 5.0f;                // max wander from its host point (world px)
+const float kFireflyBankPx = 2.0f;                 // lake fireflies hover this far outside the water rect
+const Color kFireflyColor(214, 236, 110);          // yellow-green
+const uint8_t kFireflyCoreAlpha = 230;             // 1px core (additive)
+const uint8_t kFireflyHaloAlpha = 34;              // faint 3x3 halo under the core (additive)
+const int kAuroraBandCount = 3;                    // ribbons, alternating green / violet
+const float kAuroraSegPx = 10.0f;                  // ribbon column width (screen px)
+const float kAuroraTopGapPx = 24.0f;               // gap below the HUD strip / stock panel
+const float kAuroraBandSpacingPx = 24.0f;          // vertical step between ribbon centrelines
+const float kAuroraWavePx = 9.0f;                  // centreline sway amplitude
+const float kAuroraHalfThickPx = 12.0f;            // max half-thickness; edges fade to alpha 0
+const float kAuroraDriftRadPerSec = 0.22f;         // slow sway and curtain drift
+const uint8_t kAuroraAlphaClear = 34;              // peak alpha on a clear winter night
+const uint8_t kAuroraAlphaSnow = 12;               // peak alpha while snow falls (clouded over)
+static_assert(kAuroraAlphaClear < 40 && kAuroraAlphaSnow < kAuroraAlphaClear, "aurora must stay faint: alpha < 40");
+const Color kAuroraGreen(110, 214, 150);
+const Color kAuroraViolet(160, 120, 214);
 const int kFootprintCoreFadeMult = 2;              // safe-core prints age this many times faster once the snow stops
 bool snowLying = false;                            // snow has fallen this winter (caps + prints); cleared outside winter
 // R57-F3 Thunderstorm Wildfire, phase 1: every summer rain is a storm with exactly one lightning strike. It burns one wild
@@ -6460,6 +6486,103 @@ void drawRain(RenderWindow& window, VertexArray& va, int frame) {
             pushQuad(va, p + Vector2f(k == rainStreakPixels - 1 ? -1.0f : 0.0f, (float)k), Vector2f(1.0f, 1.0f), rainStreakColor);
     }
     if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R63-F4: hash of (host key, cycle), same mix as the rain streaks
+uint32_t nightLifeHash(uint32_t key, uint32_t cycle) {
+    uint32_t h = cycle * 73856093u ^ key * 19349663u;
+    h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+    return h;
+}
+
+// R63-F4 Night Sky: after the night overlay. Summer nights out of the rain: fireflies (world view); winter nights: aurora
+// ribbons (screen view, from auroraTopY down). One vertex array, one additive draw. Leaves the view it last set.
+void drawNightLife(RenderWindow& window, const View& worldView, const FloatRect& camRect,
+                   const vector<CircleShape>& bushshapes, VertexArray& va, int frame, float auroraTopY) {
+    if (!isNightHour(game_time)) return;
+    int s = seasonOf(game_day);
+    va.clear();
+    if (s == seasonSummer) {
+        if (raining) return;
+        int lit = 0;
+        // one firefly at host point c, keyed by k (stable while the camera pans)
+        auto firefly = [&](Vector2f c, uint32_t k) {
+            uint32_t f = (uint32_t)frame + k * 2654435761u % kFireflyLifeFrames;
+            int age = (int)(f % kFireflyLifeFrames);
+            uint32_t h = nightLifeHash(k, f / kFireflyLifeFrames);
+            float ph = (float)(h % 628) / 100.0f;
+            Vector2f off(sin(age * 0.031f + ph) * kFireflyDriftPx, cos(age * 0.023f + ph * 1.7f) * kFireflyDriftPx);
+            float env = sin(3.14159265f * age / kFireflyLifeFrames);                               // fade in and out
+            float pulse = 0.5f + 0.5f * sin(2 * 3.14159265f * age / kFireflyPulseFrames + ph);
+            float a = env * pulse * pulse;
+            if (a < 0.03f) return;
+            Vector2f p = snapPx(c + off);
+            Color halo = kFireflyColor, core = kFireflyColor;
+            halo.a = (uint8_t)(kFireflyHaloAlpha * a);
+            core.a = (uint8_t)(kFireflyCoreAlpha * a);
+            pushQuad(va, p - Vector2f(1.0f, 1.0f), Vector2f(3.0f, 3.0f), halo);
+            pushQuad(va, p, Vector2f(1.0f, 1.0f), core);
+            lit++;
+        };
+        auto hosts = [](uint32_t k, uint32_t frameNow, int odds) {   // is host k lit this cycle?
+            uint32_t f = frameNow + k * 2654435761u % kFireflyLifeFrames;
+            return nightLifeHash(k ^ 0x9e3779b9u, f / kFireflyLifeFrames) % (uint32_t)odds == 0;
+        };
+        for (int j = 0; j < (int)lakes.size() && lit < kFireflyCount; j++) {
+            const FloatRect& L = lakes[j];
+            if (!camRect.findIntersection(L)) continue;
+            for (int sl = 0; sl < kFireflyLakeSlots && lit < kFireflyCount; sl++) {
+                uint32_t k = 0x40000000u + (uint32_t)(j * kFireflyLakeSlots + sl);
+                if (!hosts(k, (uint32_t)frame, kFireflyLakeOdds)) continue;
+                uint32_t f = (uint32_t)frame + k * 2654435761u % kFireflyLifeFrames;
+                uint32_t h = nightLifeHash(k ^ 0x5bd1e995u, f / kFireflyLifeFrames);
+                float per = 2 * (L.size.x + L.size.y), d = (float)(h % 4096) / 4096.0f * per, e = kFireflyBankPx;
+                Vector2f c = d < L.size.x ? L.position + Vector2f(d, -e)                                   // top bank
+                           : (d -= L.size.x) < L.size.y ? L.position + Vector2f(L.size.x + e, d)           // right bank
+                           : (d -= L.size.y) < L.size.x ? L.position + Vector2f(L.size.x - d, L.size.y + e) // bottom bank
+                           : L.position + Vector2f(-e, L.size.y - (d - L.size.x));                          // left bank
+                if (camRect.contains(c)) firefly(c, k);
+            }
+        }
+        for (int i = 0; i < (int)bushshapes.size() && lit < kFireflyCount; i++) {
+            float r = bushshapes[i].getRadius();
+            Vector2f c = bushshapes[i].getPosition() + Vector2f(r, r - 2.0f);   // just above the bush's centre
+            if (!camRect.contains(c) || !hosts((uint32_t)i, (uint32_t)frame, kFireflyBushOdds)) continue;
+            firefly(c, (uint32_t)i);
+        }
+        if (va.getVertexCount() == 0) return;
+        window.setView(worldView);
+        window.draw(va, BlendAdd);
+        return;
+    }
+    if (s != seasonWinter) return;
+    window.setView(window.getDefaultView());
+    float w = window.getDefaultView().getSize().x;
+    float t = frame / 60.0f * kAuroraDriftRadPerSec;
+    float peak = raining ? kAuroraAlphaSnow : kAuroraAlphaClear;
+    float top = auroraTopY + kAuroraTopGapPx + kAuroraHalfThickPx + kAuroraWavePx;   // first centreline, edges clear of top
+    for (int b = 0; b < kAuroraBandCount; b++) {
+        Color base = b % 2 == 0 ? kAuroraGreen : kAuroraViolet;
+        float y0 = top + b * kAuroraBandSpacingPx, bp = b * 1.9f;
+        auto column = [&](float x, Vector2f& up, Vector2f& mid, Vector2f& dn, Color& cm) {
+            float y = y0 + sin(x * 0.009f + t * 2.0f + bp) * kAuroraWavePx;
+            float th = kAuroraHalfThickPx * (0.55f + 0.45f * sin(x * 0.013f - t * 1.4f + bp));
+            float curtain = 0.5f + 0.5f * sin(x * 0.021f - t * 3.0f + bp * 1.3f);
+            up = {x, y - th}; mid = {x, y}; dn = {x, y + th};
+            cm = base; cm.a = (uint8_t)(peak * curtain * curtain);
+        };
+        Color edge = base; edge.a = 0;
+        for (float x = 0.0f; x < w; x += kAuroraSegPx) {
+            Vector2f u0, m0, d0, u1, m1, d1;
+            Color c0, c1;
+            column(x, u0, m0, d0, c0);
+            column(min(x + kAuroraSegPx, w), u1, m1, d1, c1);
+            for (Vertex v : {Vertex{u0, edge}, Vertex{u1, edge}, Vertex{m1, c1}, Vertex{u0, edge}, Vertex{m1, c1}, Vertex{m0, c0},
+                             Vertex{m0, c0}, Vertex{m1, c1}, Vertex{d1, edge}, Vertex{m0, c0}, Vertex{d1, edge}, Vertex{d0, edge}})
+                va.append(v);
+        }
+    }
+    window.draw(va, BlendAdd);
 }
 
 // R47-F9 Ancestor Stones. Independent of the barb vectors: a stone keeps only its race and spot, never an index or id.
@@ -19715,6 +19838,7 @@ int main() {
     VertexArray rainVerts(PrimitiveType::Triangles); // scratch buffer for drawRain, rebuilt every frame
     VertexArray ashVerts(PrimitiveType::Triangles), fireVerts(PrimitiveType::Triangles), boltVerts(PrimitiveType::Triangles);   // R57-F3
     VertexArray minimapVerts(PrimitiveType::Triangles); // UIO-F1: scratch buffer for drawMinimap's dots, rebuilt every frame
+    VertexArray nightVerts(PrimitiveType::Triangles);   // R63-F4: fireflies or aurora, rebuilt every night frame
 
     RectangleShape dnc({windowSize, windowSize});   // screen-space overlay, drawn in the default view
 
@@ -20082,6 +20206,8 @@ int main() {
         drawPoiGlow(window, worldView, camRect, frameCount);   // R47-F4: found sites, any hour
         if (isNightHour(t)) drawCampfireGlow(window, worldView, fire, frameCount);
         if (isNightHour(t)) drawHouseLights(window, worldView, houses, houseshapes);
+        drawNightLife(window, worldView, camRect, bushshapes, nightVerts, frameCount,   // R63-F4: fireflies / aurora, night only
+                      max(hudBarHeight, stockRect.position.y + stockRect.size.y));      // aurora starts under last frame's stock panel
         drawLoreCandles(window, worldView, barbs, isNightHour(t));   // R59-F3: study candles at any hour, halo at night
         drawProwlerOverlay(window, worldView, prowlers, fire);   // R48-F1: red eyes + safe-zone ring, above the night overlay
         drawHouseFires(window, worldView, houses, houseshapes, frameCount);   // R61-F1: flames on torched roofs, above the overlay
