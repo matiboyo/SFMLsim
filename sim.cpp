@@ -610,6 +610,32 @@ const uint8_t kVigilGlowNewestAlpha = 70;         // halo strength: newest stone
 const uint8_t kVigilGlowAlpha = 36;               // ...and the rest
 const int kVigilFlickerFrames = 9;                // drawn frames per flicker step
 const Color kVigilTickerTint(226, 198, 150);      // warm candle cream on the black ticker strip
+// R63-F2 Harvest Feast (phase 1): on autumn's first day at kFeastStartHour each race with food to spare lights a 4x4
+// bonfire beside its crate and calls 6-8 idle barbs to the fixed gather ring round it (gatherIdleAt, label "feasting").
+// Each guest that reaches its slot eats: kFeastFoodPerGuest from the race's stock, hunger reset. A race under
+// kFeastFoodFloor (or with nobody free) skips it with a ticker line. The fire burns kFeastHours and shrinks over the
+// last kFeastShrinkTicks; when it is out every guest is released. Never saved: resetFeast() on a chronicle load.
+// Phase 1 only: no morale or birth bump.
+const int kFeastStartHour = 18;                   // the evening of autumn's first day (eveningStartHour)...
+const int kFeastHours = 3;                        // ...burning until dusk (nightStartHour)
+const int kFeastShrinkTicks = ticksPerGameHour;  // the fire shrinks over its last game hour
+const int kFeastGuestsMin = 6;                    // idle barbs called to the ring (both <= kGatherSlots)...
+const int kFeastGuestsMax = 8;                    // ...a fresh roll in this range per race
+const int kFeastFoodFloor = 12;                   // a race holding less food than this skips the feast
+const int kFeastFoodPerGuest = 1;                 // food each arriving guest eats from its race's stock
+const Vector2f kFeastFireSize(4.0f, 4.0f);        // the bonfire (logs row + 3 flame rows); vigil candles are 1x2
+const Vector2f kFeastFireOffsets[] = {            // fire top-left relative to the crate, first clear one wins:
+    Vector2f(-14.0f, -15.0f),                     // above-left: clear of the smokehouse, barracks and herb hut
+    Vector2f(22.0f, 12.0f),                       // below-right: between the shaft and the wonder
+};
+const Color kFeastFlameLow(214, 112, 44);         // bottom flame row (lerped from campfireEmberColor as it shrinks)
+const Color kFeastFlameMid(240, 158, 62);         // middle row
+const Color kFeastFlameTip(255, 216, 132);        // the 1px tip
+const int kFeastFlickerFrames = 7;                // drawn frames per tip flicker step
+const float kFeastGlowPx = 18.0f;                 // outer glow radius (the campfire's is 40)
+const int kFeastGlowLayers = 2;                   // stacked additive circles...
+const uint8_t kFeastGlowAlpha = 25;               // ...summing to this at the centre (full fire); subtle
+const Color kFeastTickerTint(222, 180, 108);      // harvest amber on the black ticker strip
 // R56-F3 Deeds and Legends (phase 1): kills and raid wins add renown, a plain barb field that moves with the struct on
 // every swapRemove(barbs, i). At kTitleRenown a barb is hailed with a title (fixed char[], written only through snprintf)
 // once, with one ticker line; at most kTitleMaxLiving titled barbs live at once, so titles stay rare. A titled barb's
@@ -6048,6 +6074,27 @@ void resetVigil() {
     for (auto& m : vigilMorale) m = 0.0f;
 }
 
+// R63-F2: harvest feast state, one fire per race. Guests are held as barb ids (never indices), re-resolved each tick
+// through gatherCount()/findBarbById(). Never saved: resetFeast() on a chronicle load.
+static_assert(kFeastGuestsMin >= 1 && kFeastGuestsMax >= kFeastGuestsMin && kFeastGuestsMax <= kGatherSlots, "feast guests fit the ring");
+static_assert(kFeastFoodFloor >= kFeastGuestsMax * kFeastFoodPerGuest, "the floor covers a full ring's meals");
+struct feastState {
+    int day = -1;                           // game_day the feast was last held (or skipped): once per autumn
+    bool lit[raceCount] = {};               // race r's fire is burning
+    int ticks[raceCount] = {};              // sim ticks of fire left
+    Vector2f pos[raceCount];                // fire top-left (fixed for the feast)
+    int ids[raceCount][kGatherSlots] = {};  // guests' barb ids, -1 = none
+    bool fed[raceCount][kGatherSlots] = {}; // guest k has eaten (parallel to ids)
+    int eaten[raceCount] = {};              // meals served, for the log
+};
+feastState feast;
+
+// R63-F2: on a chronicle load (gatherers are already released by resetGathers()): no fire burns on
+void resetFeast() {
+    feast = feastState{};
+    for (auto& row : feast.ids) for (auto& id : row) id = -1;
+}
+
 int clockk() {
     static int timer = 0;
     if (++timer >= ticksPerGameHour) {
@@ -11072,6 +11119,7 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
     resetHollowHunt(barbs);   // R62-F3b: nor the joint hunt
     resetGathers(barbs);      // R63-F5a: nor any gathering
     resetVigil();             // R63-F5: nor a vigil, nor its morale lift
+    resetFeast();             // R63-F2: nor a harvest feast fire
     salmon = salmonRun{};     // R63-F3: nor a salmon run (anglers on its banks quit through the fish path's range check)
     if (d.barbs.empty()) {
         for (auto& b : barbs) b.bornHour = chronicleNowHour() - founderAgeHours();   // founders arrive on the restored clock (R57-F1: grown)
@@ -12159,6 +12207,56 @@ void drawVigilCandles(RenderWindow& window, const View& worldView, const FloatRe
     }
     if (glow.getVertexCount() > 0) window.draw(glow, BlendAdd);
     if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R63-F2: 0..1 strength of race r's feast fire: full until its last kFeastShrinkTicks, then down to 0
+float feastFireLevel(int r) { return feast.lit[r] ? clamp((float)feast.ticks[r] / kFeastShrinkTicks, 0.0f, 1.0f) : 0.0f; }
+
+// R63-F2: the bonfires, world layer beside the campfire (under barbs and the overlay). 4x4: a log row under three
+// flame rows (4 wide, 2 wide, a 1px tip that flickers side to side); over the last hour the rows drop away top first
+// and the colour sinks toward ember. One batched draw.
+void drawFeastFires(RenderWindow& window, const FloatRect& camRect, int frame) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (int r = 0; r < raceCount; r++) {
+        if (!feast.lit[r]) continue;
+        Vector2f p = feast.pos[r];
+        if (!camRect.findIntersection(FloatRect(p, kFeastFireSize))) continue;
+        float s = feastFireLevel(r);
+        int rows = max(1, (int)ceil(3.0f * s));   // flame rows still standing; an ember row to the end
+        pushQuad(va, p + Vector2f(0.0f, 3.0f), Vector2f(4.0f, 1.0f), campfireLogColor);
+        pushQuad(va, p + Vector2f(0.0f, 2.0f), Vector2f(4.0f, 1.0f), lerpColor(campfireEmberColor, kFeastFlameLow, s));
+        if (rows >= 2) pushQuad(va, p + Vector2f(1.0f, 1.0f), Vector2f(2.0f, 1.0f), lerpColor(kFeastFlameLow, kFeastFlameMid, s));
+        if (rows >= 3) {
+            unsigned h = (unsigned)(frame / kFeastFlickerFrames) * 2654435761u ^ ((unsigned)p.x * 73856093u);
+            pushQuad(va, p + Vector2f((h >> 11) % 2 ? 2.0f : 1.0f, 0.0f), Vector2f(1.0f, 1.0f), kFeastFlameTip);
+        }
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R63-F2: soft additive glow round each bonfire, after the overlays (like drawCampfireGlow); kFeastGlowAlpha at the
+// centre at full fire, fading with the fire over its last hour
+void drawFeastGlow(RenderWindow& window, const View& worldView, const FloatRect& camRect, int frame) {
+    window.setView(worldView);
+    CircleShape c;
+    c.setPointCount(32);
+    for (int r = 0; r < raceCount; r++) {
+        if (!feast.lit[r]) continue;
+        Vector2f centre = feast.pos[r] + kFeastFireSize / 2.0f;
+        if (!camRect.findIntersection(FloatRect(centre - Vector2f(kFeastGlowPx, kFeastGlowPx), Vector2f(2 * kFeastGlowPx, 2 * kFeastGlowPx)))) continue;
+        Color col = campfireGlowColor;
+        col.a = (uint8_t)((float)kFeastGlowAlpha / kFeastGlowLayers * feastFireLevel(r) * campfireFlicker(frame + 17 * r));
+        if (col.a == 0) continue;
+        c.setFillColor(col);
+        c.setPosition(centre);
+        for (int i = 1; i <= kFeastGlowLayers; i++) {
+            float rad = kFeastGlowPx * i / kFeastGlowLayers;
+            c.setRadius(rad);
+            c.setOrigin({rad, rad});
+            window.draw(c, BlendAdd);
+        }
+    }
 }
 
 // INBOX-F1: the release half of removeBarb(), shared with bellTick() so a barb taking shelter frees exactly what a dead one does
@@ -14164,6 +14262,84 @@ void vigilTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
             if (gi < 0) { endVigil(barbs, r, "stones gone"); continue; }
         }
         if (game_time >= kVigilEndHour || game_time < nightStartHour) endVigil(barbs, r, "the hour");
+    }
+}
+
+// R63-F2: race r's fire spot: the first fixed offset from its crate that is on the map, dry and off every house
+Vector2f feastFirePos(int r, const vector<RectangleShape>& houseshapes) {
+    for (Vector2f off : kFeastFireOffsets) {
+        Vector2f p = snapPx(storehousePos[r] + off);
+        if (!watchStopOk(p + kFeastFireSize / 2.0f, kFeastFireSize)) continue;
+        bool onHouse = false;
+        for (auto& hs : houseshapes)
+            if (hs.getGlobalBounds().findIntersection(FloatRect(p, kFeastFireSize))) { onHouse = true; break; }
+        if (!onHouse) return p;
+    }
+    return snapPx(storehousePos[r] + kFeastFireOffsets[0]);
+}
+
+// R63-F2: the one way a race's feast ends (the fire out): every guest still gathered is released where it stands
+void endFeast(vector<barb>& barbs, int r, const char* why) {
+    if (!feast.lit[r]) return;
+    releaseGather(barbs, feast.ids[r], "feast over");
+    feast.lit[r] = false;
+    feast.ticks[r] = 0;
+    printf("FEAST END - %s (%s): %d meals eaten, food: %d\n", racePlurals[r], why, feast.eaten[r], stock[r].food);
+}
+
+// R63-F2: once per sim tick, after clockk(). On autumn's first day at kFeastStartHour each living race lights its
+// fire and calls guests (or skips with a ticker line); while lit, a guest standing at its slot eats once, and the
+// fire burns down, releasing the guests when it is out.
+void feastTick(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<RectangleShape>& houseshapes) {
+    if (seasonOf(game_day) == seasonAutumn && dayInSeason(game_day) == 0 && game_time == kFeastStartHour
+        && feast.day != game_day) {
+        feast.day = game_day;
+        int ticks = kFeastHours * ticksPerGameHour + ticksPerGameHour;   // an hour past the fire: endFeast() releases first
+        for (int r = 0; r < raceCount; r++) {
+            bool alive = false;
+            for (auto& b : barbs) if (b.race == r && b.health > 0) { alive = true; break; }
+            if (!alive || feast.lit[r]) continue;   // a race with nobody left holds nothing and says nothing
+            if (stock[r].food < kFeastFoodFloor) {
+                printf("FEAST SKIPPED - %s: food %d under %d\n", racePlurals[r], stock[r].food, kFeastFoodFloor);
+                logEvent(string("The ") + racePlurals[r] + " skip the harvest feast - the larder is too thin", kFeastTickerTint);
+                continue;
+            }
+            Vector2f p = feastFirePos(r, houseshapes);
+            int want = uniform_int_distribution<int>(kFeastGuestsMin, kFeastGuestsMax)(gen);
+            int sent = gatherIdleAt(barbs, squares, r, p + kFeastFireSize / 2.0f, feast.ids[r], want, ticks, "feasting");
+            if (sent == 0) {
+                printf("FEAST SKIPPED - %s: nobody idle\n", racePlurals[r]);
+                logEvent(string("The ") + racePlurals[r] + " skip the harvest feast - no one is free", kFeastTickerTint);
+                continue;
+            }
+            feast.lit[r] = true;
+            feast.ticks[r] = kFeastHours * ticksPerGameHour;
+            feast.pos[r] = p;
+            feast.eaten[r] = 0;
+            for (auto& f : feast.fed[r]) f = false;
+            printf("FEAST - %s light a bonfire at (%.0f, %.0f), %d of %d guests called, food: %d\n", racePlurals[r], p.x, p.y,
+                   sent, want, stock[r].food);
+            logEvent(string("The ") + racePlurals[r] + " light a harvest feast fire - " + to_string(sent) + " gather to eat",
+                     kFeastTickerTint);
+        }
+    }
+    for (int r = 0; r < raceCount; r++) {
+        if (!feast.lit[r]) continue;
+        gatherCount(barbs, feast.ids[r], false);   // drops ids of guests released (death, draft, timer) or gone
+        for (int k = 0; k < kGatherSlots; k++) {
+            int i = findBarbById(barbs, feast.ids[r][k]);
+            if (i < 0 || feast.fed[r][k] || barbs[i].moving) continue;
+            if (stock[r].food < kFeastFoodPerGuest) continue;   // the larder ran dry mid-feast: no meal, hunger stands
+            barb& b = barbs[i];
+            stock[r].food -= kFeastFoodPerGuest;
+            b.hunger = 0;
+            b.slowTick = 0;
+            b.starveTicks = 0;
+            feast.fed[r][k] = true;
+            feast.eaten[r]++;
+            printf("FEAST MEAL - %s %s ate, food: %d\n", racePlurals[r], b.name, stock[r].food);
+        }
+        if (--feast.ticks[r] <= 0) endFeast(barbs, r, "fire out");
     }
 }
 
@@ -20452,6 +20628,7 @@ int main() {
                     }
                 }
                 vigilTick(barbs, squares);   // R63-F5: after clockk(): the year's first dusk lights the graveside vigil
+                feastTick(barbs, squares, houseshapes);   // R63-F2: after clockk(): autumn's first evening lights the harvest feast
                 riverSeasonTick(barbs, squares, stores, smoke, dwarfForge, fields, trees, tris, rocks, octs, bushes);   // R62-F2: after clockk(), so ice/flood land at the midnight
                 runTick();   // R63-F3: after riverSeasonTick(), so the run sees this tick's river state
                 bridgeTorchTick(barbs, squares, stores, smoke, dwarfForge, fields, trees, tris, rocks, octs, bushes);   // R62-F2c: burn timers, a won raid's torch
@@ -20580,6 +20757,7 @@ int main() {
 	if (!paused) millFrameTick();
 
 	drawCampfire(window, fire, frameCount);
+	drawFeastFires(window, camRect, frameCount);   // R63-F2: harvest bonfires beside the crates, under the barbs
 
 	drawDeer(window, deers, deershape, frameCount);
 
@@ -20656,6 +20834,7 @@ int main() {
                       max(hudBarHeight, stockRect.position.y + stockRect.size.y));      // aurora starts under last frame's stock panel
         drawLoreCandles(window, worldView, barbs, isNightHour(t));   // R59-F3: study candles at any hour, halo at night
         drawVigilCandles(window, worldView, camRect, houseshapes, frameCount);   // R63-F5: graveside flames over the overlay
+        drawFeastGlow(window, worldView, camRect, frameCount);   // R63-F2: faint bonfire glow over the overlay
         drawProwlerOverlay(window, worldView, prowlers, fire);   // R48-F1: red eyes + safe-zone ring, above the night overlay
         drawHouseFires(window, worldView, houses, houseshapes, frameCount);   // R61-F1: flames on torched roofs, above the overlay
         drawBridgeFires(window, worldView, frameCount);   // R62-F2c: flames on a torched bridge deck, above the overlay
