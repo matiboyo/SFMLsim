@@ -896,6 +896,36 @@ const int wolfSpawnChance = 5000;          // 1-in-N per tick while below the ca
 const int wolfStepInterval = 2;            // ticks per 1px step (deer step every 3, so wolves gain slowly)
 const Vector2f wolfSize(5.0f, 3.0f);
 const Color wolfColor(150, 150, 160);      // cool mid grey: lighter than rocks, darker than birds, far from deer tan
+// R63-F6 Wolf Den (phase 1): at dawn on spring's first day, kDenSpringChance of a den on the wild rim (just inside the wild
+// band's outer edge, where wolves already come and go), placed through placePoi. The den is its own struct with a stable
+// id: a 6x4 grey-brown mound with a 2px dark mouth. Its kDenPups pups are wolves made by spawnWolf(), the one spawn site,
+// which refuses past maxWolves; they hunt like any wolf but come home to the mouth instead of leaving. A hunter (a barb on
+// a deer chase) or a watchman within kDenClearReachPx clears it: clearDen(id) removes den and pups and leaves a pale scuff
+// (fixed slots) fading over a day. Autumn's arrival abandons a den. Never saved: resetDens() on a chronicle load.
+// Phase 1 only: no renown or other integration.
+const float kDenSpringChance = 0.75f;      // chance of a den each spring
+const int kDenPups = 2;                    // pups made with the den (each still capped by maxWolves)
+const float kDenRimDepthPx = 60.0f;        // den centre at most this far inside the wild band's outer edge
+const int kDenPlaceTries = 1500;           // once a year; most rolls miss the rim strip or land under the wild ring's trees
+const float kDenHouseGap = 80.0f;          // den centre -> any house centre (keeps it apart from homes)
+const float kDenPoiGap = 80.0f;            // ...-> any hut/well centre
+const float kDenCampGap = 120.0f;          // ...-> the wildfolk camp centre
+const float kDenRuinGap = 120.0f;          // ...-> the ruin centre
+const float kDenTreeClearPx = 1.0f;       // no tree footprint this close to the den and its pups' rest spots
+const float kDenClearReachPx = 10.0f;      // hunter/watchman centre -> den centre that clears the den
+const Vector2f kDenSize(6.0f, 4.0f);       // mound (a house is far larger and square-roofed)
+const Vector2f kDenMouthOffset(2.0f, 2.0f);// 2x2 dark mouth, bottom centre
+const Vector2f kDenMouthSize(2.0f, 2.0f);
+const Vector2f kDenPupRest[kDenPups] = {Vector2f(-4.0f, 2.0f), Vector2f(7.0f, 2.0f)};   // pup top-left vs den top-left: either side
+const Vector2f kPupSize(3.0f, 2.0f);       // smaller than a wolf (5x3)
+const Color kPupColor(170, 166, 168);      // a shade paler and warmer than wolfColor
+const Color kDenColor(110, 98, 84);        // grey-brown earth: warmer and darker than rocks (128,126,118)
+const Color kDenLitColor(132, 118, 100);   // top row of the mound
+const Color kDenMouthColor(34, 28, 24);    // the dark hole
+const int kDenScuffSlots = 2;              // fixed scuff entries; a new scuff takes a free or the faintest slot
+const int kDenScuffTicks = 24 * ticksPerGameHour;   // the scuff fades out over one game day
+const Vector2f kDenScuffSize(10.0f, 5.0f); // a little wider than the mound (corners trimmed when drawn)
+const Color kDenScuffColor(188, 178, 152, 80);       // pale trampled earth, alpha at its freshest
 
 // R48-F1 Night Prowlers, phase 1: shadow creatures come in from the map edge during the night, chase the nearest barb or
 // house outside the lit campfire's safe zone and bite barbs; they dissolve at dawn or on entering the safe zone.
@@ -5105,9 +5135,21 @@ int raceCooldown[raceCount] = {};   // POL-F4: visits left before a race can be 
 // Wolves own their shape (like the trader), so there is no parallel vector to keep in sync
 struct wolf {
     enum Phase {Hunting, Leaving} phase = Hunting;
-    Vector2f exit;
+    Vector2f exit;            // R63-F6: a pup's exit is its rest spot at the den mouth
     int stepTimer = 0;
+    int denId = -1;           // R63-F6: wolfDen.id of a pup's den (stable id, never an index); -1 = an ordinary wolf
     RectangleShape shape;
+};
+
+// R63-F6: one wolf den on the wild rim. pos = mound top-left (whole pixels).
+struct wolfDen {
+    int id = -1;
+    Vector2f pos;
+};
+struct denScuff {             // fixed-size slot; on = drawn and fading
+    bool on = false;
+    Vector2f pos;             // scuff top-left
+    int ticks = 0;            // ticks of fade left
 };
 
 // R48-F1: prowlers own their state (no parallel vector). Targets are stable ids (barb.id / house.id), never indices,
@@ -5847,12 +5889,98 @@ void deerkilling(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares
 	}
 }
 
+// R63-F6: wolf dens (at most one at a time) and their fixed scuff slots. Never saved.
+vector<wolfDen> dens;
+int nextDenId = 0;
+int denRollDay = -1;                       // game_day of the last spring roll, so it fires once
+denScuff denScuffs[kDenScuffSlots];
+
+int findDenById(int id) {
+	for (int i = 0; i < (int)dens.size(); i++) if (dens[i].id == id) return i;
+	return -1;
+}
+Vector2f denCentre(const wolfDen& d) { return d.pos + kDenSize / 2.0f; }
+
+void resetDens() {
+	dens.clear();
+	for (auto& s : denScuffs) s = denScuff{};
+	denRollDay = -1;
+}
+
+// R63-F6: the one wolf spawn site. Refuses (false) once maxWolves wolves are out, pups included. denId >= 0 = a pup
+// resting at pos (its exit, beside the den mouth); otherwise pos is the edge point it arrives at and leaves by.
+bool spawnWolf(vector<wolf>& wolves, Vector2f pos, int denId) {
+	if ((int)wolves.size() >= maxWolves) return false;
+	wolf w;
+	w.exit = pos;
+	w.denId = denId;
+	w.shape.setSize(denId >= 0 ? kPupSize : wolfSize);
+	w.shape.setFillColor(denId >= 0 ? kPupColor : wolfColor);
+	w.shape.setPosition(pos);
+	wolves.push_back(w);
+	return true;
+}
+
+// R63-F6: the one way a den goes. Its pups (any still out; none if they are already gone) are removed by reverse
+// iteration, and the den leaves a scuff in a free slot (or the faintest one). Returns the pups removed.
+int clearDen(vector<wolf>& wolves, int id) {
+	int di = findDenById(id);
+	if (di < 0) return 0;
+	int pups = 0;
+	for (int i = (int)wolves.size() - 1; i >= 0; i--)
+		if (wolves[i].denId == id) { swapRemove(wolves, i); pups++; }
+	int slot = 0;
+	for (int k = 0; k < kDenScuffSlots; k++) {
+		if (!denScuffs[k].on) { slot = k; break; }
+		if (denScuffs[k].ticks < denScuffs[slot].ticks) slot = k;
+	}
+	denScuffs[slot].on = true;
+	denScuffs[slot].pos = snapPx(denCentre(dens[di]) - kDenScuffSize / 2.0f);
+	denScuffs[slot].ticks = kDenScuffTicks;
+	swapRemove(dens, di);
+	return pups;
+}
+
+bool placeDenSite(Vector2f& out, const vector<CircleShape>& tris, const vector<RectangleShape>& houseshapes);   // after placePoi()
+
 // Wolves enter from an edge, chase the nearest deer and kill it on contact (no food). After one kill,
 // or once deer are scarce (<= wolfMinDeer), they walk back out, so they can never wipe the deer out.
-void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs) {
+// R63-F6: also rolls the spring den (pups through spawnWolf), brings pups home and clears a den a hunter or watchman reaches.
+void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs, const vector<RectangleShape>& squares,
+              const vector<CircleShape>& tris, const vector<RectangleShape>& houseshapes) {
 	vector<deer>& deers = wd.deers;
 	vector<RectangleShape>& deershape = wd.deershape;
 	int deerCount = countSpecies(deers, speciesDeer);   // only deer count: rabbits are never wolf prey
+	if (!dens.empty() && seasonOf(game_day) >= seasonAutumn) {   // R63-F6: autumn abandons the den; pups slip off
+		for (auto& w : wolves)
+			if (w.denId >= 0) { w.denId = -1; w.phase = wolf::Leaving; }
+		printf("WOLF DEN - abandoned for the autumn (%d)\n", (int)dens.size());
+		dens.clear();
+	}
+	if (seasonOf(game_day) == seasonSpring && dayInSeason(game_day) == 0 && game_time == nightEndHour
+	    && denRollDay != game_day) {   // R63-F6: the spring roll; maxWolves is checked before any pup is made
+		denRollDay = game_day;
+		Vector2f c;
+		if (!dens.empty() || (int)wolves.size() >= maxWolves) {
+			printf("WOLF DEN - none this spring (%s)\n", dens.empty() ? "pack at its cap" : "a den stands");
+		} else if (uniform_real_distribution<float>(0.0f, 1.0f)(gen) >= kDenSpringChance) {
+			printf("WOLF DEN - none this spring (roll)\n");
+		} else if (!placeDenSite(c, tris, houseshapes)) {
+			printf("WOLF DEN - no spot found on the wild rim\n");
+		} else {
+			wolfDen d;
+			d.id = nextDenId++;
+			d.pos = snapPx(c - kDenSize / 2.0f);
+			dens.push_back(d);
+			int pups = 0;
+			for (int k = 0; k < kDenPups; k++)
+				if (spawnWolf(wolves, d.pos + kDenPupRest[k], d.id)) pups++;
+			const char* dir = compassName(c - villageCenter);
+			printf("WOLF DEN %d - at (%.0f, %.0f) to the %s, %d pups, wolves %d/%d\n", d.id, c.x, c.y, dir, pups,
+			       (int)wolves.size(), maxWolves);
+			logEvent(string("Wolves have denned on the wild rim to the ") + dir);
+		}
+	}
 	if ((int)wolves.size() < maxWolves && deerCount > wolfMinDeer
 	    && uniform_int_distribution<int>(0, wolfSpawnChance - 1)(gen) == 0) {
 		// R47-F1: in from a random side of the wild band's outer edge (where it meets the rocky rim), well clear of the
@@ -5871,11 +5999,7 @@ void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs) {
 			Vector2f d = w.exit - villageCenter;
 			found = hypot(d.x, d.y) >= zoneCoreRadius + wolfCoreMarginPx;
 		}
-		if (found) {
-			w.shape.setSize(wolfSize);
-			w.shape.setFillColor(wolfColor);
-			w.shape.setPosition(w.exit);
-			wolves.push_back(w);
+		if (found && spawnWolf(wolves, w.exit, -1)) {   // R63-F6: through the one spawn site (cap checked there)
 			const char* dir = compassName(w.exit - villageCenter);
 			printf("Wolf arriving from the %s (%.0f, %.0f)\n", dir, w.exit.x, w.exit.y);
 			logEvent(string("A wolf comes out of the wilds to the ") + dir);
@@ -5885,6 +6009,7 @@ void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs) {
 	for (int i = 0; i < (int)wolves.size(); ) {
 		wolf& w = wolves[i];
 		Vector2f pos = w.shape.getPosition();
+		if (w.denId >= 0 && findDenById(w.denId) < 0) { w.denId = -1; w.phase = wolf::Leaving; }   // R63-F6: den gone (load)
 		if (w.phase == wolf::Hunting && deerCount <= wolfMinDeer) w.phase = wolf::Leaving;
 		Vector2f goal = w.exit;
 		int prey = -1;
@@ -5907,7 +6032,7 @@ void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs) {
 		}
 		Vector2f diff = goal - pos;
 		float dSq = diff.x * diff.x + diff.y * diff.y;
-		if (w.phase == wolf::Leaving && dSq < 1.0f) {
+		if (w.phase == wolf::Leaving && dSq < 1.0f && w.denId < 0) {   // R63-F6: a pup home at its den stays there
 			swapRemove(wolves, i);   // re-check index i: it now holds the swapped-in wolf
 			continue;
 		}
@@ -5917,6 +6042,25 @@ void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs) {
 		}
 		++i;
 	}
+	// R63-F6: a hunter (on a deer chase) or a watchman reaching a den clears it. Reverse: clearDen() swap-removes dens.
+	for (int di = (int)dens.size() - 1; di >= 0; di--) {
+		Vector2f dc = denCentre(dens[di]);
+		for (int j = 0; j < (int)barbs.size() && j < (int)squares.size(); j++) {
+			const barb& b = barbs[j];
+			if (b.health <= 0 || !(b.deertargeting || b.activity == actWatch)) continue;
+			Vector2f d = squares[j].getPosition() + squares[j].getSize() / 2.0f - dc;
+			if (d.x * d.x + d.y * d.y >= kDenClearReachPx * kDenClearReachPx) continue;
+			int id = dens[di].id;
+			int pups = clearDen(wolves, id);
+			const char* role = b.activity == actWatch ? "watchman" : "hunter";
+			printf("WOLF DEN %d CLEARED by %s %s (%s), %d pups gone, wolves %d/%d\n", id, role, b.name,
+			       racePlurals[clampRace(b.race)], pups, (int)wolves.size(), maxWolves);
+			logRaceEvent(string(b.name) + " drives the wolves from their den", b.race);
+			break;
+		}
+	}
+	for (auto& s : denScuffs)   // R63-F6: scuffs fade over a day
+		if (s.on && --s.ticks <= 0) s = denScuff{};
 }
 
 // Pushes one animal onto deers and its shape onto deershape together (same index)
@@ -7942,7 +8086,8 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
                             campHunterShapes[i], nullopt};
         }
     for (auto& w : wolves)
-        if (near(w.shape)) return hoverHit{w.phase == wolf::Hunting ? "Wolf: hunting" : "Wolf: leaving", w.shape, nullopt};
+        if (near(w.shape)) return hoverHit{w.denId >= 0 ? (w.phase == wolf::Hunting ? "Wolf pup: hunting" : "Wolf pup: at the den")   // R63-F6
+                                                        : (w.phase == wolf::Hunting ? "Wolf: hunting" : "Wolf: leaving"), w.shape, nullopt};
     for (int i = 0; i < (int)deershape.size() && i < (int)deers.size(); i++)
         if (near(deershape[i])) return hoverHit{string(speciesOf(deers[i]).name) + " " + to_string(deers[i].health) + "hp", deershape[i], nullopt};
     for (int i = 0; i < (int)octs.size() && i < (int)rocks.size(); i++)
@@ -11121,6 +11266,7 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
     resetVigil();             // R63-F5: nor a vigil, nor its morale lift
     resetFeast();             // R63-F2: nor a harvest feast fire
     salmon = salmonRun{};     // R63-F3: nor a salmon run (anglers on its banks quit through the fish path's range check)
+    resetDens();              // R63-F6: nor a wolf den or its scuffs (its pups leave through wolfTick()'s den check)
     if (d.barbs.empty()) {
         for (auto& b : barbs) b.bornHour = chronicleNowHour() - founderAgeHours();   // founders arrive on the restored clock (R57-F1: grown)
         printf("CHRONICLE - no barbs saved: the %d founders stay\n", (int)barbs.size());
@@ -19226,6 +19372,34 @@ bool placePoi(float margin, int tries, OkFn ok, Vector2f& out) {
     return false;
 }
 
+// R63-F6: a den centre on the wild rim: in the wild band no more than kDenRimDepthPx inside its outer edge, clear of the
+// core (as wolf arrivals are), the quarters, the ruins, every hut/well, the wildfolk camp and every house, dry, and with
+// no tree footprint over the mound or its pups' rest spots (a canopy would hide it).
+bool placeDenSite(Vector2f& out, const vector<CircleShape>& tris, const vector<RectangleShape>& houseshapes) {
+    auto farFrom = [](Vector2f p, Vector2f q, float gap) { Vector2f d = p - q; return d.x * d.x + d.y * d.y >= gap * gap; };
+    return placePoi(poiEdgeMargin, kDenPlaceTries, [&](Vector2f p) {
+        Vector2f tl = snapPx(p - kDenSize / 2.0f);
+        float padL = -kDenPupRest[0].x, padR = kDenPupRest[1].x + kPupSize.x - kDenSize.x;
+        FloatRect area(tl - Vector2f(padL + kDenTreeClearPx, kDenTreeClearPx),
+                       kDenSize + Vector2f(padL + padR + 2 * kDenTreeClearPx, 2 * kDenTreeClearPx));
+        for (Vector2f k : {area.position, area.position + area.size, area.position + Vector2f(area.size.x, 0.0f),
+                           area.position + Vector2f(0.0f, area.size.y)})
+            if (zoneAt(k) != zoneWild) return false;
+        float rim = min(min(p.x, p.y), min(worldSize - p.x, worldSize - p.y));
+        if (rim > zoneEdgeBandPx + kDenRimDepthPx) return false;
+        if (!farFrom(p, villageCenter, zoneCoreRadius + wolfCoreMarginPx)) return false;
+        if (nearQuarter(p, poiQuarterGap)) return false;
+        if (hasRuins() && !farFrom(p, ruinCentre, kDenRuinGap)) return false;
+        for (int i = 0; i < (int)poiShapes.size(); i++) if (!farFrom(p, poiCentre(i), kDenPoiGap)) return false;
+        for (auto& s : wildCampShapes) if (!farFrom(p, s.getPosition() + s.getSize() / 2.0f, kDenCampGap)) return false;
+        for (auto& h : houseshapes) if (!farFrom(p, h.getPosition() + h.getSize() / 2.0f, kDenHouseGap)) return false;
+        if (!lakeClear(area)) return false;
+        for (auto& t : tris)
+            if (area.findIntersection(FloatRect(t.getPosition(), Vector2f(treeFootprint, treeFootprint)))) return false;
+        return true;
+    }, out);
+}
+
 void spawnRuins(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleShape>& stumps, vector<rock>& rocks,
                 vector<CircleShape>& octs, vector<char>& rockGold, vector<bush>& bushes, vector<CircleShape>& bushshapes) {
     ruinStones.clear();
@@ -20256,6 +20430,33 @@ void drawPois(RenderWindow& window, const FloatRect& camRect, int frame) {
     if (va.getVertexCount() > 0) window.draw(va);
 }
 
+// R63-F6: with the buildings, under the pups (wolves) and barbs. Scuffs first (pale trampled earth, corners trimmed so it
+// reads as a rough oval, alpha falling with the ticks left), then each den: lit top row, body, dark 2x2 mouth.
+void drawDens(RenderWindow& window, const FloatRect& camRect) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (auto& s : denScuffs) {
+        if (!s.on || !camRect.findIntersection(FloatRect(s.pos, kDenScuffSize))) continue;
+        Color c = kDenScuffColor;
+        c.a = (uint8_t)(kDenScuffColor.a * s.ticks / kDenScuffTicks);
+        if (c.a == 0) continue;
+        pushQuad(va, s.pos + Vector2f(2.0f, 0.0f), Vector2f(kDenScuffSize.x - 4.0f, 1.0f), c);
+        pushQuad(va, s.pos + Vector2f(0.0f, 1.0f), Vector2f(kDenScuffSize.x, kDenScuffSize.y - 2.0f), c);
+        pushQuad(va, s.pos + Vector2f(2.0f, kDenScuffSize.y - 1.0f), Vector2f(kDenScuffSize.x - 4.0f, 1.0f), c);
+    }
+    for (auto& d : dens) {
+        Vector2f o = snapPx(d.pos);
+        if (!camRect.findIntersection(FloatRect(o, kDenSize))) continue;
+        pushQuad(va, o + Vector2f(1.0f, 0.0f), Vector2f(kDenSize.x - 2.0f, 1.0f), kDenLitColor);   // rounded top
+        pushQuad(va, o + Vector2f(0.0f, 1.0f), Vector2f(kDenSize.x, 1.0f), kDenColor);
+        pushQuad(va, o + Vector2f(0.0f, 2.0f), Vector2f(kDenMouthOffset.x, kDenSize.y - 2.0f), kDenColor);   // left flank
+        float rx = kDenMouthOffset.x + kDenMouthSize.x;
+        pushQuad(va, o + Vector2f(rx, 2.0f), Vector2f(kDenSize.x - rx, kDenSize.y - 2.0f), kDenColor);        // right flank
+        pushQuad(va, o + kDenMouthOffset, kDenMouthSize, kDenMouthColor);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
 // R47-F4: found sites glow soft violet (additive, after the day/night overlay, any hour, dimmed by rain like the ruins);
 // spent sites keep one faint small layer; undiscovered sites have none.
 void drawPoiGlow(RenderWindow& window, const View& worldView, const FloatRect& camRect, int frame) {
@@ -20600,7 +20801,7 @@ int main() {
                 herdTick(wd);   // R56-F1: season-edge trek flags, before the deer move
                 deerwander(wd, squares, barbs);
                 deerkilling(wd, barbs, squares, smoke);
-                wolfTick(wolves, wd, barbs);
+                wolfTick(wolves, wd, barbs, squares, tris, houseshapes);   // R63-F6: + spring den, pups, den clearing
                 prowlerTick(prowlers, barbs, squares, houses, houseshapes, fire);   // R48-F1: bites land before starveDeathTick()
                 wyrmTick(houses, houseshapes);   // R61-F1: house burns, wake, the night's torching; wyrmThreat[] for bellTick()
                 watchTick(barbs, squares, prowlers);   // R51-F1: watchmen patrol and fight; slain prowlers fade, prowlerTick() removes them
@@ -20737,6 +20938,7 @@ int main() {
 	drawCamps(window);
 	drawPois(window, camRect, frameCount);   // R47-F4: huts and wells, with the buildings
 	drawWildCamp(window, camRect, frameCount, isNightHour(game_time));   // R55-F1: hide tents, hearth smoke, pennant
+	drawDens(window, camRect);   // R63-F6: wolf den mound + fading scuffs, with the buildings, under the pups and barbs
 	drawStall(window, activeTrader);
 	drawForge(window, dwarfForge, frameCount, forgeBonusPending(barbs, dwarfForge), forgeSmelting(barbs));   // R47-F7: smoke wisp
 	if (forgeEmberFrames > 0 && !paused) forgeEmberFrames--;
