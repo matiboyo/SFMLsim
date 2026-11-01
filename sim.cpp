@@ -1140,6 +1140,52 @@ const float kLootSpeedMult = 0.8f;            // laden walk speed multiplier (fo
 const float kLootRelationDelta = 0.15f;       // relation drop for the pair when anything is plundered
 const Vector2f kLootBundleSize(2.0f, 1.0f);   // carried low beside the body, one column out from the spear's foot
 const Color kLootBundleColor(176, 120, 190);  // muted violet sack: apart from every task stripe, the red pennant and the relic gold
+// R65-F1 Longships on the Strand, phase 1: at dusk, once kSeaRaidCooldownTicks have run out and some race has reached the
+// Hamlet, a longship may come in off the sea (only when a river, and so a sea, was placed). Its landing (beached hull
+// spot, the strand point the raiders use and the target crate's race) is cached once, when the ship spawns, from
+// seaMask/seaDepth. Beached, it lands kSeaRaiderCount raiders who march to the crate of the quarter nearest the landing,
+// each lifts one capped pack (deducted at pickup; kSeaLootCap per landing, same share and floor as the R53-F1 plunder)
+// and races back to the ship. Watchmen strike them like prowlers (no stored id: nearest each tick); a slain raider drops
+// its pack back to the robbed race. Any raider aboard: the ship sails off with what it carries; every raider beaten: the
+// ship burns on the strand. One ticker line per landing. Ship and raider states are enums (longshipPhase, seaRaiderState);
+// raiders hold the ship id (never an index) and are stranded (walk to the strand and wade off) once the ship is gone.
+const int kSeaRaiderCount = 3;                       // raiders landed by the one ship
+const int kSeaRaidCooldownTicks = 3 * 24 * ticksPerGameHour;   // three game days between landings (and before the first)
+const float kSeaRaidNightChance = 0.35f;             // dusk roll once the cooldown has run out
+const int kSeaRaidArriveMaxDelayTicks = 2 * ticksPerGameHour;  // the ship comes in within the first two hours of the night
+const int kSeaShipSailTicks = 600;                   // sail in from the map edge to the strand, and back out (~10s at 1x)
+const int kSeaRaidMaxTicks = 6 * ticksPerGameHour;   // backstop from the landing: the ship sails, stragglers are stranded
+const int kSeaShipBurnTicks = 2 * ticksPerMinute;    // beaten: flames along the hull this long...
+const int kSeaShipCharTicks = ticksPerMinute;        // ...then the charred hull fades out over this
+const int kSeaShipFlameTongues = 5;                  // flame pixels on a burning hull (thins over the last quarter)
+const int kSeaLandingEdgeCells = 4;                  // landing columns keep this many cells off the map corners...
+const int kSeaLandingRiverCells = 4;                 // ...and this many off the river band at the strand row
+const float kSeaLandingInlandPx = 3.0f;              // strand point: this far inland of the waterline
+const int kSeaRaiderMaxHp = 40;                      // 2-3 watch blows
+const int kSeaRaiderMarchStep = 9;                   // ticks per 1px marching in (barbs step every 10)
+const int kSeaRaiderFleeStep = 12;                   // laden flight to the ship: a watchman on its heels closes in
+const int kSeaRaiderRetreatStep = 10;                // empty-handed walk back
+const int kSeaLootTicks = 240;                       // ticks at the crate before the pack is lifted (~4s at 1x)
+const float kSeaLootReachPx = 1.5f;                  // raider centre to its crate spot
+const float kSeaRaiderSpreadPx = 3.0f;               // raiders stand this far apart at the crate and on the strand
+const int kSeaLootCap = 6;                           // units lifted by one landing at most
+const int kSeaRaiderFadeTicks = 90;                  // slain, or wading off when stranded
+const int kSeaRaiderFlashFrames = 2;                 // white hit flash, drawn frames
+const int kRenownSeaRaider = 5;                      // a sea raider slain on the watch
+const Vector2f kSeaRaiderSize(2.0f, 2.0f);           // hitbox, like a barb's square; the 2x4 body stands on it
+const Vector2f kSeaHullSize(14.0f, 3.0f);            // hull box (gunwale, strakes, keel); posts, mast and sail rise above
+const float kSeaShipSailTopPx = 9.0f;                // mast top above the hull box
+const Color kSeaHullColor(84, 62, 46);               // dark tarred oak, reads on the sea blue (54, 86, 124)
+const Color kSeaGunwaleColor(122, 94, 66);           // lighter top strake
+const Color kSeaSailColor(170, 156, 128);            // undyed wool
+const Color kSeaSailStripeColor(132, 82, 68);        // faded madder stripe, well off the raid red (226, 50, 44)
+const Color kSeaShieldColors[2] = {Color(150, 132, 92), Color(104, 116, 124)};   // ochre and slate shields on the rail
+const Color kSeaCharColor(38, 34, 32);               // burnt hull
+const Color kSeaShipGlowColor(255, 140, 50, 36);     // faint additive glow round the burning hull, night only
+const Color kSeaRaiderColor(122, 156, 178);          // steel-blue cloak: apart from barbs, the raid red, loot violet, prowler lavender
+const Color kSeaRaiderHelmColor(196, 202, 206);      // pale iron helm row, drawn again above the night overlay
+const Color kSeaRaiderFlashColor(255, 255, 255);
+const Color kSeaRaidTickerTint(150, 184, 206);       // landing ticker line, the raiders' steel-blue lifted for the black strip
 // R54-F1 Caravans and Coin, phase 1: a race with a spare stock sends one two-barb caravan (held by barb id, owned by
 // caravanTick()) along the route planner to a rival crate that is not cold. There the pair swaps one lot each of a
 // surplus kind, the relation warms, and a pair at or above kRelFriendlyMinRelation becomes "friendly" for
@@ -5270,6 +5316,49 @@ struct prowler {
     int flashFrames = 0;      // R51-F1: drawn frames of white hit flash left (counted down after drawProwlers())
 };
 int nextProwlerId = 0;
+// R65-F1: the one longship (a single global, nothing to swapRemove) and its raiders. Everything the landing needs is
+// cached in the ship when it spawns; raiders copy their strand point and target race at landing and hold the ship by id.
+enum longshipPhase { shipAway, shipInbound, shipBeached, shipOutbound, shipBurning };
+struct longship {
+    longshipPhase phase = shipAway;
+    int id = -1;
+    int cooldown = kSeaRaidCooldownTicks;   // ticks until a dusk may roll for a landing
+    int arriveIn = -1;        // >= 0: tonight's arrival is scheduled this many ticks out
+    Vector2f beach;           // hull box top-left when beached
+    Vector2f offing;          // hull box top-left at the map edge (sail in from / out to)
+    Vector2f pos;             // hull box top-left now
+    Vector2f strand;          // landing point on the strand (raiders step off and board here)
+    bool faceLeft = false;    // prow end
+    int race = -1;            // target crate's race, cached at spawn
+    int timer = 0;            // sail in/out ticks left
+    int landedTicks = 0;      // ticks since the raiders stepped off
+    int burnLeft = 0, charLeft = 0;
+    int lootLeft = kSeaLootCap;
+    int boarded = 0;
+    raceStock carried{0, 0, 0};
+};
+longship seaShip;
+int nextSeaShipId = 0;
+enum seaRaiderState { srMarch, srLift, srFlee, srRetreat, srStranded, srFallen };
+struct seaRaider {
+    int id = -1;
+    int shipId = -1;
+    seaRaiderState state = srMarch;
+    Vector2f pos;             // hitbox top-left (kSeaRaiderSize)
+    Vector2f crateSpot;       // centre spot at the target crate
+    Vector2f strand;          // centre spot on the strand
+    int race = -1;            // target race (clamped on every use)
+    int hp = kSeaRaiderMaxHp;
+    int timer = 0;            // lift ticks left
+    int stepTimer = 0;
+    int fade = 0;             // > 0 = fading (slain or wading off), removed at 0
+    int flashFrames = 0;      // counted down after drawSeaRaidOverlay()
+    bool faceLeft = false;
+    raceStock loot{0, 0, 0};
+    int lootFrom = -1;
+};
+vector<seaRaider> seaRaiders;
+int nextSeaRaiderId = 0;
 // R61-F1: the one wyrm (a single global, nothing to swapRemove). id is stable for its life and fresh on each waking; the
 // house it hunts is held by house id and re-resolved every tick. Never saved: awake is re-derived from hollowLootLeft.
 enum wyrmPhase { wyrmLair, wyrmHunt, wyrmLoiter, wyrmRetreat };
@@ -13611,6 +13700,45 @@ int findProwlerById(const vector<prowler>& prowlers, int id) {
     return -1;
 }
 
+// R65-F1: sea raider helpers, used by watchTick() and seaRaidTick()
+Vector2f seaRaiderCentre(const seaRaider& r) { return r.pos + kSeaRaiderSize / 2.0f; }
+bool seaRaiderFightable(const seaRaider& r) { return r.fade == 0 && r.hp > 0 && r.state != srFallen; }
+bool seaRaiderLaden(const seaRaider& r) { return r.loot.food + r.loot.wood + r.loot.stone > 0; }
+
+// R65-F1: the one way a sea raider's pack ends without the ship: handed back to the robbed race. Safe with no pack.
+void dropSeaLoot(seaRaider& r, const char* why) {
+    if (seaRaiderLaden(r) && r.lootFrom >= 0 && r.lootFrom < raceCount) {
+        raceStock& s = stockOfRace(r.lootFrom);
+        s.food += r.loot.food; s.wood += r.loot.wood; s.stone += r.loot.stone;
+        printf("SEA LOOT DROPPED - raider %d (%s) drops %s, back to the %s\n", r.id, why, lootText(r.loot).c_str(), racePlurals[r.lootFrom]);
+    }
+    r.loot = raceStock{0, 0, 0};
+    r.lootFrom = -1;
+}
+
+// R65-F1: slain on the watch: drops the pack and starts the fade; seaRaidTick() removes it, so no index moves here
+void slaySeaRaider(seaRaider& r) {
+    if (r.state == srFallen) return;
+    dropSeaLoot(r, "slain");
+    r.state = srFallen;
+    r.hp = 0;
+    r.fade = kSeaRaiderFadeTicks;
+    printf("SEA RAIDER %d SLAIN at (%.0f, %.0f)\n", r.id, r.pos.x, r.pos.y);
+}
+
+// R65-F1: index of the nearest fightable sea raider within range of c, or -1 (coarse squared distance, at most a few)
+int nearestSeaRaider(Vector2f c, float range) {
+    int best = -1;
+    float bestSq = range * range;
+    for (int k = 0; k < (int)seaRaiders.size(); k++) {
+        if (!seaRaiderFightable(seaRaiders[k])) continue;
+        Vector2f d = seaRaiderCentre(seaRaiders[k]) - c;
+        float dSq = d.x * d.x + d.y * d.y;
+        if (dSq < bestSq) { bestSq = dSq; best = k; }
+    }
+    return best;
+}
+
 // R51-F1: patrol waypoint k (hitbox centre) on race r's ring
 Vector2f watchStopPos(int r, int k) {
     float a = 2.0f * 3.14159265f * (float)(((k % watchRingStops) + watchRingStops) % watchRingStops) / (float)watchRingStops;
@@ -13746,6 +13874,37 @@ void watchTick(vector<barb>& barbs, vector<RectangleShape>& squares, vector<prow
                 }
             } else {
                 Vector2f goal = pc - sq.getSize() / 2.0f;
+                b.targetx = (int)goal.x;
+                b.targety = (int)goal.y;
+                b.moving = true;
+                walkStep(b, sq, true);
+            }
+            continue;
+        }
+
+        // R65-F1: no prowler: the nearest sea raider in engage range, re-found every tick (no stored index). A laden
+        // raider runs slower than a watchman, so one on its heels closes in on the way to the ship.
+        int si = nearestSeaRaider(c, watchEngagePx);
+        if (si >= 0) {
+            seaRaider& r = seaRaiders[si];
+            Vector2f rc = seaRaiderCentre(r);
+            Vector2f d = rc - c;
+            if (d.x * d.x + d.y * d.y <= watchStrikeRangePx * watchStrikeRangePx) {
+                b.moving = false; clearRoute(b);
+                b.stepTimer = 0;
+                if (b.watchCooldown == 0) {
+                    b.watchCooldown = watchStrikeCooldownTicks;
+                    int dmg = weaponDamage(b);
+                    r.hp = max(0, r.hp - dmg);
+                    r.flashFrames = kSeaRaiderFlashFrames;
+                    printf("WATCH HIT - %s (id %d) hits sea raider %d for %d, %d hp left\n", b.name, b.id, r.id, dmg, r.hp);
+                    if (r.hp <= 0) {
+                        slaySeaRaider(r);   // removal stays in seaRaidTick(): indices here stay valid
+                        addRenown(barbs, i, kRenownSeaRaider, deedWatch);
+                    }
+                }
+            } else {
+                Vector2f goal = rc - sq.getSize() / 2.0f;
                 b.targetx = (int)goal.x;
                 b.targety = (int)goal.y;
                 b.moving = true;
@@ -15974,6 +16133,340 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
         endRaid(barbs, true);   // R53-F1: packs are deposited here
         for (int k = 0; k < kRaidPartySize; k++) plagueCarryHome(barbs, ri[k], def, "raid");   // R59-F2: ri[k] -1 = dropped
     }
+}
+
+// R65-F1: picks and caches the landing (once, as the ship spawns): a coast column clear of the corners, the river band
+// and the lakes, preferring one whose neighbours share its depth so the hull lies flush on the strand. Then the target
+// race: the peopled quarter nearest the strand. False (nothing changed) if there is no landing or no target.
+bool spawnLongship(const vector<barb>& barbs) {
+    if (!riverPlaced) return false;
+    const int N = trailGridN;
+    const float cell = trailCellSize;
+    vector<int> even, any;
+    for (int x = kSeaLandingEdgeCells; x < N - kSeaLandingEdgeCells; x++) {
+        int d = seaDepth[x];
+        int row = seaLow ? d : N - 1 - d;   // first land row in from the coast
+        int c = riverCellOf(row, x);
+        if (seaBlocked(c) || riverBase[c] != riverCell::dry) continue;
+        if (x >= riverLo[row] - kSeaLandingRiverCells && x <= riverHi[row] + kSeaLandingRiverCells) continue;
+        float wl = seaLow ? d * cell : worldSize - d * cell;
+        Vector2f strand = riverPoint(seaLow ? wl + kSeaLandingInlandPx : wl - kSeaLandingInlandPx, (x + 0.5f) * cell);
+        if (!lakeClear(FloatRect(strand - Vector2f(4.0f, 4.0f), Vector2f(8.0f, 8.0f)))) continue;
+        any.push_back(x);
+        if (seaDepth[x - 1] == d && seaDepth[x + 1] == d) even.push_back(x);
+    }
+    const vector<int>& pool = even.empty() ? any : even;
+    if (pool.empty()) { printf("LONGSHIP - no landing on the strand, none tonight\n"); return false; }
+    int x = pool[uniform_int_distribution<int>(0, (int)pool.size() - 1)(gen)];
+    int d = seaDepth[x];
+    float wl = seaLow ? d * cell : worldSize - d * cell;   // waterline: first land px (low sea) / first sea px (high sea)
+    Vector2f strand = riverPoint(seaLow ? wl + kSeaLandingInlandPx : wl - kSeaLandingInlandPx, (x + 0.5f) * cell);
+
+    int pop[raceCount] = {};
+    for (auto& b : barbs) pop[clampRace(b.race)]++;
+    int race = -1;
+    float best = numeric_limits<float>::infinity();
+    for (int r = 0; r < raceCount; r++) {
+        if (pop[r] == 0) continue;
+        Vector2f dv = quarterCentre(r) - strand;
+        float dSq = dv.x * dv.x + dv.y * dv.y;
+        if (dSq < best) { best = dSq; race = r; }
+    }
+    if (race < 0) { printf("LONGSHIP - nobody to raid, none tonight\n"); return false; }
+
+    longship s;
+    s.cooldown = 0;
+    s.id = nextSeaShipId++;
+    s.phase = shipInbound;
+    s.timer = kSeaShipSailTicks;
+    s.strand = strand;
+    s.race = race;
+    if (riverVertical) {   // coast runs east-west: the hull lies along it, sail rising to the north
+        float hx = (x + 0.5f) * cell - kSeaHullSize.x / 2.0f;
+        s.beach = Vector2f(hx, seaLow ? wl - kSeaHullSize.y : wl);
+        s.offing = Vector2f(hx, seaLow ? kSeaShipSailTopPx + 1.0f : worldSize - kSeaHullSize.y - 1.0f);
+        s.faceLeft = bernoulli_distribution(0.5)(gen);
+    } else {               // coast runs north-south: beached prow-first onto the strand
+        float hy = (x + 0.5f) * cell - 1.0f;
+        s.beach = Vector2f(seaLow ? wl - kSeaHullSize.x : wl, hy);
+        s.offing = Vector2f(seaLow ? 1.0f : worldSize - kSeaHullSize.x - 1.0f, hy);
+        s.faceLeft = !seaLow;
+    }
+    s.beach = snapPx(s.beach);
+    s.offing = snapPx(s.offing);
+    s.pos = s.offing;
+    seaShip = s;
+    printf("LONGSHIP %d sails in for the %s strand at (%.0f, %.0f), bound for the %s\n", s.id,
+           compassName(strand - villageCenter), strand.x, strand.y, racePlurals[race]);
+    return true;
+}
+
+// R65-F1: the ship's raiders lift one pack each at the crate: the kind the race can spare most, within the landing's
+// kSeaLootCap and the plunder share/floor (kLootStockFrac, kLootRivalFloor). Deducted at pickup.
+void liftSeaLoot(seaRaider& r) {
+    int def = clampRace(r.race);
+    raceStock& rs = stockOfRace(def);
+    const int have[3] = {rs.food, rs.wood, rs.stone};
+    const int floorOf[3] = {kLootRivalFloor.food, kLootRivalFloor.wood, kLootRivalFloor.stone};
+    const int pack[3] = {kLootPackFood, kLootPackWood, kLootPackStone};
+    int avail[3];
+    for (int k = 0; k < 3; k++) avail[k] = max(0, min((int)(have[k] * kLootStockFrac), have[k] - floorOf[k]));
+    int kind = 0;
+    for (int q = 1; q < 3; q++) if (avail[q] > avail[kind]) kind = q;
+    int take = min(min(pack[kind], avail[kind]), seaShip.lootLeft);
+    if (take <= 0) {
+        printf("SEA LOOT NONE - raider %d finds the %s stores too bare\n", r.id, racePlurals[def]);
+        return;
+    }
+    raceStock got{0, 0, 0};
+    (kind == 0 ? got.food : kind == 1 ? got.wood : got.stone) = take;
+    spend(rs, got.wood, got.stone, got.food);
+    r.loot = got;
+    r.lootFrom = def;
+    seaShip.lootLeft -= take;
+    printf("SEA LOOT LIFTED - raider %d lifts %s from the %s\n", r.id, lootText(got).c_str(), racePlurals[def]);
+}
+
+// R65-F1: runs right after raidTick(). The dusk roll and the sail in; the landing (one ticker line); every raider's
+// walk, lift, flight and boarding (backward over seaRaiders, so swapRemove only pulls in a visited raider; the ship is
+// re-checked by id every tick and a raider whose ship is gone is stranded); then the ship's exit: away with anyone
+// aboard, burning if all were beaten, or sailing at the backstop. watchTick() only wounds and slays; removal is here.
+void seaRaidTick(const vector<barb>& barbs) {
+    static bool wasNight = false;
+    bool night = isNightHour(game_time);
+    bool dusk = night && !wasNight;
+    wasNight = night;
+    longship& s = seaShip;
+
+    if (s.phase == shipAway) {
+        if (s.cooldown > 0) s.cooldown--;
+        if (dusk && s.cooldown == 0 && s.arriveIn < 0 && riverPlaced && leadingEra() >= eraHamlet
+            && bernoulli_distribution(kSeaRaidNightChance)(gen)) {
+            s.arriveIn = uniform_int_distribution<int>(0, kSeaRaidArriveMaxDelayTicks)(gen);
+            printf("LONGSHIP - a sail on the horizon, due in %d ticks\n", s.arriveIn);
+        }
+        if (s.arriveIn >= 0) {
+            if (!night) s.arriveIn = -1;   // the night passed before it came
+            else if (s.arriveIn-- == 0 && !spawnLongship(barbs)) { s.arriveIn = -1; s.cooldown = kSeaRaidCooldownTicks; }
+        }
+    } else if (s.phase == shipInbound) {
+        s.timer--;
+        float t = 1.0f - (float)max(s.timer, 0) / kSeaShipSailTicks;
+        s.pos = snapPx(s.offing + (s.beach - s.offing) * t);
+        if (s.timer <= 0) {
+            s.phase = shipBeached;
+            s.pos = s.beach;
+            s.landedTicks = 0;
+            int race = clampRace(s.race);
+            Vector2f across = riverPoint(0.0f, kSeaRaiderSpreadPx);
+            for (int k = 0; k < kSeaRaiderCount; k++) {
+                seaRaider r;
+                r.id = nextSeaRaiderId++;
+                r.shipId = s.id;
+                r.state = srMarch;
+                r.race = race;
+                r.hp = kSeaRaiderMaxHp;
+                r.strand = s.strand + across * (float)(k - 1);
+                r.crateSpot = quarterCentre(race) + Vector2f(kSeaRaiderSpreadPx * (k - 1), 0.0f);
+                r.pos = snapPx(r.strand - kSeaRaiderSize / 2.0f);
+                seaRaiders.push_back(r);
+            }
+            const char* dir = compassName(s.strand - villageCenter);
+            printf("LONGSHIP %d BEACHES on the %s strand at (%.0f, %.0f): %d raiders for the %s\n", s.id, dir, s.strand.x,
+                   s.strand.y, kSeaRaiderCount, racePlurals[race]);
+            logEvent(string("A longship beaches on the ") + dir + " strand - raiders make for the " + racePlurals[race],
+                     kSeaRaidTickerTint);
+        }
+    }
+
+    bool beached = s.phase == shipBeached;
+    for (int i = (int)seaRaiders.size() - 1; i >= 0; i--) {
+        seaRaider& r = seaRaiders[i];
+        if (r.fade > 0) {
+            if (--r.fade <= 0) swapRemove(seaRaiders, i);
+            continue;
+        }
+        if (r.state == srFallen) { swapRemove(seaRaiders, i); continue; }
+        if (r.state != srStranded && !(beached && s.id == r.shipId)) {   // the ship is gone: make for the strand alone
+            r.state = srStranded;
+            printf("SEA RAIDER %d stranded (ship %d gone)\n", r.id, r.shipId);
+        }
+        if (!night && (r.state == srMarch || r.state == srLift)) {   // dawn: back to the ship
+            r.state = seaRaiderLaden(r) ? srFlee : srRetreat;
+            printf("SEA RAIDER %d turns back at dawn\n", r.id);
+        }
+        Vector2f c = seaRaiderCentre(r);
+        Vector2f goal = r.strand;
+        int step = kSeaRaiderRetreatStep;
+        if (r.state == srMarch) {
+            goal = r.crateSpot;
+            step = kSeaRaiderMarchStep;
+            Vector2f d = goal - c;
+            if (d.x * d.x + d.y * d.y <= kSeaLootReachPx * kSeaLootReachPx) {
+                r.state = srLift;
+                r.timer = kSeaLootTicks;
+                continue;
+            }
+        } else if (r.state == srLift) {
+            if (--r.timer > 0) continue;
+            liftSeaLoot(r);
+            r.state = seaRaiderLaden(r) ? srFlee : srRetreat;
+            continue;
+        } else {
+            if (r.state == srFlee) step = kSeaRaiderFleeStep;
+            Vector2f d = goal - c;
+            if (d.x * d.x + d.y * d.y < 1.0f) {
+                if (r.state == srStranded) {   // wades off into the sea; the pack stays on the strand for its owners
+                    dropSeaLoot(r, "stranded");
+                    r.fade = kSeaRaiderFadeTicks;
+                    printf("SEA RAIDER %d wades off the strand\n", r.id);
+                    continue;
+                }
+                s.boarded++;
+                s.carried.food += r.loot.food; s.carried.wood += r.loot.wood; s.carried.stone += r.loot.stone;
+                printf("SEA RAIDER %d boards ship %d%s%s\n", r.id, s.id, seaRaiderLaden(r) ? " with " : "",
+                       seaRaiderLaden(r) ? lootText(r.loot).c_str() : "");
+                swapRemove(seaRaiders, i);
+                continue;
+            }
+        }
+        if (++r.stepTimer >= step) {
+            r.stepTimer = 0;
+            Vector2f m = pathStep(c, goal);   // fords only, like every other walker
+            if (fabs(m.x) > 0.2f) r.faceLeft = m.x < 0.0f;
+            r.pos += m;
+        }
+    }
+
+    if (s.phase == shipBeached) {
+        s.landedTicks++;
+        int ashore = 0;
+        for (auto& r : seaRaiders) if (r.shipId == s.id && seaRaiderFightable(r) && r.state != srStranded) ashore++;
+        if (ashore == 0 && s.boarded == 0) {
+            s.phase = shipBurning;
+            s.burnLeft = kSeaShipBurnTicks;
+            s.charLeft = kSeaShipCharTicks;
+            printf("LONGSHIP %d BURNS - every raider beaten, the ship is fired on the strand\n", s.id);
+        } else if (ashore == 0 || s.landedTicks >= kSeaRaidMaxTicks) {
+            s.phase = shipOutbound;
+            s.timer = kSeaShipSailTicks;
+            printf("LONGSHIP %d SAILS with %d aboard, carrying %s%s\n", s.id, s.boarded,
+                   s.carried.food + s.carried.wood + s.carried.stone > 0 ? lootText(s.carried).c_str() : "nothing",
+                   ashore > 0 ? " (stragglers left behind)" : "");
+        }
+    } else if (s.phase == shipOutbound) {
+        s.timer--;
+        float t = (float)max(s.timer, 0) / kSeaShipSailTicks;
+        s.pos = snapPx(s.offing + (s.beach - s.offing) * t);
+        if (s.timer <= 0) {
+            printf("LONGSHIP %d gone over the horizon\n", s.id);
+            seaShip = longship{};
+            seaShip.cooldown = kSeaRaidCooldownTicks;
+        }
+    } else if (s.phase == shipBurning) {
+        if (s.burnLeft > 0) s.burnLeft--;
+        else if (--s.charLeft <= 0) {
+            printf("LONGSHIP %d burnt out\n", s.id);
+            seaShip = longship{};
+            seaShip.cooldown = kSeaRaidCooldownTicks;
+        }
+    }
+}
+
+// R65-F1: world layer, under the night overlay (with the prowlers and the wyrm). The ship in side view on its hull box:
+// gunwale, strake and keel, stern and prow posts, rail shields, mast and a striped wool sail; alpha fades it in and out
+// at the map edge. Burning or charred, it is drawn black without the sail. Raiders: a 2x4 body on the hitbox (feet on
+// its bottom edge) with a pale helm row and a 2x1 sack beside it while laden.
+void drawSeaRaid(RenderWindow& window) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    const longship& s = seaShip;
+    if (s.phase != shipAway) {
+        float a = 1.0f;
+        if (s.phase == shipInbound) a = 1.0f - (float)s.timer / kSeaShipSailTicks;
+        else if (s.phase == shipOutbound) a = (float)s.timer / kSeaShipSailTicks;
+        else if (s.phase == shipBurning && s.burnLeft <= 0) a = (float)s.charLeft / kSeaShipCharTicks;
+        a = clamp(a, 0.0f, 1.0f);
+        bool charred = s.phase == shipBurning;
+        auto fa = [&](Color col) { col.a = (uint8_t)(col.a * a); return col; };
+        Color hull = fa(charred ? kSeaCharColor : kSeaHullColor), rail = fa(charred ? kSeaCharColor : kSeaGunwaleColor);
+        Vector2f o = snapPx(s.pos);
+        const float w = kSeaHullSize.x;
+        auto at = [&](float x, float y, float sw, float sh, Color col) {   // offsets written prow-right, mirrored for left
+            pushQuad(va, o + Vector2f(s.faceLeft ? w - x - sw : x, y), Vector2f(sw, sh), col);
+        };
+        if (!charred) at(6.0f, -kSeaShipSailTopPx, 1.0f, kSeaShipSailTopPx, hull);   // mast
+        else at(6.0f, -3.0f, 1.0f, 3.0f, hull);                                         // burnt stub
+        if (!charred)
+            for (int j = 0; j < 5; j++) at(3.0f, -8.0f + j, 8.0f, 1.0f, fa(j % 2 == 0 ? kSeaSailColor : kSeaSailStripeColor));
+        at(1.0f, 0.0f, 12.0f, 1.0f, rail);   // gunwale
+        at(1.0f, 1.0f, 12.0f, 1.0f, hull);   // strake
+        at(3.0f, 2.0f, 8.0f, 1.0f, hull);    // keel
+        at(0.0f, -2.0f, 1.0f, 3.0f, hull);   // stern post
+        at(13.0f, -3.0f, 1.0f, 4.0f, hull);  // prow post
+        at(12.0f, -3.0f, 1.0f, 1.0f, hull);  // prow head
+        if (!charred)
+            for (int k = 0; k < 3; k++) at(3.0f + 3.0f * k, 0.0f, 1.0f, 1.0f, fa(kSeaShieldColors[k % 2]));
+    }
+    for (auto& r : seaRaiders) {
+        float a = r.fade > 0 ? (float)r.fade / kSeaRaiderFadeTicks : 1.0f;
+        bool flash = r.flashFrames > 0;
+        Color body = flash ? kSeaRaiderFlashColor : kSeaRaiderColor, helm = flash ? kSeaRaiderFlashColor : kSeaRaiderHelmColor;
+        body.a = helm.a = (uint8_t)(255.0f * a);
+        Vector2f o = snapPx(r.pos);
+        Vector2f top = o + Vector2f(0.0f, kSeaRaiderSize.y - barbBodySize.y);   // feet on the hitbox's bottom edge
+        pushQuad(va, top, Vector2f(barbBodySize.x, 1.0f), helm);
+        pushQuad(va, top + Vector2f(0.0f, 1.0f), Vector2f(barbBodySize.x, barbBodySize.y - 1.0f), body);
+        if (seaRaiderLaden(r)) {
+            Color sack = kLootBundleColor;
+            sack.a = body.a;
+            pushQuad(va, top + Vector2f(r.faceLeft ? -kLootBundleSize.x : barbBodySize.x, 2.0f), kLootBundleSize, sack);
+        }
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R65-F1: above the night overlay: the raiders' helm rows (night only, so they read in the dark), a 1px hp bar on a
+// wounded raider, and flames along a burning hull with a faint additive glow at night
+void drawSeaRaidOverlay(RenderWindow& window, const View& worldView, int frame) {
+    if (seaShip.phase == shipAway && seaRaiders.empty()) return;
+    window.setView(worldView);
+    static VertexArray va(PrimitiveType::Triangles), glow(PrimitiveType::Triangles);
+    va.clear();
+    glow.clear();
+    bool night = isNightHour(game_time);
+    const longship& s = seaShip;
+    if (s.phase == shipBurning && s.burnLeft > 0) {
+        Vector2f o = snapPx(s.pos);
+        float left = (float)s.burnLeft / kSeaShipBurnTicks;
+        int n = left < 0.25f ? max(1, (int)ceil(kSeaShipFlameTongues * left / 0.25f)) : kSeaShipFlameTongues;
+        if (night) pushQuad(glow, o + Vector2f(-3.0f, -6.0f), Vector2f(kSeaHullSize.x + 6.0f, 10.0f), kSeaShipGlowColor);
+        uint32_t cyc = (uint32_t)(frame / kFlameFlickerFrames);
+        for (int k = 0; k < n; k++) {
+            uint32_t h = fireHash((uint32_t)s.id * 8u + (uint32_t)k + 0x5EA0u, cyc);
+            float x = 1.0f + (float)(h % 12u);          // along the rail, x 1..12
+            float y = -3.0f + (float)((h >> 4) % 3u);   // just above it, y -3..-1
+            bool tall = (h >> 8) & 1u;
+            pushQuad(va, o + Vector2f(x, tall ? y - 1.0f : y), Vector2f(1.0f, tall ? 2.0f : 1.0f), kFlameColors[(h >> 9) & 1u]);
+        }
+    }
+    for (auto& r : seaRaiders) {
+        Vector2f o = snapPx(r.pos);
+        Vector2f top = o + Vector2f(0.0f, kSeaRaiderSize.y - barbBodySize.y);
+        if (night) {
+            Color helm = r.flashFrames > 0 ? kSeaRaiderFlashColor : kSeaRaiderHelmColor;
+            helm.a = (uint8_t)(255.0f * (r.fade > 0 ? (float)r.fade / kSeaRaiderFadeTicks : 1.0f));
+            pushQuad(va, top, Vector2f(barbBodySize.x, 1.0f), helm);
+        }
+        if (!seaRaiderFightable(r) || r.hp >= kSeaRaiderMaxHp) continue;
+        const float barW = 4.0f;   // centred over the 2px body, one row of grass above the helm
+        Vector2f b = top + Vector2f((barbBodySize.x - barW) / 2.0f, -2.0f);
+        float fillW = min(barW, ceil(barW * max(r.hp, 0) / kSeaRaiderMaxHp));
+        pushQuad(va, b, Vector2f(barW, 1.0f), healthBarBackColor);
+        if (fillW > 0.0f) pushQuad(va, b, Vector2f(fillW, 1.0f), healthBarFillColor);
+    }
+    if (glow.getVertexCount() > 0) window.draw(glow, BlendAdd);
+    if (va.getVertexCount() > 0) window.draw(va);
 }
 
 // R61-F2: armed, drilled (wears the drill pip), hale, fed and free (raidIdle()); never a leader or the shinobi
@@ -21305,6 +21798,7 @@ int main() {
                 hostTick(barbs, squares, stores, tris, bushshapes);   // R61-F2: field hosts march, clash and go home; before the raids and the bell
                 huntTick(barbs, squares);   // R62-F3b: the truce's joint Hollow hunt (muster, gather, march, hoard)
                 raidTick(barbs, squares, stores);   // R52-F1: raid march and fight; sets raidThreat[] for bellTick() just below
+                seaRaidTick(barbs);   // R65-F1: longship landing, raiders' walk/lift/flight; removes raiders watchTick() slew
                 caravanTick(barbs, squares, stores);   // R54-F1: caravans, swaps and the friendly timers, once per sim tick
                 campTick(barbs, squares, wd);   // R55-F1: wildfolk hunters, deer trade, trespass and tents
                 exileTick(barbs, squares, stores);     // R54-F3: walks the migrant; an arrival is only queued here...
@@ -21464,6 +21958,7 @@ int main() {
 	drawProwlers(window, prowlers);   // R48-F1: bodies under the night overlay; eyes after it
 	for (auto& p : prowlers) if (p.flashFrames > 0 && !paused) p.flashFrames--;   // R51-F1: the hit flash lasts 2 drawn frames
 	drawWyrm(window, frameCount);   // R61-F1: body under the night overlay; ember eye and hp bar after it
+	drawSeaRaid(window);   // R65-F1: longship + sea raiders, under the night overlay; helms, hp bars and hull flames after it
 
         drawStumps(window, stumps, stumpVerts, camRect);   // R45-F1a: ~12k stumps (R47-F1), only those touching the view
         drawAshStumps(window, ashVerts, camRect);   // R57-F3: burnt-out stumps, same layer as the living trees' stumps
@@ -21537,6 +22032,8 @@ int main() {
         drawHouseFires(window, worldView, houses, houseshapes, frameCount);   // R61-F1: flames on torched roofs, above the overlay
         drawBridgeFires(window, worldView, frameCount);   // R62-F2c: flames on a torched bridge deck, above the overlay
         drawWyrmOverlay(window, worldView);   // R61-F1: ember eye + hp bar
+        drawSeaRaidOverlay(window, worldView, frameCount);   // R65-F1: raider helms + hp bars, burning hull
+        for (auto& r : seaRaiders) if (r.flashFrames > 0 && !paused) r.flashFrames--;   // the hit flash lasts 2 drawn frames
         drawHoardGlint(window, worldView, frameCount);   // R62-F3b: gold glint over the Hollow (hunt out, or a fresh kill)
         if (wyrm.flashFrames > 0 && !paused) wyrm.flashFrames--;   // the hit flash lasts 2 drawn frames
         drawWatchTorches(window, worldView, frameCount);   // R51-F1: torches glow above the overlay (prowler hp bars are drawn in the call above)
