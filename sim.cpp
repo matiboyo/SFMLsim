@@ -348,6 +348,7 @@ const int32_t kChronicleBlockWonder = 0x444E4F57;   // R60-F3 "WOND": raceCount,
 // R65-F4 "VASL": raceCount, then per vassal race (its barbRace index, the stable id) {lord race, paidSeason, boundSeason,
 // resent * kChronicleResentScale, grumbled, snapped-chain lord race, snapped-chain frames left}
 const int32_t kChronicleBlockVassal = 0x4C534156;
+const int32_t kChronicleBlockYear = 0x52414559;     // R65-F3 "YEAR" (part of v6): one word, the yearSeed bits
 const int kChronicleVassalWords = 7;
 const float kChronicleResentScale = 10000.0f;       // resent stored as round(v * scale), clamped to 0..kResentSnap on load
 const int kChronicleMaxBlocks = 32;              // blocks per file; more is rejected
@@ -398,6 +399,41 @@ const float rainStreakFallPx = 4.0f;       // px fallen per frame (~240px/s)
 const float rainStreakDriftPx = 1.0f;      // px drifted left per frame, matches the slant
 const Color rainStreakColor(170, 195, 225, 64); // pale blue, ~25% alpha
 bool raining = false;
+// R65-F3 The Yearly Weather Roll, phase 1: each year is one of four types, one in four each, rolled by yearType() from
+// (yearSeed, year) alone. yearSeed is drawn once per new game and saved in the chronicle's "YEAR" block, so a mid-year
+// load gets the same year back. kYearDefs is the one table every consumer reads: wheat growth and bush regrowth (the
+// harvest), rain/snow spell lengths, the spring flood (river height) and winter hunger. Multipliers stay mild; a new
+// colony's first kYearGraceYears years never roll drought or hard winter, and the winter starvation floor still holds.
+enum yearKind { yearDrought, yearHardWinter, yearWet, yearPlenty, yearKindCount };
+struct yearDef {
+    const char* name;         // HUD banner
+    const char* newYearLine;  // New Year ticker, after "Year N begins - "
+    float harvestMult;        // wheat growth and bush regrowth speed x this
+    float rainMult;           // rain/snow spells last x this, clear spells / this
+    int floodHours;           // spring flood length in game hours from spring's first midnight (0 = low water, no flood)
+    float winterHungerMult;   // x winterHungerMult
+    Color tint;               // banner text and ticker line
+};
+const yearDef kYearDefs[yearKindCount] = {
+    {"Drought",     "drought: thin harvests, little rain, no spring flood", 0.85f, 0.75f, 0,  1.0f, Color(212, 176, 108)},  // dusty ochre
+    {"Hard winter", "a hard winter ahead: deep snow, a big spring melt",    1.0f,  1.2f,  36, 1.1f, Color(180, 200, 225)},  // winter ice
+    {"Wet year",    "a wet year: long rains, a high spring flood",          1.1f,  1.3f,  36, 1.0f, Color(130, 172, 210)},  // muted rain blue
+    {"Plenty",      "a year of plenty: rich harvests",                       1.25f, 1.0f,  24, 1.0f, Color(156, 200, 120)},  // muted green
+};
+const int kYearGraceYears = 1;   // years from the start with drought -> plenty and hard winter -> wet year
+uint32_t yearSeed = 0;           // drawn from gen at startup; chronicleRestore() puts the saved one back
+// Pure: reads nothing but yearSeed and its argument (year = game_day / yearDays)
+yearKind yearType(int year) {
+    uint32_t h = (uint32_t)year * 2654435761u ^ yearSeed;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+    yearKind k = (yearKind)(h % yearKindCount);
+    if (year < kYearGraceYears) k = k == yearDrought ? yearPlenty : k == yearHardWinter ? yearWet : k;
+    return k;
+}
+const yearDef& yearNow() { return kYearDefs[yearType(game_day / yearDays)]; }
+int rainSpellTicks() { return (int)(rainWeatherTicks * yearNow().rainMult); }
+int clearSpellTicks() { return (int)(clearWeatherTicks / yearNow().rainMult); }
+float winterHungerNow() { return winterHungerMult * yearNow().winterHungerMult; }
 // R63-F1 Winter snowfall and footprints: winter rain falls as 1px flakes (draw-only, hashed like the streaks); once snow
 // has fallen this winter, roofs and tree tips carry a 2px translucent cap and walking barbs leave faint 1px prints in a
 // fixed ring buffer (written from walkStep). After the snow stops, prints in the safe core fade twice as fast.
@@ -3871,7 +3907,10 @@ techId studyTarget(int race) {
 }
 
 int chopTicks(int race) { return knows(race, techHandAxe) ? handAxeChopTicks : treeChopTicks; }
-int wheatGrowTicks(int race) { return knows(race, techSeedSelection) ? (int)(fieldGrowTicks / seedSelectionGrowSpeed) : fieldGrowTicks; }
+int wheatGrowTicks(int race) {   // R65-F3: / the year's harvestMult
+    float base = knows(race, techSeedSelection) ? fieldGrowTicks / seedSelectionGrowSpeed : (float)fieldGrowTicks;
+    return (int)(base / yearNow().harvestMult);
+}
 
 // A wheat plot (R19-F3). rect/shape are set once the spot is chosen; growth counts up to fieldGrowTicks once sown.
 // FARM-F1: held per race in a fieldGrid (fields[race][k]); the race is the row index.
@@ -6502,7 +6541,13 @@ int clockk() {
                 printf("SEASON - %s (day %d, year %d)\n", seasonDefs[now].name, game_day + 1, game_day / yearDays + 1);
                 logEvent(seasonDefs[now].arrivalLine, seasonDefs[now].ticker);
             }
-            if (game_day % yearDays == 0 && game_day > 0) vigilYearTurn();   // R63-F5: the year edge
+            if (game_day % yearDays == 0 && game_day > 0) {   // R63-F5: the year edge
+                vigilYearTurn();
+                const yearDef& yd = yearNow();   // R65-F3: the New Year line names the year's type
+                int year = game_day / yearDays + 1;
+                printf("NEW YEAR - year %d: %s\n", year, yd.name);
+                logEvent("Year " + to_string(year) + " begins - " + yd.newYearLine, yd.tint);
+            }
         }
         if (game_time == nightEndHour && seasonOf(game_day) == seasonAutumn && dayInSeason(game_day) == daysPerSeason - 1)
             logEvent(frostLine, seasonDefs[seasonWinter].ticker);   // R51-F3: once, at dawn of autumn's last day
@@ -6515,7 +6560,7 @@ int clockk() {
 
 bool weatherTick() {
     static int wtimer = 0;
-    if (++wtimer >= (raining ? rainWeatherTicks : clearWeatherTicks)) {
+    if (++wtimer >= (raining ? rainSpellTicks() : clearSpellTicks())) {   // R65-F3: the year's rainMult
         raining = !raining;
         wtimer = 0;
         printf(raining ? "Rain starts - berries ripening\n" : "Rain stops\n");
@@ -7427,7 +7472,7 @@ void hungerTick(vector<barb>& barbs) {
     static float winterHungerCarry = 0.0f;
     int growth = 1;
     if (isWinter()) {
-        winterHungerCarry += winterHungerMult - 1.0f;
+        winterHungerCarry += winterHungerNow() - 1.0f;   // R65-F3: a hard winter bites harder
         if (winterHungerCarry >= 1.0f) { winterHungerCarry -= 1.0f; growth++; }
     } else winterHungerCarry = 0.0f;
     for (auto& b : barbs) {
@@ -8830,6 +8875,7 @@ string hudDetailText(const hudValues& v) {
     s += string("\nSeason: ") + seasonDefs[seasonOf(v.day)].name + " (day " + to_string(dayInSeason(v.day) + 1) + " of "
          + to_string(daysPerSeason) + ", year " + to_string(v.day / yearDays + 1) + ")"
          + (seasonOf(v.day) == seasonWinter ? " - hunger grows faster" : "");   // R51-F3
+    s += string("\nYear type: ") + kYearDefs[yearType(v.day / yearDays)].name;   // R65-F3
     s += "\nStockpiles (wood/stone/food):";   // RACE-F1
     for (int r = 0; r < raceCount; r++)
         s += string("\n  ") + racePlurals[r] + ": " + to_string(v.stock[r].wood) + " / " + to_string(v.stock[r].stone) + " / " + to_string(v.stock[r].food);
@@ -9762,6 +9808,8 @@ struct chronicleData {
     int wonderStage[raceCount] = {};               // raw: clamped to wonderStageCount() by chronicleRestore()
     bool haveVassal = false;                       // R65-F4: a "VASL" block of the expected size was read (absent before v6)
     int vassal[raceCount][kChronicleVassalWords] = {};   // raw words: judged by chronicleRestoreVassals(), which drops a bad entry
+    bool haveYear = false;                         // R65-F3: a "YEAR" block of the expected size was read
+    uint32_t yearSeed = 0;                         // any value is valid
 };
 
 int chronicleNameIndex(const barb& b) {   // R55-F4: -1 for Sasuke; names only ever come from barbNames or shinobiName
@@ -9876,6 +9924,11 @@ bool chronicleSaveVassal(FILE* f) {
     return ok;
 }
 
+// R65-F3: the "YEAR" block: the yearSeed, so yearType() rolls the same years after a load
+bool chronicleSaveYear(FILE* f) {
+    return chronPut(f, kChronicleBlockYear) && chronPut(f, 1) && chronPut(f, (int32_t)yearSeed);
+}
+
 // R60-F3: the "WOND" block: raceCount, then each race's standing wonder stages
 bool chronicleSaveWonder(FILE* f) {
     bool ok = chronPut(f, kChronicleBlockWonder) && chronPut(f, 1 + raceCount) && chronPut(f, raceCount);
@@ -9908,6 +9961,7 @@ bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
     ok = ok && chronicleSaveAlly(f, barbs);               // R59-F1 (v5)
     ok = ok && chronicleSaveWar(f);                       // R60-F1: one more tagged block, no version bump
     ok = ok && chronicleSaveVassal(f);                    // R65-F4 (v6)
+    ok = ok && chronicleSaveYear(f);                      // R65-F3 (v6)
     ok = ok && chronicleSaveWonder(f);                    // R60-F3: likewise
     ok = ok && chronPut(f, kChronicleEndMark);
     if (fclose(f) != 0) ok = false;
@@ -10060,6 +10114,20 @@ bool chronicleReadVassal(FILE* f, int words, chronicleData& d, const char*& why)
     return true;
 }
 
+// R65-F3: the "YEAR" block into d. Another size is skipped (this run's freshly drawn seed stays) rather than rejecting the file.
+bool chronicleReadYear(FILE* f, int words, chronicleData& d, const char*& why) {
+    int32_t v = 0;
+    if (words != 1) {
+        for (int k = 0; k < words; k++) if (!chronGet(f, v)) { why = "truncated"; return false; }
+        printf("CHRONICLE - year block size differs: a new year roll begins\n");
+        return true;
+    }
+    if (!chronGet(f, v)) { why = "truncated"; return false; }
+    d.yearSeed = (uint32_t)v;
+    d.haveYear = true;
+    return true;
+}
+
 // Reads and bounds-checks the whole file into out; nothing global is touched here. why = the rejection reason.
 bool chronicleRead(chronicleData& out, const char*& why) {
     why = nullptr;
@@ -10138,6 +10206,9 @@ bool chronicleRead(chronicleData& out, const char*& why) {
                 } else if (tag == kChronicleBlockVassal) {   // R65-F4
                     if (d.haveVassal) { why = "two vassal blocks"; break; }
                     if (!chronicleReadVassal(f, words, d, why)) break;
+                } else if (tag == kChronicleBlockYear) {   // R65-F3
+                    if (d.haveYear) { why = "two year blocks"; break; }
+                    if (!chronicleReadYear(f, words, d, why)) break;
                 } else {   // a block from a later feature: skipped word by word, so a short file still fails
                     for (int k = 0; k < words && !why; k++) if (!chronGet(f, v)) why = "truncated";
                 }
@@ -10180,6 +10251,7 @@ bool chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
     d.houseNewId.assign(d.houses.size(), -1);
     game_day = d.day;
     game_time = d.hour;
+    if (d.haveYear) yearSeed = d.yearSeed;   // R65-F3: same year types as before the load; older files keep this run's seed
     for (int r = 0; r < raceCount; r++) stock[r] = d.stocks[r];
     for (int a = 0; a < raceCount; a++)
         for (int b = 0; b < raceCount; b++) raceRelation[a][b] = a == b ? 0.0f : d.relation[a][b];   // direct: no tier lines on load
@@ -19227,8 +19299,8 @@ void stormTick(vector<tree>& trees, vector<CircleShape>& tris, vector<RectangleS
     static bool wasRaining = false;
     stormClock++;
     if (raining && !wasRaining && seasonOf(game_day) == seasonSummer) {
-        stormStrikeIn = uniform_int_distribution<int>((int)(kStormStrikeMinFrac * rainWeatherTicks),
-                                                      (int)(kStormStrikeMaxFrac * rainWeatherTicks))(gen);
+        stormStrikeIn = uniform_int_distribution<int>((int)(kStormStrikeMinFrac * rainSpellTicks()),    // R65-F3: this
+                                                      (int)(kStormStrikeMaxFrac * rainSpellTicks()))(gen);  // year's spell
         printf("STORM - summer thunderstorm, strike in %d ticks\n", stormStrikeIn);
     }
     if (!raining) stormStrikeIn = -1;
@@ -20019,7 +20091,9 @@ void drawRiver(RenderWindow& window, int frame) {
 // (not the opening spring of a new game), normal otherwise
 riverSeasonState riverWantState() {
     if (isWinter()) return riverIced;
-    if (seasonOf(game_day) == seasonSpring && dayInSeason(game_day) == 0 && game_day >= yearDays) return riverFlooded;
+    // R65-F3: the flood runs the year's floodHours from spring's first midnight (none in a drought: low water)
+    if (seasonOf(game_day) == seasonSpring && game_day >= yearDays && dayInSeason(game_day) * 24 + game_time < yearNow().floodHours)
+        return riverFlooded;
     return riverNormal;
 }
 
@@ -21475,10 +21549,11 @@ void drawPoiGlow(RenderWindow& window, const View& worldView, const FloatRect& c
 // Bare bushes ripen again after bushRegrowTicks (rainRegrowMult times faster in rain)
 void bushTick(vector<bush>& bushes, vector<CircleShape>& bushshapes) {
     if (isWinter()) return;   // R52-F2: the lean season: bare bushes wait for spring (regrow counters hold)
+    const int regrowTicks = (int)(bushRegrowTicks / yearNow().harvestMult);   // R65-F3: the year's harvest
     for (int i = 0; i < (int)bushes.size(); i++) {
         if (bushes[i].ripe) continue;
         bushes[i].regrow += raining ? rainRegrowMult : 1;
-        if (bushes[i].regrow < bushRegrowTicks) continue; // >= ripens, so overshoot can't skip it
+        if (bushes[i].regrow < regrowTicks) continue; // >= ripens, so overshoot can't skip it
         bushes[i].ripe = true;
         bushes[i].regrow = 0;
         bushshapes[i].setFillColor(bushRipeColor);
@@ -21512,13 +21587,43 @@ void leanSeasonTick(const vector<barb>& barbs, vector<bush>& bushes, vector<Circ
     refresh = larderRefreshTicks - 1;
     int eaters[raceCount] = {};
     for (auto& b : barbs) if (b.activity != actExpedition) eaters[clampRace(b.race)]++;   // away members eat rations, not the larder
-    float mealsPerDay = 24.0f * ticksPerGameHour / hungerThreshold * winterHungerMult;   // winter rate: it is the lean days we count
+    float mealsPerDay = 24.0f * ticksPerGameHour / hungerThreshold * winterHungerNow();   // winter rate (R65-F3: this year's): it is the lean days we count
     float need = leanDaysToSpring();
     for (int r = 0; r < raceCount; r++) {
         float days = eaters[r] > 0 ? stock[r].food / (eaters[r] * mealsPerDay) : 0.0f;
         larderCovered[r] = eaters[r] > 0 && days >= need;
         larderFill[r] = need > 0.0f ? clamp(days / need, 0.0f, 1.0f) : 1.0f;
     }
+}
+
+// R65-F3: the year-type banner: a small panel centred just under the HUD strip reading "Year N: <type>" in the type's
+// tint, on the same translucent backing and rim as the stock panel. Slides right of the stock panel if they would meet;
+// hidden (empty rect) if it would still touch a panel or run off the window.
+FloatRect drawYearBanner(RenderWindow& window, const Font& font, const FloatRect& stockR, const FloatRect& inspectR, const FloatRect& lensR) {
+    window.setView(window.getDefaultView());
+    Vector2f win = window.getDefaultView().getSize();
+    const yearDef& yd = yearNow();
+    Text t(font, "Year " + to_string(game_day / yearDays + 1) + ": " + yd.name, stockFontSize);
+    FloatRect tb = t.getLocalBounds();
+    Vector2f size(round(tb.size.x + 2 * stockPad.x), round(tb.size.y + 2 * stockPad.y));
+    Vector2f pos(round((win.x - size.x) / 2.0f), round(hudBarHeight + stockMargin));
+    auto hits = [&](const FloatRect& o) {
+        if (o.size.x <= 0) return false;
+        FloatRect grown(o.position - Vector2f(stockMargin, stockMargin), o.size + Vector2f(2 * stockMargin, 2 * stockMargin));
+        return FloatRect(pos, size).findIntersection(grown).has_value();
+    };
+    if (hits(stockR)) pos.x = round(stockR.position.x + stockR.size.x + stockMargin);
+    if (hits(stockR) || hits(inspectR) || hits(lensR) || pos.x + size.x > win.x - stockMargin) return FloatRect();
+    RectangleShape panel(size);
+    panel.setPosition(pos);
+    panel.setFillColor(inspectPanelColor);
+    panel.setOutlineThickness(-1.0f);   // inward, so the panel stays exactly size
+    panel.setOutlineColor(inspectBorderColor);
+    window.draw(panel);
+    t.setFillColor(yd.tint);
+    t.setPosition(Vector2f(round(pos.x + stockPad.x - tb.position.x), round(pos.y + stockPad.y - tb.position.y)));
+    window.draw(t);
+    return FloatRect(pos, size);
 }
 
 int main() {
@@ -21530,6 +21635,7 @@ int main() {
     const Time Timepertick = seconds(1.0f / 60.0f);
 
     resetKnowHow();   // fresh practice counters and no learned techs for every new game (R20-F1)
+    yearSeed = (uint32_t)gen();   // R65-F3: this game's year rolls; chronicleRestore() swaps in a saved seed
     for (auto& w : wonder) w = 0;   // R60-F3: no wonder stages until chronicleRestore() brings saved ones back
     resetTrails();    // wear, tiers and cobbles (R20-F2)
     world wd;   // R56-F4/R57-F4: owns the deer and barb pairs; constructed first, the references below keep every name
@@ -21672,6 +21778,7 @@ int main() {
     Lens lens = Lens::Off;                // UIO-F3: overlay lens, cycled with L
     FloatRect lensRect;                   // UIO-F3: last frame's lens legend; empty when off or hidden
     FloatRect stockRect;                  // RACE-F1: last frame's race stock panel; empty when hidden
+    FloatRect yearRect;                   // R65-F3: last frame's year banner; empty when hidden
     VertexArray lensVerts(PrimitiveType::Triangles);
     VertexArray trailVerts(PrimitiveType::Triangles);
     VertexArray paveVerts(PrimitiveType::Triangles);   // cobbled cells (R20-F2), rebuilt only when a cell is paved
@@ -22065,7 +22172,8 @@ int main() {
             bool overUi = overHud || tickerRect.contains(mscreen) || minimapRect(window).contains(mscreen)
                        || (inspectRect.size.x > 0 && inspectRect.contains(mscreen))
                        || (lensRect.size.x > 0 && lensRect.contains(mscreen))
-                       || (stockRect.size.x > 0 && stockRect.contains(mscreen));
+                       || (stockRect.size.x > 0 && stockRect.contains(mscreen))
+                       || (yearRect.size.x > 0 && yearRect.contains(mscreen));   // R65-F3
             if (window.hasFocus() && !panning && !overUi && mpx.x >= 0 && mpx.y >= 0 && mpx.x < (int)wsz.x && mpx.y < (int)wsz.y) {
                 Vector2f mworld = window.mapPixelToCoords(mpx, worldView);
                 hover = pickHover(mworld, tooltipPickRadius / zoom, barbs, squares, activeTrader, wolves, deers, deershape, rocks, octs, bushes, bushshapes, houses, houseshapes, fields, stores);
@@ -22118,6 +22226,7 @@ int main() {
             inspectRect = selIdx >= 0 ? drawInspectPanel(window, hudFont, barbs[selIdx], minimapRect(window)) : FloatRect();   // UIO-F2
             stockRect = drawStockPanel(window, hudFont, hv, inspectRect, minimapRect(window), tickerRect);   // RACE-F1: top-left, before the legend
             lensRect = drawLensLegend(window, hudFont, lens, inspectRect, minimapRect(window), tickerRect, stockRect);   // UIO-F3: after both, so it can dodge them
+            yearRect = drawYearBanner(window, hudFont, stockRect, inspectRect, lensRect);   // R65-F3: after the panels it dodges, before tooltips
             Vector2f mouse = window.mapPixelToCoords(Mouse::getPosition(window), window.getDefaultView());
             if (overHud) // full details hang just under the strip, beside the cursor
                 drawTooltip(window, hudFont, hudDetailText(hv),
