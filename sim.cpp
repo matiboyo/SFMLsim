@@ -890,7 +890,29 @@ const Vector2f birdWingsOut(3.0f, 2.0f);
 const Vector2f birdWingsIn(2.0f, 2.0f);
 const Color birdColor(205, 215, 230);      // pale blue-white: readable on dark green, distinct from white idle barbs
 
-const int maxWolves = 3;                   // R47-F1: was 2; the wild ring is bigger and wolfier
+const int maxWolves = 3;                   // R47-F1: was 2; R64-F3: now only the pack size before the first daily count
+// R64-F3 Spring Fawns and Prey-Sized Packs, phase 1: in spring, part of the deer that walk in to refill the herd are born
+// instead, as a fawn beside a random adult: a 3x2 paler body (half the deer's length) with a 1x2 head, two leggy legs and
+// no antler; a pale back spot shows only when zoomed in. fawnAge (ticks left) is set only by addAnimal() and carried by
+// the deer/deershape swapRemove pair; at 0 the fawn grows to a full deer in place. Once a day the wolf pack size (the cap
+// spawnWolf() checks) is set from the cached deer/cap ratio, outside every barb and wolf loop; a real increase gives one
+// "pack grows" ticker line, at most once per season. Raids on homesteads are phase 2.
+const float kFawnShare = 0.5f;             // spring: chance a deer refill is a fawn born in the herd instead of an arrival
+const int kFawnGrowTicks = 24 * ticksPerGameHour;   // one game day from fawn to deer
+const Vector2f kFawnBodySize(3.0f, 2.0f);  // logic hitbox and drawn body
+const Vector2f kFawnHeadPos(3.0f, -1.0f);  // 1x2 head column just in front of the body, 1px above it (facing right)
+const Vector2f kFawnHeadSize(1.0f, 2.0f);
+const float kFawnLegX[2] = {0.0f, 2.0f};   // back, front: alternate while walking
+const float kFawnLegPx = 2.0f;             // leggy: as long as a deer's legs on half the body
+const float kFawnLegLiftedPx = 1.0f;
+const Vector2f kFawnSpotPos(1.0f, 0.0f);   // 1px dapple on the back, middle column
+const float kFawnSpotMinZoom = 2.0f;       // spot hidden below this zoom: a 1px dot is noise at 1x
+const Color kFawnBody(214, 176, 134);      // paler than the deer's tan, still darker than the sandy rabbit
+const Color kFawnHead(202, 164, 122);
+const Color kFawnSpot(238, 228, 204);
+const int kWolfPackMin = 2;                // pack size with no deer left...
+const int kWolfPackMax = 4;                // ...and with the herd at its cap (linear between, rounded)
+const Color kWolfPackTickerTint(178, 180, 196);   // cool wolf grey on the black ticker strip
 const int wolfMinDeer = 4;                 // wolves only hunt while more deer than this remain, else they leave
 const int wolfSpawnChance = 5000;          // 1-in-N per tick while below the cap and deer are plentiful (~83s)
 const int wolfStepInterval = 2;            // ticks per 1px step (deer step every 3, so wolves gain slowly)
@@ -5157,11 +5179,13 @@ int invincibleTimer = 0;
 int fleeTimer = 0;      // ticks of flee left; only deerwander touches the flee fields (never health/invincible)
 int fleeCooldown = 0;
 deerTrek migrate = trekNone;   // R56-F1: a deer field, so swapRemove(deers, i) carries it with the deer/deershape pair
+int fawnAge = 0;        // R64-F3: ticks until a fawn grows up; > 0 = fawn. Set only by addAnimal(), carried by swapRemove
 };
 
 int nextDeerId = 0;
 
 const speciesDef& speciesOf(const deer& d) { return speciesDefs[d.species]; }
+Color animalBodyColor(const deer& d) { return d.fawnAge > 0 ? kFawnBody : speciesOf(d).body; }   // R64-F3: unflashed fill
 
 int countSpecies(const vector<deer>& deers, animalSpecies s) {
 	int n = 0;
@@ -5894,10 +5918,10 @@ void deerkilling(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares
 		Vector2f deerpos = ds.getPosition();
 		const speciesDef& sp = speciesOf(d);
 		if (d.invincible) {
-			ds.setFillColor(d.invincibleTimer > animalHitInvincibleTicks - animalHitFlashTicks ? Color::Red : sp.body);
+			ds.setFillColor(d.invincibleTimer > animalHitInvincibleTicks - animalHitFlashTicks ? Color::Red : animalBodyColor(d));
 			if (--d.invincibleTimer <= 0) {
 				d.invincible = false;
-				ds.setFillColor(sp.body);
+				ds.setFillColor(animalBodyColor(d));
 			}
 		}
 		bool removed = false;
@@ -5979,10 +6003,41 @@ void resetDens() {
 	denRollDay = -1;
 }
 
-// R63-F6: the one wolf spawn site. Refuses (false) once maxWolves wolves are out, pups included. denId >= 0 = a pup
-// resting at pos (its exit, beside the den mouth); otherwise pos is the edge point it arrives at and leaves by.
+// R64-F3: the wolf pack size (cap), set once a day by wolfPackDayTick() from the cached prey ratio. Never saved.
+int wolfPackSize = maxWolves;
+float wolfPreyRatio = 1.0f;                // cached at the daily count: deer alive / deer cap
+int wolfPackDay = -1;                      // game_day of the last count
+int wolfPackGrowSeason = -1;               // absolute season of the last "pack grows" ticker line
+
+void resetWolfPack() {
+	wolfPackSize = maxWolves;
+	wolfPreyRatio = 1.0f;
+	wolfPackDay = -1;
+}
+
+// R64-F3: called from the tick loop before wolfTick(), outside the barb and wolf loops. Counts the deer once a day,
+// caches the ratio and sets the pack size; one ticker line on a real increase, at most once per absolute season.
+void wolfPackDayTick(const world& wd) {
+	if (wolfPackDay == game_day) return;
+	bool first = wolfPackDay < 0;
+	wolfPackDay = game_day;
+	int cap = speciesDefs[speciesDeer].cap;
+	wolfPreyRatio = cap > 0 ? clamp((float)countSpecies(wd.deers, speciesDeer) / cap, 0.0f, 1.0f) : 0.0f;
+	int size = kWolfPackMin + (int)lround(wolfPreyRatio * (kWolfPackMax - kWolfPackMin));
+	if (size == wolfPackSize) return;
+	printf("WOLF PACK - %d -> %d (deer at %.0f%% of cap)\n", wolfPackSize, size, wolfPreyRatio * 100.0f);
+	bool grew = size > wolfPackSize;
+	wolfPackSize = size;
+	if (grew && !first && wolfPackGrowSeason != absSeason()) {
+		wolfPackGrowSeason = absSeason();
+		logEvent("The wolf pack grows with the herd", kWolfPackTickerTint);
+	}
+}
+
+// R63-F6: the one wolf spawn site. Refuses (false) once wolfPackSize (R64-F3) wolves are out, pups included. denId >= 0 =
+// a pup resting at pos (its exit, beside the den mouth); otherwise pos is the edge point it arrives at and leaves by.
 bool spawnWolf(vector<wolf>& wolves, Vector2f pos, int denId) {
-	if ((int)wolves.size() >= maxWolves) return false;
+	if ((int)wolves.size() >= wolfPackSize) return false;
 	wolf w;
 	w.exit = pos;
 	w.denId = denId;
@@ -6030,10 +6085,10 @@ void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs, const vector
 		dens.clear();
 	}
 	if (seasonOf(game_day) == seasonSpring && dayInSeason(game_day) == 0 && game_time == nightEndHour
-	    && denRollDay != game_day) {   // R63-F6: the spring roll; maxWolves is checked before any pup is made
+	    && denRollDay != game_day) {   // R63-F6: the spring roll; wolfPackSize (R64-F3) is checked before any pup is made
 		denRollDay = game_day;
 		Vector2f c;
-		if (!dens.empty() || (int)wolves.size() >= maxWolves) {
+		if (!dens.empty() || (int)wolves.size() >= wolfPackSize) {
 			printf("WOLF DEN - none this spring (%s)\n", dens.empty() ? "pack at its cap" : "a den stands");
 		} else if (uniform_real_distribution<float>(0.0f, 1.0f)(gen) >= kDenSpringChance) {
 			printf("WOLF DEN - none this spring (roll)\n");
@@ -6049,11 +6104,11 @@ void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs, const vector
 				if (spawnWolf(wolves, d.pos + kDenPupRest[k], d.id)) pups++;
 			const char* dir = compassName(c - villageCenter);
 			printf("WOLF DEN %d - at (%.0f, %.0f) to the %s, %d pups, wolves %d/%d\n", d.id, c.x, c.y, dir, pups,
-			       (int)wolves.size(), maxWolves);
+			       (int)wolves.size(), wolfPackSize);
 			logEvent(string("Wolves have denned on the wild rim to the ") + dir);
 		}
 	}
-	if ((int)wolves.size() < maxWolves && deerCount > wolfMinDeer
+	if ((int)wolves.size() < wolfPackSize && deerCount > wolfMinDeer
 	    && uniform_int_distribution<int>(0, wolfSpawnChance - 1)(gen) == 0) {
 		// R47-F1: in from a random side of the wild band's outer edge (where it meets the rocky rim), well clear of the
 		// core; it leaves the same way. No clear spot in wolfSpawnTries = no wolf this time.
@@ -6126,7 +6181,7 @@ void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs, const vector
 			int pups = clearDen(wolves, id);
 			const char* role = b.activity == actWatch ? "watchman" : "hunter";
 			printf("WOLF DEN %d CLEARED by %s %s (%s), %d pups gone, wolves %d/%d\n", id, role, b.name,
-			       racePlurals[clampRace(b.race)], pups, (int)wolves.size(), maxWolves);
+			       racePlurals[clampRace(b.race)], pups, (int)wolves.size(), wolfPackSize);
 			logRaceEvent(string(b.name) + " drives the wolves from their den", b.race);
 			break;
 		}
@@ -6135,32 +6190,59 @@ void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs, const vector
 		if (s.on && --s.ticks <= 0) s = denScuff{};
 }
 
-// Pushes one animal onto deers and its shape onto deershape together (same index)
-void addAnimal(world& wd, deer d) {
+// Pushes one animal onto deers and its shape onto deershape together (same index). R64-F3: fawn = a deer fawn (the only
+// place fawnAge is set): half-length paler hitbox, grown to a deer by deerspawn() when fawnAge runs out.
+void addAnimal(world& wd, deer d, bool fawn = false) {
 	vector<deer>& deers = wd.deers;
 	vector<RectangleShape>& deershape = wd.deershape;
 	const speciesDef& sp = speciesOf(d);
 	d.id = nextDeerId++;
 	d.health = sp.maxHealth;
+	d.fawnAge = fawn && d.species == speciesDeer ? kFawnGrowTicks : 0;
 	deers.push_back(d);
 	RectangleShape ds;
 	ds.setPosition(Vector2f(d.x, d.y));
-	ds.setSize(sp.bodySize);
-	ds.setFillColor(sp.body);
+	ds.setSize(d.fawnAge > 0 ? kFawnBodySize : sp.bodySize);
+	ds.setFillColor(animalBodyColor(d));
 	deershape.push_back(ds);
 }
 
-// Each species walks in from a side edge under its own cap; species with a breed rate also multiply in place
+// Each species walks in from a side edge under its own cap; species with a breed rate also multiply in place.
+// R64-F3: fawns age here (one pass, before the spawn rolls) and in spring a deer refill may be a fawn born in the herd.
 void deerspawn(world& wd) {
-	const vector<deer>& deers = wd.deers;
-	const vector<RectangleShape>& deershape = wd.deershape;
+	vector<deer>& deers = wd.deers;
+	vector<RectangleShape>& deershape = wd.deershape;
+	for (int i = 0; i < (int)deers.size(); i++) {
+		deer& f = deers[i];
+		if (f.fawnAge <= 0 || --f.fawnAge > 0) continue;
+		deershape[i].setSize(speciesOf(f).bodySize);   // grown: full deer hitbox in place, same index
+		if (!f.invincible) deershape[i].setFillColor(animalBodyColor(f));
+		printf("Fawn %d grew into a deer\n", f.id);
+	}
+	bool spring = seasonOf(game_day) == seasonSpring;
 	for (int s = 0; s < speciesCount; s++) {
 		const speciesDef& sp = speciesDefs[s];
 		int n = countSpecies(deers, (animalSpecies)s);
 		if (n >= sp.cap) continue;
 		deer d;
 		d.species = (animalSpecies)s;
-		if (uniform_int_distribution<int>(0, sp.arriveOneIn - 1)(gen) == 0) {
+		int adults = 0;
+		for (auto& a : deers) if (a.species == s && a.fawnAge <= 0) adults++;
+		bool refill = uniform_int_distribution<int>(0, sp.arriveOneIn - 1)(gen) == 0;
+		if (refill && s == speciesDeer && spring && adults >= 2
+		    && uniform_real_distribution<float>(0.0f, 1.0f)(gen) < kFawnShare) {   // R64-F3: a spring fawn beside an adult
+			int pick = uniform_int_distribution<int>(0, adults - 1)(gen);
+			int parent = -1;
+			for (int k = 0; k < (int)deers.size(); k++)
+				if (deers[k].species == s && deers[k].fawnAge <= 0 && pick-- == 0) { parent = k; break; }
+			Vector2f p = deershape[parent].getPosition();
+			float side = uniform_int_distribution<int>(0, 1)(gen) == 0 ? -rabbitBirthOffsetPx : rabbitBirthOffsetPx;
+			d.x = (int)clamp(p.x + side, 0.0f, worldSize - sp.bodySize.x);
+			d.y = (int)p.y;
+			if (!lakeClear(FloatRect(Vector2f(d.x, d.y), sp.bodySize + Vector2f(0.0f, sp.legPx)))) continue; // no fawns in the water
+			addAnimal(wd, d, true);
+			printf("Fawn born - %d deer now\n", n + 1);
+		} else if (refill) {
 			if (DeerSpawnRL(gen) == 0) {
 				d.x = (int)-deerOffMapPx;
 				d.targetx = DeerSpawnXgotoL(gen);
@@ -7827,7 +7909,7 @@ void drawHouseLights(RenderWindow& window, const View& worldView, const vector<h
 }
 
 // Game animals (deer, rabbit) from speciesDefs: legs, tail, body = hitbox, head, accent pixels. Facing and gait come from state + frame.
-void drawDeer(RenderWindow& window, const vector<deer>& deers, const vector<RectangleShape>& deershape, int frame) {
+void drawDeer(RenderWindow& window, const vector<deer>& deers, const vector<RectangleShape>& deershape, int frame, float zoom) {
     RectangleShape r;
     for (int i = 0; i < (int)deershape.size() && i < (int)deers.size(); i++) {
         const deer& d = deers[i];
@@ -7837,7 +7919,8 @@ void drawDeer(RenderWindow& window, const vector<deer>& deers, const vector<Rect
         float bw = ds.getSize().x, bh = ds.getSize().y;
         bool left = d.moving ? d.targetx < ds.getPosition().x : d.id % 2 == 1;
         Color body = ds.getFillColor();                  // keeps the red hit flash from deerkilling
-        bool flashing = body != sp.body;
+        bool fawn = d.fawnAge > 0;                       // R64-F3: own small geometry, no antler
+        bool flashing = body != animalBodyColor(d);
 
         int legPhase = ((frame + d.id * 4) / sp.legFrames) % 2;
         float rise = (sp.gait == gaitHop && d.moving && legPhase == 1) ? sp.hopPx : 0.0f; // mid-hop: sprite lifts
@@ -7845,12 +7928,13 @@ void drawDeer(RenderWindow& window, const vector<deer>& deers, const vector<Rect
         // mirror a right-facing x offset (and width) across the body
         auto at = [&](Vector2f p, float w) { return o + Vector2f(left ? bw - p.x - w : p.x, p.y); };
         r.setFillColor(sp.leg);
-        for (int k = 0; k < sp.legCount; k++) {
-            float len = sp.legPx;
-            if (sp.gait == gaitWalk && d.moving && (k % 2) == legPhase) len = sp.legLiftedPx; // diagonal pairs (0+2, 1+3) alternate
+        int legCount = fawn ? 2 : sp.legCount;
+        for (int k = 0; k < legCount; k++) {
+            float len = fawn ? kFawnLegPx : sp.legPx;
+            if (sp.gait == gaitWalk && d.moving && (k % 2) == legPhase) len = fawn ? kFawnLegLiftedPx : sp.legLiftedPx; // diagonal pairs (0+2, 1+3) alternate
             if (sp.gait == gaitHop && k == 0) len += rise;  // back leg stays on the ground pushing off; front leg tucks
             r.setSize(Vector2f(1.0f, len));
-            r.setPosition(at(Vector2f(sp.legX[k], bh), 1.0f));
+            r.setPosition(at(Vector2f(fawn ? kFawnLegX[k] : sp.legX[k], bh), 1.0f));
             window.draw(r);
         }
         r.setSize(Vector2f(1.0f, 1.0f));
@@ -7863,13 +7947,19 @@ void drawDeer(RenderWindow& window, const vector<deer>& deers, const vector<Rect
         r.setPosition(o);
         r.setFillColor(body);
         window.draw(r);
-        r.setSize(sp.headSize);
-        r.setPosition(at(sp.headPos, sp.headSize.x));
-        r.setFillColor(flashing ? body : sp.head);
+        Vector2f headSize = fawn ? kFawnHeadSize : sp.headSize;
+        r.setSize(headSize);
+        r.setPosition(at(fawn ? kFawnHeadPos : sp.headPos, headSize.x));
+        r.setFillColor(flashing ? body : (fawn ? kFawnHead : sp.head));
         window.draw(r);
         r.setSize(Vector2f(1.0f, 1.0f));
+        if (fawn && !flashing && zoom >= kFawnSpotMinZoom) {   // R64-F3: the dapple only when zoomed in
+            r.setFillColor(kFawnSpot);
+            r.setPosition(at(kFawnSpotPos, 1.0f));
+            window.draw(r);
+        }
         r.setFillColor(sp.accent);
-        for (int k = 0; k < sp.accentPixels; k++) {
+        for (int k = 0; k < (fawn ? 0 : sp.accentPixels); k++) {
             r.setPosition(at(sp.accentPos[k], 1.0f));
             window.draw(r);
         }
@@ -8170,7 +8260,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         if (near(w.shape)) return hoverHit{w.denId >= 0 ? (w.phase == wolf::Hunting ? "Wolf pup: hunting" : "Wolf pup: at the den")   // R63-F6
                                                         : (w.phase == wolf::Hunting ? "Wolf: hunting" : "Wolf: leaving"), w.shape, nullopt};
     for (int i = 0; i < (int)deershape.size() && i < (int)deers.size(); i++)
-        if (near(deershape[i])) return hoverHit{string(speciesOf(deers[i]).name) + " " + to_string(deers[i].health) + "hp", deershape[i], nullopt};
+        if (near(deershape[i])) return hoverHit{string(deers[i].fawnAge > 0 ? "Fawn" : speciesOf(deers[i]).name) + " " + to_string(deers[i].health) + "hp", deershape[i], nullopt};
     for (int i = 0; i < (int)octs.size() && i < (int)rocks.size(); i++)
         if (near(octs[i])) return hoverHit{rocks[i].dying ? "Rock: being mined" : "Rock", nullopt, rockDrawShape(octs[i])};
     for (int i = 0; i < (int)bushshapes.size() && i < (int)bushes.size(); i++)
@@ -11355,6 +11445,7 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
     salmon = salmonRun{};     // R63-F3: nor a salmon run (anglers on its banks quit through the fish path's range check)
     resetDens();              // R63-F6: nor a wolf den or its scuffs (its pups leave through wolfTick()'s den check)
     resetRebellion();         // R64-F1: nor the snap marks or a snapped chain
+    resetWolfPack();          // R64-F3: the pack is recounted on the next tick from the restored herd
     if (d.barbs.empty()) {
         for (auto& b : barbs) b.bornHour = chronicleNowHour() - founderAgeHours();   // founders arrive on the restored clock (R57-F1: grown)
         printf("CHRONICLE - no barbs saved: the %d founders stay\n", (int)barbs.size());
@@ -21107,6 +21198,7 @@ int main() {
                 herdTick(wd);   // R56-F1: season-edge trek flags, before the deer move
                 deerwander(wd, squares, barbs);
                 deerkilling(wd, barbs, squares, smoke);
+                wolfPackDayTick(wd);   // R64-F3: once a day, before the wolves: pack size from the cached prey ratio
                 wolfTick(wolves, wd, barbs, squares, tris, houseshapes);   // R63-F6: + spring den, pups, den clearing
                 prowlerTick(prowlers, barbs, squares, houses, houseshapes, fire);   // R48-F1: bites land before starveDeathTick()
                 wyrmTick(houses, houseshapes);   // R61-F1: house burns, wake, the night's torching; wyrmThreat[] for bellTick()
@@ -21267,7 +21359,7 @@ int main() {
 	drawCampfire(window, fire, frameCount);
 	drawFeastFires(window, camRect, frameCount);   // R63-F2: harvest bonfires beside the crates, under the barbs
 
-	drawDeer(window, deers, deershape, frameCount);
+	drawDeer(window, deers, deershape, frameCount, zoom);
 
 	for (auto& w : wolves)
 		drawSnapped(window, w.shape);
