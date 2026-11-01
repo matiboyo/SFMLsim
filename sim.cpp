@@ -2537,6 +2537,31 @@ const float kRunFishLaneFrac = 0.2f;            // lanes kept within this fracti
 const Color kRunFishColor(192, 200, 208, 230);     // silver, well above the river blue (62, 97, 138) and ford (88, 118, 148)
 const int kRunBankStride = 3;                      // one bank spot per this many river rows, on each bank
 const int kRunFishBonus = 1;                       // extra food per catch at a river bank spot during the run (lake: 1)
+// R64-F2 Sea Band and Surf, phase 1: carved with the river (same seed, same retries) along the map edge at one end of
+// the river, so the river mouth opens into it. Per across column the sea runs from the edge inward seaDepth[x] cells
+// (a slow wavy coast). seaBlocked(cell) is the one sea test (crossable, riverClear and so every placement check). Never
+// frozen. Surf dashes and mouth foam beads sit in one static VertexArray whose alpha alone is animated, slowly.
+const float kSeaDepthMin = 4.0f;                   // mean coast depth from the edge, in cells (32-48px)...
+const float kSeaDepthMax = 6.0f;
+const int kSeaDepthFloor = 3;                      // ...never shallower than this, never deeper than kSeaDepthCap
+const int kSeaDepthCap = 8;                        // 64px: under deerEntryDepthPx, so edge arrivals still walk in to dry land
+const float kSeaCoastAmp = 1.5f;                   // coast swell amplitude (cells) and wavelength (px)
+const float kSeaCoastLen = 520.0f;
+const float kSeaCoastWobbleAmp = 0.6f;             // small second wiggle on the coast
+const float kSeaCoastWobbleLen = 150.0f;
+const int kSeaMouthTestCells = 3;                  // mouth-gap walkers start this many cells inland of the deepest coast...
+const float kSeaMouthTestPx = 12.0f;               // ...and this far out from the river band, one on each bank
+const Color kSeaDeepA(54, 86, 124);                // desaturated blue a shade under the river (62, 97, 138)
+const Color kSeaDeepB(51, 82, 119);                // checker partner, kept close to A
+const Color kSeaShallowColor(74, 104, 136);        // sea cells touching land or the river mouth
+const Color kSeaSurfColor(206, 216, 220);          // pale grey-white surf, alpha animated up to kSeaSurfPeak
+const uint8_t kSeaSurfPeak = 64;                   // low-alpha: a faint line that comes and goes
+const int kSeaSurfPeriod = 360;                    // drawn frames per surf swell (6s at 60fps): slow
+const float kSeaSurfSweep = 0.35f;                 // phase step per column, so the swell rolls along the coast
+const int kSeaFoamBeads = 6;                       // 1px beads off the river mouth
+const Color kSeaFoamColor(226, 232, 234);
+const uint8_t kSeaFoamPeak = 110;
+const int kSeaFoamPeriod = 480;                    // slower than the surf: nothing moves faster than the surf
 
 // Far Reaches (R45-F1b): one ruin site far out from the village (placed once at startup by spawnRuins, after the
 // quarters, lakes and bushes), a ridge of ordinary mineable rocks arcing behind it, and one lean-to camp per race beside
@@ -3921,12 +3946,24 @@ uint32_t riverSeed = 0;                                       // drawn from gen 
 // R62-F2: riverWet is the live cell state (seasonal); riverBase is the carved layout (dry, water or ford only)
 // R62-F2b: bridge is a live-only state (never in riverBase), written over a spanned ford's cells by riverApplyState()
 enum class riverCell : uint8_t { dry, water, ford, ice, flood, bridge };
-// The one walkability test for a river cell: dry, ice and bridge always; a ford only for waders; water and flood never
-bool crossable(riverCell c, bool canWade) {
-    return c == riverCell::dry || c == riverCell::ice || c == riverCell::bridge || (c == riverCell::ford && canWade);
-}
 vector<riverCell> riverWet(trailGridN * trailGridN, riverCell::dry);
 vector<riverCell> riverBase(trailGridN * trailGridN, riverCell::dry);
+// R64-F2: the sea, carved by riverCarve(). Sea cells stay riverCell::dry in riverWet/riverBase (so they never ice or
+// flood); seaMask alone marks them, all 0 when no river passed (no river = no sea).
+vector<char> seaMask(trailGridN * trailGridN, 0);
+vector<int> seaDepth(trailGridN, 0);                          // per across column: sea cells in from the edge
+bool seaLow = true;                                           // sea at along 0 (else at the far end)
+VertexArray seaSurfVerts(PrimitiveType::Triangles);           // surf dashes then foam beads; built once, alpha animated
+vector<float> seaSurfPhase;                                   // one per quad in seaSurfVerts
+int seaFoamFirst = 0;                                         // quads from here on are foam beads
+bool seaBlocked(int c) { return seaMask[c] != 0; }
+// The one walkability test for a grid cell: never the sea (R64-F2); dry, ice and bridge always; a ford only for
+// waders; water and flood never
+bool crossable(int cell, bool canWade) {
+    if (seaBlocked(cell)) return false;
+    riverCell c = riverWet[cell];
+    return c == riverCell::dry || c == riverCell::ice || c == riverCell::bridge || (c == riverCell::ford && canWade);
+}
 enum riverSeasonState { riverNormal, riverIced, riverFlooded };
 riverSeasonState riverState = riverNormal;
 int riverCrackTicks = 0;                                      // R62-F2: >0 while fresh-ice cracks fade (visual only)
@@ -3983,7 +4020,7 @@ bool riverClear(const FloatRect& r, float pad) {
     int y1 = clamp((int)floor((r.position.y + r.size.y + pad - 0.001f) / trailCellSize), 0, trailGridN - 1);
     for (int y = y0; y <= y1; y++)
         for (int x = x0; x <= x1; x++)
-            if (riverWet[y * trailGridN + x] != riverCell::dry) return false;   // R62-F2: ice too (it thaws)
+            if (riverWet[y * trailGridN + x] != riverCell::dry || seaBlocked(y * trailGridN + x)) return false;   // R62-F2: ice too (it thaws); R64-F2: the sea
     return true;
 }
 
@@ -6402,8 +6439,9 @@ void trailTick() {
 // R39-F1: path tier and road tier (paved cells included) shave trailSpeedBonus[tier] ticks off the step limit
 int stepLimit(const barb& b, Vector2f pos) {
     if (riverPlaced) {   // R61-F3: waders slow (R62-F2: on ice too; R62-F2b: a bridge is walked like dry ground)
-        riverCell rc = riverWet[riverCellAt(pos)];
-        if (rc != riverCell::dry && rc != riverCell::bridge) return stepLimit(b) * kFordWadeMult;
+        int cell = riverCellAt(pos);
+        riverCell rc = riverWet[cell];
+        if (seaBlocked(cell) || (rc != riverCell::dry && rc != riverCell::bridge)) return stepLimit(b) * kFordWadeMult;   // R64-F2: wading out of the sea too
     }
     int c = trailCell(pos);
     return max(1, stepLimit(b) - (c >= 0 ? trailSpeedBonus[trailTier[c]] : 0));
@@ -6420,7 +6458,7 @@ int routeStamp = 0;
 
 // Lake water blocks a route cell (centre inside a lake rect); the bank zone stays walkable so shore spots are reachable
 bool routeCellBlocked(int c) {
-    if (riverPlaced && !crossable(riverWet[c], true)) return true;   // R61-F3: river water blocks; fords (R62-F2: and ice) stay open
+    if (riverPlaced && !crossable(c, true)) return true;   // R61-F3: river water blocks; fords (R62-F2: and ice) stay open; R64-F2: sea blocks
     Vector2f centre(((c % trailGridN) + 0.5f) * trailCellSize, ((c / trailGridN) + 0.5f) * trailCellSize);
     for (auto& l : lakes) if (l.contains(centre)) return true;
     return false;
@@ -6547,12 +6585,20 @@ Vector2f crossingAim(Vector2f pos, Vector2f goal) {
 // may still be walked into (as with lakes), and a walker already in the water is never held.
 Vector2f riverGuard(Vector2f pos, Vector2f d, Vector2f goal) {
     if (!riverPlaced) return d;
-    int cur = riverCellAt(pos);
-    if (!crossable(riverWet[cur], true) || crossable(riverWet[riverCellAt(pos + d)], true) || !crossable(riverWet[riverCellAt(goal)], true)) return d;
+    int cur = riverCellAt(pos), next = riverCellAt(pos + d);
+    if (!crossable(cur, true) || crossable(next, true) || !crossable(riverCellAt(goal), true)) return d;
+    if (seaBlocked(next)) {   // R64-F2: the coast runs across the river axis: slide along it, else step inland
+        float ac = riverAcross(d);
+        if (fabs(ac) > 0.001f) {
+            Vector2f s = riverPoint(0.0f, ac > 0.0f ? 1.0f : -1.0f);
+            if (crossable(riverCellAt(pos + s), true)) return s;
+        }
+        return riverPoint(seaLow ? 1.0f : -1.0f, 0.0f);
+    }
     float al = riverAlong(d);
     if (fabs(al) > 0.001f) {
         Vector2f s = riverPoint(al > 0.0f ? 1.0f : -1.0f, 0.0f);
-        if (crossable(riverWet[riverCellAt(pos + s)], true)) return s;
+        if (crossable(riverCellAt(pos + s), true)) return s;
     }
     int side = riverSide[cur];
     float away = side == 0 ? -1.0f : side == 1 ? 1.0f : (riverAcross(d) > 0.0f ? -1.0f : 1.0f);
@@ -6606,7 +6652,7 @@ void footprintStep(Vector2f before, const RectangleShape& sq) {
     Vector2f feet = snapPx(after) + Vector2f(((cx1 + cy1) & 1) ? max(0.0f, sz.x - 1.0f) : 0.0f, max(0.0f, sz.y - 1.0f));
     if (riverPlaced) {
         riverCell rc = riverWet[riverCellAt(feet)];
-        if (rc == riverCell::water || rc == riverCell::ford || rc == riverCell::flood) return;
+        if (rc == riverCell::water || rc == riverCell::ford || rc == riverCell::flood || seaBlocked(riverCellAt(feet))) return;   // R64-F2: nor in the sea
     }
     footprint& f = footprints[footprintHead];
     f.pos = feet;
@@ -18729,7 +18775,33 @@ bool riverCarve(uint32_t seed) {
             riverSide[c] = in ? 2 : x < riverLo[i] ? 0 : 1;
         }
     }
+    // R64-F2: the sea at one end of the river. Each across column holds seaDepth[x] sea cells in from that edge; the
+    // river's cells under it go dry (seaMask alone marks the sea), so the band ends at the coast: the mouth.
+    fill(seaMask.begin(), seaMask.end(), 0);
+    seaLow = bernoulli_distribution(0.5)(rg);
+    float seaBase = uniform_real_distribution<float>(kSeaDepthMin, kSeaDepthMax)(rg);
+    float sp1 = phase(rg), sp2 = phase(rg);
+    for (int x = 0; x < N; x++) {
+        float a = (x + 0.5f) * cell;
+        float d = seaBase + kSeaCoastAmp * sin(6.2831853f * a / kSeaCoastLen + sp1) + kSeaCoastWobbleAmp * sin(6.2831853f * a / kSeaCoastWobbleLen + sp2);
+        seaDepth[x] = clamp((int)round(d), kSeaDepthFloor, kSeaDepthCap);
+        for (int k = 0; k < seaDepth[x]; k++) {
+            int c = riverCellOf(seaLow ? k : N - 1 - k, x);
+            if (riverBase[c] == riverCell::ford) return false;   // a ford must never open into the sea
+            seaMask[c] = 1;
+            riverBase[c] = riverWet[c] = riverCell::dry;
+        }
+    }
     float reach = quarterReachAt(quarterStepMax) + kRiverQuarterGap;
+    for (int c = 0; c < N * N; c++) {   // R64-F2: the sea keeps the same distance from the campfire and quarters
+        if (!seaMask[c]) continue;
+        Vector2f p(((c % N) + 0.5f) * cell, ((c / N) + 0.5f) * cell);
+        if (hypot(p.x - villageCenter.x, p.y - villageCenter.y) < kRiverVillageMinDist) return false;
+        for (int q = 0; q < raceCount; q++) {
+            Vector2f d = p - quarterCentre(q);
+            if (hypot(d.x, d.y) < reach) return false;
+        }
+    }
     for (int i = 0; i < N; i++)
         for (int x = riverLo[i]; x <= riverHi[i]; x++) {
             Vector2f p = riverPoint((i + 0.5f) * cell, (x + 0.5f) * cell);
@@ -18752,7 +18824,7 @@ bool riverWalkTest(Vector2f from, Vector2f to) {
         Vector2f m = pathStep(p, to);
         if (m.x == 0.0f && m.y == 0.0f) return false;
         p += m;
-        if (!crossable(riverWet[riverCellAt(p)], true)) return false;
+        if (!crossable(riverCellAt(p), true)) return false;
     }
     return false;
 }
@@ -18766,7 +18838,7 @@ bool riverCheck() {
     vector<int> stack{riverCellAt(villageCenter)};
     seen[stack[0]] = 1;
     int reached = 0, open = 0;
-    for (int c = 0; c < N * N; c++) if (crossable(riverWet[c], true)) open++;
+    for (int c = 0; c < N * N; c++) if (crossable(c, true)) open++;
     while (!stack.empty()) {
         int c = stack.back();
         stack.pop_back();
@@ -18776,7 +18848,7 @@ bool riverCheck() {
         for (int k = 0; k < 4; k++) {
             if (nx[k] < 0 || ny[k] < 0 || nx[k] >= N || ny[k] >= N) continue;
             int m = ny[k] * N + nx[k];
-            if (seen[m] || !crossable(riverWet[m], true)) continue;
+            if (seen[m] || !crossable(m, true)) continue;
             seen[m] = 1;
             stack.push_back(m);
         }
@@ -18798,7 +18870,58 @@ bool riverCheck() {
             return false;
         }
     }
+    // R64-F2: the mouth gap. A walker in the corner between the coast and the river, on each bank, must reach the
+    // campfire, so nobody is trapped between the sea and the river mouth.
+    int row = seaLow ? kSeaDepthCap + kSeaMouthTestCells : N - 1 - kSeaDepthCap - kSeaMouthTestCells;
+    for (int s = 0; s < 2; s++) {
+        float across = s == 0 ? riverLo[row] * trailCellSize - kSeaMouthTestPx : (riverHi[row] + 1) * trailCellSize + kSeaMouthTestPx;
+        Vector2f start = riverPoint((row + 0.5f) * trailCellSize, clamp(across, trailCellSize, worldSize - trailCellSize));
+        if (!riverWalkTest(start, villageCenter)) {
+            printf("River check: walker from (%.0f, %.0f) in the river mouth gap never reached the campfire\n", start.x, start.y);
+            return false;
+        }
+    }
     return true;
+}
+
+// R64-F2: once, after the river (and its sea) pass the check. One 3x1 surf dash per coast column 2-3px off the waterline
+// (plus a 2x1 outer dash on about half of them, 5-6px out), skipping the mouth columns, then kSeaFoamBeads 1px beads
+// scattered 2-10px off the river mouth. Positions are fixed; drawSeaSurf() only rewrites the alpha.
+void buildSeaSurf() {
+    seaSurfVerts.clear();
+    seaSurfPhase.clear();
+    if (!riverPlaced) return;
+    const int N = trailGridN;
+    const float cell = trailCellSize;
+    // along coordinate of the 1px row `off` px out to sea from column x's waterline
+    auto lineAlong = [&](int x, float off) { return seaLow ? seaDepth[x] * cell - off : worldSize - seaDepth[x] * cell + off - 1.0f; };
+    for (int x = 0; x < N; x++) {
+        int inland = riverCellOf(seaLow ? seaDepth[x] : N - 1 - seaDepth[x], x);
+        if (riverBase[inland] != riverCell::dry) continue;   // the mouth gets foam instead
+        uint32_t h = fireHash((uint32_t)x, 0x5EA5u);
+        float ph = x * kSeaSurfSweep + (float)((h >> 4) % 100) / 100.0f;
+        pushQuad(seaSurfVerts, riverPoint(lineAlong(x, 2.0f + (h & 1)), x * cell + (float)((h >> 1) % 5)), riverPoint(1.0f, 3.0f), kSeaSurfColor);
+        seaSurfPhase.push_back(ph);
+        if ((h >> 8) % 2 != 0) continue;
+        pushQuad(seaSurfVerts, riverPoint(lineAlong(x, 5.0f + ((h >> 9) & 1)), x * cell + (float)((h >> 10) % 6)), riverPoint(1.0f, 2.0f), kSeaSurfColor);
+        seaSurfPhase.push_back(ph + 0.9f);   // the outer line crests first, so the swell reads as rolling in
+    }
+    seaFoamFirst = (int)seaSurfPhase.size();
+    int mouth = -1;   // first river row in from the sea edge whose band centre is not sea
+    for (int k = 0; k < N && mouth < 0; k++) {
+        int i = seaLow ? k : N - 1 - k;
+        if (!seaBlocked(riverCellOf(i, (riverLo[i] + riverHi[i]) / 2))) mouth = i;
+    }
+    if (mouth < 0) return;
+    float a0 = riverLo[mouth] * cell - 3.0f, span = (riverHi[mouth] - riverLo[mouth] + 1) * cell + 6.0f;
+    for (int k = 0; k < kSeaFoamBeads; k++) {
+        uint32_t h = fireHash((uint32_t)k + 1u, riverSeed);
+        float across = floor(a0 + (float)(h % (uint32_t)span));
+        int x = clamp((int)(across / cell), 0, N - 1);
+        float off = (float)(2 + (h >> 8) % 9);
+        pushQuad(seaSurfVerts, riverPoint(lineAlong(x, off), across), Vector2f(1.0f, 1.0f), kSeaFoamColor);
+        seaSurfPhase.push_back((float)((h >> 16) % 628) / 100.0f);
+    }
 }
 
 // R61-F3: once at startup, right after placeQuarters(): carve and check the river from riverSeed + offset, moving to the
@@ -18810,6 +18933,9 @@ void spawnRiver() {
         if (riverCarve(riverSeed + (uint32_t)t) && riverCheck()) {
             printf("River: seed %u offset %d, %s, fords at (%.0f, %.0f) and (%.0f, %.0f)\n", riverSeed, t,
                    riverVertical ? "north-south" : "east-west", fords[0].bank[0].x, fords[0].bank[0].y, fords[1].bank[0].x, fords[1].bank[0].y);
+            buildSeaSurf();   // R64-F2
+            printf("Sea: %s edge, %d cells, %zu surf/foam quads\n", riverVertical ? (seaLow ? "north" : "south") : (seaLow ? "west" : "east"),
+                   (int)count(seaMask.begin(), seaMask.end(), 1), seaSurfPhase.size());
             return;
         }
         riverPlaced = false;
@@ -18817,6 +18943,9 @@ void spawnRiver() {
     }
     fill(riverWet.begin(), riverWet.end(), riverCell::dry);
     fill(riverBase.begin(), riverBase.end(), riverCell::dry);    fill(riverSide.begin(), riverSide.end(), 0);
+    fill(seaMask.begin(), seaMask.end(), 0);   // R64-F2: no river, no sea
+    seaSurfVerts.clear();
+    seaSurfPhase.clear();
     printf("River: no layout passed in %d tries, none this game\n", kRiverGenTries);
 }
 
@@ -19097,7 +19226,8 @@ void buildRiverVerts() {
     auto cellPos = [&](int c) { return Vector2f((c % N) * cell, (c / N) * cell); };
     for (int pass = 0; pass < 2; pass++)   // plain banks, then ford banks over them
         for (int c = 0; c < N * N; c++)
-            if (riverBase[c] == (pass == 0 ? riverCell::water : riverCell::ford)) pushQuad(riverVerts, cellPos(c) - bank, tile + 2.0f * bank, pass == 0 ? lakeBankColor : kFordBankColor);
+            if (pass == 0 ? (riverBase[c] == riverCell::water || seaBlocked(c)) : riverBase[c] == riverCell::ford)   // R64-F2: the coast gets the lake bank
+                pushQuad(riverVerts, cellPos(c) - bank, tile + 2.0f * bank, pass == 0 ? lakeBankColor : kFordBankColor);
     for (int c = 0; c < N * N; c++) {
         if (riverWet[c] == riverCell::dry) continue;
         Vector2f p = cellPos(c);
@@ -19131,6 +19261,17 @@ void buildRiverVerts() {
             pushQuad(riverVerts, p + s + Vector2f(0.0f, 2.0f), Vector2f(3.0f, 1.0f), kFordStoneShadow);
         }
     }
+    // R64-F2: sea water after the river, so it covers the river's bank at the mouth. Cells touching land or the river
+    // are shallows; the rest a near-flat deep checker. Never iced or flooded.
+    for (int c = 0; c < N * N; c++) {
+        if (!seaBlocked(c)) continue;
+        int cx = c % N, cy = c / N;
+        bool shore = false;
+        const int nx[4] = {cx - 1, cx + 1, cx, cx}, ny[4] = {cy, cy, cy - 1, cy + 1};
+        for (int k = 0; k < 4; k++)
+            if (nx[k] >= 0 && ny[k] >= 0 && nx[k] < N && ny[k] < N && !seaBlocked(ny[k] * N + nx[k])) shore = true;
+        pushQuad(riverVerts, cellPos(c), tile, shore ? kSeaShallowColor : (cx + cy) % 2 == 0 ? kSeaDeepA : kSeaDeepB);
+    }
     printf("River: %zu vertices\n", riverVerts.getVertexCount());
 }
 
@@ -19161,13 +19302,30 @@ void drawSalmon(RenderWindow& window) {
         if (a < trailCellSize || a > len - 2.0f * trailCellSize) continue;   // off the map ends
         float across = riverCentreAt(a) + lanes[k] * kRunFishLaneFrac * bandW
                        + kRunFishWeavePx * sin(salmon.age * kRunFishWeaveRate + k * 1.7f);
+        if (seaBlocked(riverCellAt(riverPoint(a, across)))) continue;   // R64-F2: the run starts at the mouth
         pushQuad(fish, riverPoint(floor(a), floor(across)), riverPoint(2.0f, 1.0f), kRunFishColor);
     }
     if (fish.getVertexCount() > 0) window.draw(fish);
 }
 
-void drawRiver(RenderWindow& window) {
+// R64-F2: surf and foam over the sea water. Positions never change; each quad's alpha follows a slow raised cosine
+// (squared for the surf, so its crest is brief) from its own phase.
+void drawSeaSurf(RenderWindow& window, int frame) {
+    if (seaSurfPhase.empty()) return;
+    const float tSurf = 6.2831853f * (float)(frame % kSeaSurfPeriod) / kSeaSurfPeriod;
+    const float tFoam = 6.2831853f * (float)(frame % kSeaFoamPeriod) / kSeaFoamPeriod;
+    for (int q = 0; q < (int)seaSurfPhase.size(); q++) {
+        bool foam = q >= seaFoamFirst;
+        float s = 0.5f - 0.5f * cos((foam ? tFoam : tSurf) + seaSurfPhase[q]);
+        uint8_t a = foam ? (uint8_t)(kSeaFoamPeak * s) : (uint8_t)(kSeaSurfPeak * s * s);
+        for (int v = 0; v < 6; v++) seaSurfVerts[q * 6 + v].color.a = a;
+    }
+    window.draw(seaSurfVerts);
+}
+
+void drawRiver(RenderWindow& window, int frame) {
     if (riverVerts.getVertexCount() > 0) window.draw(riverVerts);
+    drawSeaSurf(window, frame);   // R64-F2
     drawSalmon(window);   // R63-F3
     if (riverState == riverIced && riverCrackTicks > 0 && riverCrackVerts.getVertexCount() > 0) {   // R62-F2: fading cracks
         uint8_t a = (uint8_t)(255.0f * riverCrackTicks / kIceCrackTicks);
@@ -19274,7 +19432,7 @@ int riverBankPush(vector<barb>& barbs, vector<RectangleShape>& squares, storehou
                 int x = cx + dx, y = cy + dy;
                 if (x < 0 || y < 0 || x >= N || y >= N) continue;
                 int m = y * N + x;
-                if (dryOnly ? riverWet[m] != riverCell::dry : !crossable(riverWet[m], true)) continue;   // dry, ford or (R62-F2b) bridge: never iced here
+                if (dryOnly ? (riverWet[m] != riverCell::dry || seaBlocked(m)) : !crossable(m, true)) continue;   // dry, ford or (R62-F2b) bridge: never iced here; R64-F2: never the sea
                 Vector2f d = Vector2f((x + 0.5f) * trailCellSize, (y + 0.5f) * trailCellSize) - pos;
                 float dSq = d.x * d.x + d.y * d.y;
                 if (best < 0 || dSq < bestDSq) { best = m; bestDSq = dSq; }
@@ -19324,7 +19482,7 @@ void riverSeasonTick(vector<barb>& barbs, vector<RectangleShape>& squares, store
     printf("RIVER - %s (day %d)\n", want == riverIced ? "frozen over" : want == riverFlooded ? "fords flooded" : "open water, fords open", game_day + 1);
     if (want == riverIced) return;
     int pushed = riverBankPush(barbs, squares, stores, sh, fg, fields, trees, tris, rocks, octs, bushes,
-                               [](int c) { return !crossable(riverWet[c], true); }, false);
+                               [](int c) { return !crossable(c, true) && !seaBlocked(c); }, false);   // R64-F2: the thaw/flood pushes out of the river only
     if (pushed > 0) {
         printf("RIVER PUSH - %d barbs moved to the bank\n", pushed);
         logEvent(string(was == riverIced ? "The thaw drives " : "The flood drives ") + to_string(pushed)
@@ -21056,7 +21214,7 @@ int main() {
         drawQuarters(window, zoom);   // R30-F1: ground marks, under lakes, houses and crates
         drawClaimDiscs(window, stores, camRect, paused);   // R62-F1: faint claim discs, under lakes and buildings
         drawLakes(window);
-        drawRiver(window);   // R61-F3: with the lakes, under the lens, rocks, buildings and barbs
+        drawRiver(window, frameCount);   // R61-F3: with the lakes, under the lens, rocks, buildings and barbs (R64-F2: + sea surf)
         drawBridges(window);   // R62-F2b: decks over the river, still under the lens, rocks, buildings and barbs
         drawLens(window, lensVerts, worldView, lens, barbs, squares, houses, houseshapes, stores);   // UIO-F3: under rocks, buildings and barbs
 
