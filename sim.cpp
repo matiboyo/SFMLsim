@@ -2834,6 +2834,28 @@ const Color kCampMeatColor(146, 62, 50);        // carried lot of meat
 const Color kCampTickerTint(206, 172, 116);     // pale ochre ticker lines
 const Color MM_CAMP_WILD_COLOR(196, 150, 86);   // found camp on the minimap
 const float MM_CAMP_WILD_PX = 3.0f;
+// R65-F2 Wildfolk Swords for Gold, phase 1: while a war is in its window, a belligerent race whose leader is alive, whose
+// campRegard is above kSellswordMinRegard and whose purse holds kSellswordCost hires one free camp hunter (one hire per
+// check), paid through transferCoin() to kCoinWildfolk, up to kSellswordsPerWar hires per war. A hired hunter
+// (campHunter::hired, employerId = the paying leader's barb id, hiredWar = the wars[] slot) fights only in that war's
+// field host: it stands by the employer's crate, joins the host on the employer's side and strikes enemy fighters down to
+// kRaidHealthFloor. releaseSellswords() is the one way out (war ended or removed, employer dead, chronicle load); it
+// clears hired, employer and war fields together and the hunter walks home. Never saved. No upkeep yet (phase 2).
+const int kCoinWildfolk = raceCount;            // transferCoin() payee: coin paid to the wildfolk leaves the races' purses
+const int kSellswordsPerWar = 2;                // hires per war, both sides together (small: playtest before raising)
+const int kSellswordCost = 5;                   // nuggets per hire, paid once (per-season upkeep deferred)
+const float kSellswordMinRegard = 0.005f;       // campRegard above this (a recent trade, no trespass since) to hire
+const int kSellswordCheckTicks = 600;           // hire scan throttle (~10s at 1x)
+const int kSellswordStepTicks = 3;              // ticks per 1px step while hired (twice the hunting pace)
+const float kSellswordStandPx = 14.0f;          // waits this far below the employer's crate centre...
+const float kSellswordStandGapPx = 5.0f;        // ...in a row, this far apart
+const float kSellswordFieldPx = 18.0f;          // its spot on the field, behind its side's column head (kHostFrontGapPx 12)
+const float kSellswordEngagePx = 60.0f;         // in the clash, takes the nearest unbeaten enemy fighter within this
+const int kSellswordDamage = 10;                // per blow (a barb's spear is 15): three blows beat a hale fighter
+const Color kSellswordBandColor(255, 246, 214); // bright gold-white sash: whiter than crownColor and the HUD gold
+const Color kSellswordOutlineColor(30, 24, 16); // 1px dark frame round a hired hunter so the band reads on grass
+const Color kSellswordCoinColor(226, 190, 96);  // 2x1 coin pip above the head
+const Color kSellswordTickerTint(236, 226, 194);// pale gold-white hire and release lines
 
 // Expeditions (R45-F2, phase 1): one party at a time of expPartySize same-race barbs walks from its crate to its race's
 // lean-to, delves at the ruin stones, and walks home with a relic (or nothing). Rations are paid from the race's food.
@@ -4289,10 +4311,17 @@ struct campHunter {
     int stepTimer = 0;
     int tripTicks = 0;
     int restTicks = 0;
+    bool hired = false;                    // R65-F2: a sellsword; hired, employerId, employerRace, hiredWar change together
+    int employerId = -1;                   // the paying leader's barb id, re-resolved on every use
+    int employerRace = -1;
+    int hiredWar = -1;                     // wars[] slot it fights for
+    int preyId = -1;                       // enemy host fighter's barb id (never an index)
+    int strikeCooldown = 0;
 };
 vector<campHunter> campHunters;
 vector<RectangleShape> campHunterShapes;
 int nextCampHunterId = 0;
+void releaseSellswords(const char* why, int war = -1, int employerId = -1);   // R65-F2: both -1 = every sellsword
 
 // Work target of a barb. targetNone with a set targetx is a tree (or a hunt/wander/build spot, which own their flags).
 enum targetKind {targetNone, targetBush, targetRock, targetLake, targetField, targetDepot}; // targetDepot: hauling a load (R29-F1)
@@ -4740,6 +4769,7 @@ struct warState {
     bool mustered[raceCount] = {};
     int raidIds[kWarRaidLog] = {};          // 0 = empty slot
     int raidCount = 0;                      // slots filled (ring once full)
+    int sellswordsHired = 0;                // R65-F2: wildfolk hires this war (kSellswordsPerWar); unsaved
 };
 warState wars[kMaxWars];
 int warCooldown[raceCount][raceCount] = {};   // R60-F1: ticks before the pair may declare again (kept symmetric)
@@ -5053,10 +5083,10 @@ raceStock& stockOfRace(int r) { return stock[clampRace(r)]; }
 raceStock& stockOf(const barb& b) { return stockOfRace(b.race); }
 // R55-F3: the one way coin moves between races. Checked before anything changes; both purses change in the same step.
 bool transferCoin(int payer, int payee, int amount) {
-    if (payer < 0 || payer >= raceCount || payee < 0 || payee >= raceCount || payer == payee) return false;
+    if (payer < 0 || payer >= raceCount || payee < 0 || payee > kCoinWildfolk || payer == payee) return false;
     if (amount <= 0 || purse[payer] < amount) return false;
     purse[payer] -= amount;
-    purse[payee] += amount;
+    if (payee < raceCount) purse[payee] += amount;   // R65-F2: kCoinWildfolk keeps no purse; the coin leaves the races
     return true;
 }
 // R55-F3: what race `buyer` pays for one lot of `kind` (0 food, 1 wood, 2 stone): short of it (below its trade keep)
@@ -8393,6 +8423,9 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
     for (int i = 0; i < (int)campHunters.size() && i < (int)campHunterShapes.size(); i++)   // R55-F1
         if (near(campHunterShapes[i])) {
             const campHunter& h = campHunters[i];
+            if (h.hired && h.employerRace >= 0 && h.employerRace < raceCount)   // R65-F2
+                return hoverHit{string("Wildfolk sellsword: fights for the ") + racePlurals[h.employerRace] + " in their war",
+                                campHunterShapes[i], nullopt};
             return hoverHit{string("Wildfolk hunter: ") + (h.carryingMeat ? "bringing deer meat home" : h.deertargeting ? "tracking a deer" : "at camp"),
                             campHunterShapes[i], nullopt};
         }
@@ -10259,6 +10292,7 @@ bool chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
     for (auto& row : relationClashCooldown) for (auto& c : row) c = 0;
     for (int r = 0; r < raceCount; r++) { allyOf[r] = -1; allyBrideId[r] = -1; marriageCooldown[r] = 0; }   // R59-F1: chronicleRestoreBarbs() re-binds
     marriage = marriageTrip{};
+    releaseSellswords("the chronicle is restored");   // R65-F2: hunters are never saved; free them before the wars go
     for (auto& w : wars) w = warState{};   // R60-F1: chronicleRestoreWar() re-declares a valid saved war
     for (auto& row : warCooldown) for (auto& c : row) c = 0;
     // R54-F4: eras before the houses, so addHouse() rebuilds a Fourth Age race's houses as townhouses. Written directly:
@@ -12938,7 +12972,8 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     endActivity(b, actHost);
     huntMemberLost(b);                            // R62-F3b: drops its hunt id; endActivity() wipes its saved flags (no restore)
     endActivity(b, actHollowHunt);
-    endActivity(b, actGather);                    // R63-F5a: explicit (releaseBarbWork() already did it); callers hold ids, so findBarbById() drops it
+    releaseSellswords("their employer is dead", -1, b.id);   // R65-F2: by barb id, before the swapRemove
+    endActivity(b, actGather);                  // R63-F5a: explicit (releaseBarbWork() already did it); callers hold ids, so findBarbById() drops it
     envoyMemberLost(b);                         // R56-F2: drops the envoy id; envoyTick() aborts unpaid next tick
     endActivity(b, actEnvoy);
     marriageMemberLost(b);                        // R59-F1: drops its procession id; marriageTick() aborts the trip next tick
@@ -15433,6 +15468,7 @@ void endWar(int w, bool treaty, const char* why) {
         logEvent("The war between the " + pair + " fades: " + why, kWarTickerTint);
     }
     warCooldown[war.lo][war.hi] = warCooldown[war.hi][war.lo] = kWarCooldownTicks;
+    releaseSellswords("the war is over", w);   // R65-F2: before the slot is wiped
     war = warState{};
 }
 // R60-F1: a war raid's outcome scores for the side that held the field
@@ -20711,11 +20747,11 @@ void spawnWildCamp(vector<tree>& trees, vector<CircleShape>& tris, vector<Rectan
 }
 
 // R55-F1: walks a hunter shape one step toward goal every kCampHunterStepTicks; true once it is there
-bool campHunterStep(campHunter& h, RectangleShape& s, Vector2f goal) {
+bool campHunterStep(campHunter& h, RectangleShape& s, Vector2f goal, int stepTicks = kCampHunterStepTicks) {   // R65-F2: pace
     Vector2f d = goal - s.getPosition();
     float dSq = d.x * d.x + d.y * d.y;
     if (dSq < 1.0f) { s.setPosition(goal); return true; }
-    if (++h.stepTimer < kCampHunterStepTicks) return false;
+    if (++h.stepTimer < stepTicks) return false;
     h.stepTimer = 0;
     s.move(pathStep(s.getPosition(), goal));   // R61-F3: fords only
     return false;
@@ -20802,6 +20838,7 @@ void campTick(vector<barb>& barbs, const vector<RectangleShape>& squares, world&
         RectangleShape& s = campHunterShapes[i];
         int ci = findCampById(h.campId);   // re-resolved every tick
         if (ci < 0) continue;              // removed at the top of the next tick
+        if (h.hired) continue;             // R65-F2: sellswordTick() owns a hired hunter
         wildCamp& camp = wildCamps[ci];
         Vector2f home = campRestPos(ci, h.tent);
         if (h.deertargeting && findDeerById(deers, h.targetDeerId) == -1) clearCampHunt(h);   // a barb or wolf got it first
@@ -20878,6 +20915,150 @@ void campTick(vector<barb>& barbs, const vector<RectangleShape>& squares, world&
     }
 }
 
+// R65-F2: the one way a sellsword is let go. war >= 0 frees the hunters hired for that wars[] slot, employerId >= 0 the
+// ones paid by that barb, both -1 every one (the chronicle load: printed, no ticker line beside "Chronicle restored").
+// hired, employerId, employerRace and hiredWar are cleared together; campTick() then walks the hunter home to rest.
+void releaseSellswords(const char* why, int war, int employerId) {
+    bool all = war < 0 && employerId < 0;
+    int freed = 0;
+    for (auto& h : campHunters) {
+        if (!h.hired) continue;
+        if (!all && !(war >= 0 && h.hiredWar == war) && !(employerId >= 0 && h.employerId == employerId)) continue;
+        printf("WILDFOLK SELLSWORD RELEASED - hunter %d (%s, %s)\n", h.id,
+               h.employerRace >= 0 && h.employerRace < raceCount ? racePlurals[h.employerRace] : "no race", why);
+        h.hired = false;
+        h.employerId = -1;
+        h.employerRace = -1;
+        h.hiredWar = -1;
+        h.preyId = -1;
+        h.strikeCooldown = 0;
+        clearCampHunt(h);
+        h.restTicks = kCampHunterRestTicks;
+        freed++;
+    }
+    if (freed > 0 && !all) logEvent(string("The wildfolk sellswords go home: ") + why, kSellswordTickerTint);
+}
+
+// R65-F2: runs right after hostTick(), before raidTick(). Every hired hunter's employer (by barb id), war slot and race
+// are re-checked each tick; one that fails is released through releaseSellswords(). A hired hunter waits in a short row
+// below its employer's crate; while its war's host is out with the employer's side it walks to the field behind its
+// column and, in the clash, strikes the nearest unbeaten enemy fighter (held by barb id, re-resolved every tick) down to
+// kRaidHealthFloor, where hostTick() lets the beaten fighter go. Raids, hunts and every other fight are not its business.
+// Hiring runs on a kSellswordCheckTicks throttle: one hunter per belligerent per check, kSellswordsPerWar per war.
+void sellswordTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (int i = 0; i < (int)campHunters.size(); i++) {   // validation first; releases only clear flags (nothing moves)
+        const campHunter& h = campHunters[i];
+        if (!h.hired) continue;
+        int e = findBarbById(barbs, h.employerId);
+        int w = h.hiredWar;
+        bool warOk = w >= 0 && w < kMaxWars && wars[w].active && h.employerRace >= 0 && h.employerRace < raceCount
+                  && (wars[w].declarer == h.employerRace || warEnemyOf(wars[w]) == h.employerRace);
+        bool employerOk = e >= 0 && barbs[e].health > 0 && barbs[e].race == h.employerRace;
+        if (!employerOk) releaseSellswords("their employer is gone", -1, h.employerId);
+        else if (!warOk) releaseSellswords("their war is over", -1, h.employerId);
+    }
+    int row[raceCount] = {};
+    for (int i = 0; i < (int)campHunters.size() && i < (int)campHunterShapes.size(); i++) {
+        campHunter& h = campHunters[i];
+        if (!h.hired || h.employerRace < 0 || h.employerRace >= raceCount) continue;
+        RectangleShape& s = campHunterShapes[i];
+        int r = h.employerRace;
+        int k = row[r]++;
+        float across = (k - (kSellswordsPerWar - 1) / 2.0f) * kSellswordStandGapPx;
+        if (h.strikeCooldown > 0) h.strikeCooldown--;
+        int side = -1;
+        if (host.active && host.war == h.hiredWar && host.phase != warHost::Home)
+            side = host.race[0] == r ? 0 : host.race[1] == r ? 1 : -1;
+        if (side < 0) {   // no field for it: wait by the employer's crate
+            h.preyId = -1;
+            Vector2f stand = quarterCentre(r) + Vector2f(across, kSellswordStandPx) - s.getSize() / 2.0f;
+            campHunterStep(h, s, snapPx(stand), kSellswordStepTicks);
+            continue;
+        }
+        Vector2f c = s.getPosition() + s.getSize() / 2.0f;
+        if (host.phase == warHost::Clash) {
+            int fi = -1;
+            float best = kSellswordEngagePx * kSellswordEngagePx;
+            for (int q = 0; q < kHostMax; q++) {
+                int j = findBarbById(barbs, host.memberIds[1 - side][q]);
+                if (j < 0 || j >= n || !inHost(barbs[j]) || barbs[j].raidBeaten || barbs[j].health <= 0) continue;
+                if (barbs[j].id == h.preyId) { fi = j; break; }
+                Vector2f d = raidCentre(squares[j]) - c;
+                float dSq = d.x * d.x + d.y * d.y;
+                if (dSq < best) { best = dSq; fi = j; }
+            }
+            if (fi >= 0) {
+                barb& f = barbs[fi];
+                if (f.id != h.preyId) {
+                    h.preyId = f.id;
+                    printf("SELLSWORD ENGAGES - hunter %d -> %s (id %d)\n", h.id, f.name, f.id);
+                }
+                Vector2f d = raidCentre(squares[fi]) - c;
+                if (d.x * d.x + d.y * d.y > kRaidStrikeRangePx * kRaidStrikeRangePx) {
+                    campHunterStep(h, s, raidCentre(squares[fi]) - s.getSize() / 2.0f, kSellswordStepTicks);
+                } else if (h.strikeCooldown == 0) {
+                    h.strikeCooldown = kRaidStrikeCooldownTicks;
+                    f.health = max(min(f.health, kRaidHealthFloor), f.health - kSellswordDamage);   // a wound, never the kill
+                    f.raidFlash = kRaidFlashFrames;
+                    hostDustAt(raidCentre(squares[fi]));
+                    printf("SELLSWORD HIT - hunter %d hits %s (id %d) for %d, %d hp left\n", h.id, f.name, f.id, kSellswordDamage, f.health);
+                    if (f.health <= kRaidHealthFloor) {
+                        f.raidBeaten = true;   // hostTick() releases it next tick
+                        f.raidPreyId = -1;
+                        h.preyId = -1;
+                        printf("SELLSWORD BEATS - %s (id %d, %s)\n", f.name, f.id, racePlurals[clampRace(f.race)]);
+                    }
+                }
+                continue;
+            }
+            h.preyId = -1;
+        }
+        Vector2f d = quarterCentre(host.race[1 - side]) - quarterCentre(host.race[side]);   // toward the enemy
+        float len = sqrt(d.x * d.x + d.y * d.y);
+        Vector2f u = len > 0.5f ? d / len : Vector2f(1.0f, 0.0f);
+        Vector2f spot = host.field - u * kSellswordFieldPx + Vector2f(-u.y, u.x) * across - s.getSize() / 2.0f;
+        campHunterStep(h, s, snapPx(spot), kSellswordStepTicks);
+    }
+
+    static int checkTimer = 0;
+    if (++checkTimer < kSellswordCheckTicks) return;
+    checkTimer = 0;
+    if (truce.active) return;   // R62-F3: no hires while the wars are paused
+    for (int w = 0; w < kMaxWars; w++) {
+        warState& war = wars[w];
+        if (!war.active || war.bypassTicks <= 0) continue;
+        const int sides[2] = {war.declarer, warEnemyOf(war)};
+        for (int r : sides) {
+            if (war.sellswordsHired >= kSellswordsPerWar) break;
+            if (r < 0 || r >= raceCount || campRegard[r] <= kSellswordMinRegard || purse[r] < kSellswordCost) continue;
+            int li = findBarbById(barbs, raceLeaderId[r]);
+            if (li < 0 || barbs[li].health <= 0 || !isLeader(barbs[li])) continue;
+            int pick = -1;
+            for (int i = 0; i < (int)campHunters.size() && pick < 0; i++) {
+                const campHunter& h = campHunters[i];
+                int ci = findCampById(h.campId);
+                if (ci >= 0 && wildCamps[ci].found && !h.hired && !h.deertargeting && !h.carryingMeat) pick = i;
+            }
+            if (pick < 0 || !transferCoin(r, kCoinWildfolk, kSellswordCost)) continue;
+            campHunter& h = campHunters[pick];
+            h.hired = true;
+            h.employerId = barbs[li].id;
+            h.employerRace = r;
+            h.hiredWar = w;
+            h.preyId = -1;
+            h.strikeCooldown = 0;
+            h.restTicks = 0;
+            h.stepTimer = 0;
+            war.sellswordsHired++;
+            string line = string(barbs[li].name) + " of the " + racePlurals[r] + " pays " + to_string(kSellswordCost)
+                        + " gold for a wildfolk sellsword (" + to_string(war.sellswordsHired) + "/" + to_string(kSellswordsPerWar) + ")";
+            printf("---SELLSWORD HIRED--- %s, hunter %d, purse %d, regard %.3f\n", line.c_str(), h.id, purse[r], campRegard[r]);
+            logEvent(line, kSellswordTickerTint);
+        }
+    }
+}
+
 // R55-F1: hide tents, hearth, smoke and pennant in one vertex array, with the buildings (under barbs and trees), culled
 // to the view. Tent (6x5): A-frame of hide, lit left face, shaded right face, dark door flap at the bottom middle and two
 // crossed pole tips above the peak. Tent 0 carries a thin ochre pennant. Hearth: two stones and a 2px ember at the camp
@@ -20927,8 +21108,14 @@ void drawCampHunters(RenderWindow& window, const FloatRect& camRect) {
     for (int i = 0; i < (int)campHunters.size() && i < (int)campHunterShapes.size(); i++) {
         Vector2f o = snapPx(campHunterShapes[i].getPosition());
         if (!camRect.contains(o)) continue;
+        bool hired = campHunters[i].hired;   // R65-F2: dark 1px frame first, so the gold-white sash reads on the grass
+        if (hired) pushQuad(va, o - Vector2f(1.0f, 1.0f), Vector2f(4.0f, 6.0f), kSellswordOutlineColor);
         pushQuad(va, o, Vector2f(2.0f, 4.0f), kCampHunterColor);
         pushQuad(va, o, Vector2f(2.0f, 1.0f), kCampHunterHairColor);
+        if (hired) {
+            pushQuad(va, o + Vector2f(0.0f, 2.0f), Vector2f(2.0f, 1.0f), kSellswordBandColor);   // sash across the chest
+            pushQuad(va, o + Vector2f(0.0f, -3.0f), Vector2f(2.0f, 1.0f), kSellswordCoinColor);  // coin pip over the head, 1px clear of the frame
+        }
         if (campHunters[i].carryingMeat) pushQuad(va, o + Vector2f(-2.0f, 1.0f), Vector2f(2.0f, 2.0f), kCampMeatColor);
     }
     if (va.getVertexCount() > 0) window.draw(va);
@@ -21903,6 +22090,7 @@ int main() {
                 watchTick(barbs, squares, prowlers);   // R51-F1: watchmen patrol and fight; slain prowlers fade, prowlerTick() removes them
                 warTick(barbs, squares, stores);   // R60-F1: declarations, muster and treaties, before the raid launcher reads the wars
                 hostTick(barbs, squares, stores, tris, bushshapes);   // R61-F2: field hosts march, clash and go home; before the raids and the bell
+                sellswordTick(barbs, squares);   // R65-F2: wildfolk hires, waiting by the crate and fighting in the war's host
                 huntTick(barbs, squares);   // R62-F3b: the truce's joint Hollow hunt (muster, gather, march, hoard)
                 raidTick(barbs, squares, stores);   // R52-F1: raid march and fight; sets raidThreat[] for bellTick() just below
                 seaRaidTick(barbs);   // R65-F1: longship landing, raiders' walk/lift/flight; removes raiders watchTick() slew
