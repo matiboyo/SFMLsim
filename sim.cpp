@@ -1078,6 +1078,26 @@ const float kVassalCoinPipGapPx = 1.0f;       // right of the crate lid by this 
 const Color kVassalCoinPipColor(240, 214, 112);
 const int kVassalCoinPipFrames = 180;         // drawn frames the payday pip shows (~3s at 60fps)
 const Color kVassalTickerTint(232, 204, 120); // pale gold: apart from the raid reds and the envoy tribute gold
+// R64-F1 The Chain Snaps, phase 1: each tribute season a vassal's resent (0..1) rises, faster when its purse is thin or
+// its lord lost a fight since the last payday. Crossing half gives one "grumbling" ticker line. At full resent
+// rebelSnapTick() (right after vassalTributeTick()) collects the vassals ready to snap, then breaks each bond: lord
+// cleared, ally refs to the old lord dropped, and war declared through declareWar() when a slot is free, all on one
+// ticker line. The crate tooltip shows a resent bar; the broken chain lingers with a fading spark. Sellswords and
+// wildfolk sales are phase 2.
+const float kResentPerSeason = 0.15f;         // base rise per tribute season
+const float kResentThinPurseAdd = 0.10f;      // extra when the vassal had no coin to spare or a purse under...
+const int kResentThinPurse = 4;               // ...this much at payday
+const float kResentLordLostAdd = 0.15f;       // extra when the lord lost a raid or a war since the last payday
+const float kResentGrumble = 0.5f;            // one "grumbling" ticker line on crossing this
+const float kResentSnap = 1.0f;               // the chain snaps at this
+const int kRebelSnapCooldownSeasons = 4;      // per race: seasons after a snap before it may snap again (if re-bound)
+const int kRebelSnapCapPerSeason = 1;         // global: snaps at most per absolute season
+const int kResentBarCells = 10;               // tooltip bar width in characters
+const int kChainSnapFrames = 600;             // drawn frames the snapped chain lingers, fading (~10s at 60fps)
+const int kChainSnapSparkFrames = 240;        // ...and the spark at the break (~4s), fading faster
+const float kChainSnapGapPx = 12.0f;          // gap torn out of the middle of the chain
+const Vector2f kChainSnapSparkSize(2.0f, 2.0f);
+const Color kChainSnapSparkColor(214, 176, 92);   // small muted gold: dimmer than the payday coin pip
 // R53-F1 Plunder, raid phase 2: on a won raid each unbeaten raider lifts one capped pack from the rival race's stock,
 // deducted at pickup, and carries it home as a 2px bundle at 0.8x walk. settleLoot() is the one way a pack ends: deposited
 // at the home crate, or dropped (abort, release away from home, death), in which case it goes back to the robbed race.
@@ -4411,10 +4431,25 @@ struct vassalage {
     int lord = -1;
     int paidSeason = -1;
     int boundSeason = -1;
+    float resent = 0.0f;                    // R64-F1: 0..kResentSnap, rises each tribute season, cleared on a snap
+    bool grumbled = false;                  // R64-F1: the halfway ticker line has been given for this resent
 };
 vassalage vassalOf[raceCount];
 int vassalCoinPip[raceCount] = {0, 0, 0};   // R58-F1: drawn frames left of the payday pip at lord race r's crate
 int absSeason() { return game_day / daysPerSeason; }
+// R64-F1: absolute season of race r's last lost fight (a raid driven off or suffered, a war lost at the treaty)
+int fightLostSeason[raceCount] = {-1, -1, -1};
+void markFightLost(int r) { if (r >= 0 && r < raceCount) fightLostSeason[r] = absSeason(); }
+int rebelSnapSeason[raceCount] = {-1, -1, -1};   // R64-F1: absolute season of race r's last snap (per-vassal cooldown)
+int rebelCapSeason = -1, rebelCapCount = 0;      // R64-F1: snaps counted in rebelCapSeason (the global cap)
+struct chainSnapFx { int lord = -1; int frames = 0; };
+chainSnapFx chainSnap[raceCount];                // R64-F1: indexed by the former vassal; drawn while frames > 0
+void resetRebellion() {                          // chronicle load: snap marks and the snapped-chain visual are never saved
+    for (auto& s : fightLostSeason) s = -1;
+    for (auto& s : rebelSnapSeason) s = -1;
+    rebelCapSeason = -1; rebelCapCount = 0;
+    for (auto& c : chainSnap) c = chainSnapFx{};   // resent lives in vassalOf with the bond and stays with it
+}
 // true if `lord` is `r` or (transitively) one of r's vassals' vassals: binding r under lord would close a cycle
 bool vassalCycle(int r, int lord) {
     for (int k = 0, x = lord; k <= raceCount && x >= 0 && x < raceCount; k++, x = vassalOf[x].lord)
@@ -8165,6 +8200,12 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
                 int hrs = (relFriendlyTicks[r][o] + ticksPerGameHour - 1) / ticksPerGameHour;   // rounded up: never reads 0h
                 h.label += string("\nFriendly with the ") + racePlurals[o] + ", fades in " + to_string(hrs) + "h without trade";
             }
+        if (vassalOf[r].lord >= 0 && vassalOf[r].lord < raceCount) {   // R64-F1: the vassal's resent as a text bar
+            float frac = clamp(vassalOf[r].resent / kResentSnap, 0.0f, 1.0f);
+            int fill = (int)round(frac * kResentBarCells);
+            h.label += string("\nVassal of the ") + racePlurals[vassalOf[r].lord] + ", resent [" + string(fill, '#')
+                     + string(kResentBarCells - fill, '-') + "] " + to_string((int)round(frac * 100.0f)) + "%";
+        }
         h.tint = lensRaceColors[r];
         h.hoveredCrate = r;   // R47-F10
         return h;
@@ -11267,6 +11308,7 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
     resetFeast();             // R63-F2: nor a harvest feast fire
     salmon = salmonRun{};     // R63-F3: nor a salmon run (anglers on its banks quit through the fish path's range check)
     resetDens();              // R63-F6: nor a wolf den or its scuffs (its pups leave through wolfTick()'s den check)
+    resetRebellion();         // R64-F1: nor the snap marks or a snapped chain
     if (d.barbs.empty()) {
         for (auto& b : barbs) b.bornHour = chronicleNowHour() - founderAgeHours();   // founders arrive on the restored clock (R57-F1: grown)
         printf("CHRONICLE - no barbs saved: the %d founders stay\n", (int)barbs.size());
@@ -14906,6 +14948,7 @@ void endWar(int w, bool treaty, const char* why) {
         int winner = loser == d ? e : d;
         int paid = 0;
         if (loser >= 0) {
+            markFightLost(loser);   // R64-F1: a lord that loses a war breeds resent in its vassals
             raceStock& ls = stockOfRace(loser);
             paid = warReparations(tributeAmountOf(loser), ls.food);
             ls.food -= paid;
@@ -14939,12 +14982,32 @@ void warRaidOutcome(int raidId, int att, int def, bool won) {
            war.wins[0], war.wins[1]);
 }
 bool tryMusterHost(vector<barb>& barbs, const vector<RectangleShape>& squares, const storehouse (&stores)[raceCount], int w);
+int warCheckTimer = 0;   // R60-F1: warTick()'s declaration / muster throttle (R64-F1: file scope so declareWar() can reset it)
+// R60-F1 / R64-F1: the one way a war starts (warTick()'s bottomed-out scan and rebelSnapTick()). d declares on e in the
+// first free slot; refused (-1) during a truce, with no free slot, for an invalid pair, or one already at war or allied.
+// Prints the declaration and calls the muster on the next tick; the ticker line is the caller's (so a rebellion's snap
+// and war share one line). Returns the war slot.
+int declareWar(int d, int e, const char* why) {
+    if (d < 0 || d >= raceCount || e < 0 || e >= raceCount || d == e || truce.active || atWar(d, e) || isAllied(d, e)) return -1;
+    int slot = -1;
+    for (int w = 0; w < kMaxWars && slot < 0; w++) if (!wars[w].active) slot = w;
+    if (slot < 0) return -1;
+    warState& war = wars[slot];
+    war = warState{};
+    war.active = true;
+    war.lo = min(d, e); war.hi = max(d, e);   // canonical
+    war.declarer = d;
+    war.bypassTicks = kWarBypassTicks;
+    printf("---WAR DECLARED--- %s declare war on the %s (%s)\n", racePlurals[d], racePlurals[e], why);
+    warCheckTimer = 1;   // the muster is called on the next tick
+    return slot;
+}
 // R60-F1: once per sim tick, before raidTick(). Cooldowns; then per active war the clocks, upkeep, muster and treaty;
 // with a free war slot, a throttled scan for a pair whose relation has bottomed out.
 // R61-F2: on the muster check a war in its window may also call out a field host (tryMusterHost()); a live host holds
 // the treaty off like a live raid (its own stall and home timeouts bound the wait).
 void warTick(vector<barb>& barbs, const vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
-    static int checkTimer = 0;
+    int& checkTimer = warCheckTimer;
     for (int a = 0; a < raceCount; a++)
         for (int b = a + 1; b < raceCount; b++)
             if (warCooldown[a][b] > 0) warCooldown[a][b] = --warCooldown[b][a];
@@ -15002,22 +15065,13 @@ void warTick(vector<barb>& barbs, const vector<RectangleShape>& squares, const s
             if (v > kWarDeclareRelation + envy || relationTierOf(v) != relCold || warCooldown[a][b] > 0) continue;
             if (atWar(a, b) || isAllied(a, b) || pairFriendly(a, b) || !stores[a].built || !stores[b].built) continue;
             if (living[a] <= 0 || living[b] <= 0) continue;
-            int slot = -1;
-            for (int w = 0; w < kMaxWars && slot < 0; w++) if (!wars[w].active) slot = w;
-            if (slot < 0) return;
             int d = living[a] == living[b] ? (uniform_int_distribution<int>(0, 1)(gen) ? a : b) : living[a] > living[b] ? a : b;
             int e = d == a ? b : a;
-            warState& war = wars[slot];
-            war = warState{};
-            war.active = true;
-            war.lo = a; war.hi = b;   // a < b: canonical
-            war.declarer = d;
-            war.bypassTicks = kWarBypassTicks;
+            if (declareWar(d, e, "relation bottomed out") < 0) return;   // no free slot
             string line = string(racePlurals[d]) + " declare war on the " + racePlurals[e];
-            printf("---WAR DECLARED--- %s (relation %.2f, envy %.2f, %d vs %d living)\n", line.c_str(), v, envy, living[d], living[e]);
+            printf("WAR DECLARED - relation %.2f, envy %.2f, %d vs %d living\n", v, envy, living[d], living[e]);
             wonderEnvy[a][b] = wonderEnvy[b][a] = 0.0f;   // R61-F4b: spent on this war, so it cannot tip another
             logEvent(line, kWarTickerTint);
-            checkTimer = 1;   // the muster is called on the next tick
             if (--openSlots <= 0) return;
         }
 }
@@ -15300,8 +15354,21 @@ void vassalTributeTick() {
         vassalage& vs = vassalOf[v];
         int lord = vs.lord;
         if (lord < 0 || lord >= raceCount || lord == v || vs.paidSeason == season) continue;
+        bool lordLost = fightLostSeason[lord] >= 0 && fightLostSeason[lord] >= vs.paidSeason;   // R64-F1: since the last payday
         vs.paidSeason = season;
         int amount = min(min(kVassalTributeMax, (int)(purse[v] * kTributeFrac)), purse[v]);
+        {   // R64-F1: resent rises once per tribute season (the paidSeason guard above)
+            bool thin = amount <= 0 || purse[v] < kResentThinPurse;
+            float before = vs.resent;
+            vs.resent = min(kResentSnap, vs.resent + kResentPerSeason + (thin ? kResentThinPurseAdd : 0.0f)
+                                         + (lordLost ? kResentLordLostAdd : 0.0f));
+            printf("VASSAL RESENT - %s %.2f -> %.2f (purse %d%s%s)\n", racePlurals[v], before, vs.resent, purse[v],
+                   thin ? ", thin" : "", lordLost ? ", lord lost a fight" : "");
+            if (!vs.grumbled && vs.resent >= kResentGrumble && vs.resent < kResentSnap) {
+                vs.grumbled = true;
+                logEvent(string(racePlurals[v]) + " grumble under the yoke of the " + racePlurals[lord], kVassalTickerTint);
+            }
+        }
         if (amount <= 0 || !transferCoin(v, lord, amount)) {
             printf("VASSAL TRIBUTE - %s purse too thin (%d), nothing paid to the %s\n", racePlurals[v], purse[v], racePlurals[lord]);
             logEvent(string(racePlurals[v]) + " have no coin to spare for their lords the " + racePlurals[lord], kVassalTickerTint);
@@ -15311,6 +15378,55 @@ void vassalTributeTick() {
         string line = string(racePlurals[v]) + " pay " + to_string(amount) + "c tribute to their lords the " + racePlurals[lord];
         printf("---VASSAL TRIBUTE--- %s (purses %d / %d), season %d\n", line.c_str(), purse[v], purse[lord], season);
         logEvent(line, kVassalTickerTint);
+    }
+}
+
+// R64-F1: per-vassal cooldown and global season cap, checked here and nowhere else (only rebelSnapTick() calls it)
+bool rebelSnapAllowed(int v, int season, int snapsSoFar) {
+    int used = rebelCapSeason == season ? rebelCapCount : 0;
+    if (used + snapsSoFar >= kRebelSnapCapPerSeason) return false;
+    return rebelSnapSeason[v] < 0 || season - rebelSnapSeason[v] >= kRebelSnapCooldownSeasons;
+}
+// R64-F1: right after vassalTributeTick() in leanSeasonTick(). First collects every vassal at full resent that may snap
+// (alive, not bound this season, cooldown and cap allow), then breaks each: lord cleared, boundSeason set, ally refs to
+// the old lord dropped (an alliance with it, and its muster in a war of the old lord's), war declared on the old lord
+// through declareWar() when it can be. Snap and war go on one ticker line.
+void rebelSnapTick(const vector<barb>& barbs) {
+    int season = absSeason();
+    int ready[raceCount], n = 0;
+    bool anyLiving = false;
+    int living[raceCount] = {};
+    for (int v = 0; v < raceCount; v++) {
+        const vassalage& vs = vassalOf[v];
+        if (vs.lord < 0 || vs.lord >= raceCount || vs.lord == v || vs.resent < kResentSnap || vs.boundSeason == season) continue;
+        if (!anyLiving) { for (auto& b : barbs) if (b.health > 0) living[clampRace(b.race)]++; anyLiving = true; }
+        if (living[v] <= 0 || living[vs.lord] <= 0) continue;   // vassalWatchTick() clears a bond to a race that is gone
+        if (!rebelSnapAllowed(v, season, n)) continue;
+        ready[n++] = v;
+    }
+    for (int k = 0; k < n; k++) {   // mutate only after the scan
+        int v = ready[k];
+        vassalage& vs = vassalOf[v];
+        int lord = vs.lord;
+        vs.lord = -1;
+        vs.boundSeason = season;
+        vs.resent = 0.0f;
+        vs.grumbled = false;
+        rebelSnapSeason[v] = season;
+        if (rebelCapSeason != season) { rebelCapSeason = season; rebelCapCount = 0; }
+        rebelCapCount++;
+        if (isAllied(v, lord)) breakAlliance(v, "the vassals rise against their lords");
+        for (auto& w : wars)
+            if (w.active && w.declarer == lord && w.mustered[v]) {
+                w.mustered[v] = false;
+                printf("WAR MUSTER - the %s stand down (rebellion)\n", racePlurals[v]);
+            }
+        chainSnap[v] = chainSnapFx{lord, kChainSnapFrames};
+        bool war = declareWar(v, lord, "rebellion") >= 0;
+        string line = string(racePlurals[v]) + " snap their chains and throw off the " + racePlurals[lord]
+                      + (war ? ": they declare war!" : "");
+        printf("---REBELLION--- %s (season %d%s)\n", line.c_str(), season, war ? "" : ", no war: truce or no free slot");
+        logEvent(line, war ? kWarTickerTint : kVassalTickerTint);
     }
 }
 
@@ -15333,6 +15449,36 @@ void drawVassalChains(RenderWindow& window, bool paused) {
             pushQuad(va, Vector2f(floor(p.x), floor(p.y)), Vector2f(kVassalChainLinkPx, kVassalChainLinkPx),
                  k % 2 == 0 ? kVassalChainColor : kVassalChainDimColor);
         }
+    }
+    for (int v = 0; v < raceCount; v++) {   // R64-F1: a snapped chain: the same links with the middle torn out, fading
+        chainSnapFx& fx = chainSnap[v];
+        if (fx.frames <= 0) continue;
+        int lord = fx.lord;
+        if (lord >= 0 && lord < raceCount && lord != v && vassalOf[v].lord != lord) {   // re-bound: the live chain shows
+            Vector2f a = quarterCentre(v), b = quarterCentre(lord), d = b - a;
+            float len = sqrt(d.x * d.x + d.y * d.y);
+            if (len > 2.0f * kVassalChainInsetPx + kChainSnapGapPx) {
+                Vector2f u = d / len;
+                float fade = (float)fx.frames / (float)kChainSnapFrames;
+                auto faded = [fade](Color c) { c.a = (uint8_t)(c.a * fade); return c; };
+                float mid = len / 2.0f;
+                int k = 0;
+                for (float t = kVassalChainInsetPx; t <= len - kVassalChainInsetPx; t += kVassalChainStepPx, k++) {
+                    if (fabs(t - mid) < kChainSnapGapPx / 2.0f) continue;
+                    Vector2f p = a + u * t - Vector2f(kVassalChainLinkPx, kVassalChainLinkPx) / 2.0f;
+                    pushQuad(va, Vector2f(floor(p.x), floor(p.y)), Vector2f(kVassalChainLinkPx, kVassalChainLinkPx),
+                             faded(k % 2 == 0 ? kVassalChainColor : kVassalChainDimColor));
+                }
+                int spark = fx.frames - (kChainSnapFrames - kChainSnapSparkFrames);
+                if (spark > 0) {
+                    Color c = kChainSnapSparkColor;
+                    c.a = (uint8_t)(200.0f * spark / kChainSnapSparkFrames);
+                    Vector2f p = a + u * mid - kChainSnapSparkSize / 2.0f;
+                    pushQuad(va, Vector2f(floor(p.x), floor(p.y)), kChainSnapSparkSize, c);
+                }
+            }
+        }
+        if (!paused) fx.frames--;
     }
     for (int r = 0; r < raceCount; r++) {
         if (vassalCoinPip[r] <= 0) continue;
@@ -15576,6 +15722,7 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
         printf("---RAID %s--- %s after %d fight ticks\n", won ? "WON" : "LOST", line.c_str(), raid.fightTicks);
         logEvent(line, kRaidTickerTint);
         warRaidOutcome(raid.id, att, def, won);   // R60-F1: a logged war raid scores for its side
+        markFightLost(won ? def : att);           // R64-F1: the side that lost the field
         if (won) {   // R56-F3: the side that held the field; beaten fighters earn nothing
             for (int k = 0; k < kRaidPartySize; k++)
                 if (ri[k] >= 0 && !barbs[ri[k]].raidBeaten) addRenown(barbs, ri[k], kRenownRaidWin, deedRaid);
@@ -20519,6 +20666,7 @@ void leanSeasonTick(const vector<barb>& barbs, vector<bush>& bushes, vector<Circ
     }
     wasWinter = winter;
     vassalTributeTick();   // R58-F1: once per absolute season per vassal (paidSeason guards it)
+    rebelSnapTick(barbs);  // R64-F1: deferred, after the vassal loop: snaps the chains at full resent
 
     static int refresh = 0;
     if (refresh > 0) { refresh--; return; }
