@@ -328,8 +328,9 @@ const char* const kChroniclePath = "chronicle.sav";
 const char* const kChronicleTmpPath = "chronicle.sav.tmp";
 const int32_t kChronicleMagic = 0x4C524843;         // "CHRL" little-endian
 const int32_t kChronicleEndMark = 0x444E4543;       // "CEND": trailer, so a truncated file is rejected
-const int32_t kChronicleVersion = 5;                // R59-F1: v5 adds the "ALLY" block (alliances and their brides)
-const int32_t kChronicleVersionDynasty = 4;         // R58-F2: v4 widens each BARB entry with parents and dynasty; still loads
+const int32_t kChronicleVersion = 6;                // R65-F4: v6 adds the "VASL" block; the one v6 bump other new fields share
+const int32_t kChronicleVersionAlly = 5;            // R59-F1: v5 adds the "ALLY" block (alliances and their brides); still loads, no vassals
+const int32_t kChronicleVersionDynasty = 4;        // R58-F2: v4 widens each BARB entry with parents and dynasty; still loads
 const int32_t kChronicleVersionBlocks = 3;          // R55-F4: v3 adds tagged blocks (named barbs first) after the houses; still loads
 const int32_t kChronicleVersionEras = 2;            // R54-F4: v2 adds the per-race era array after the relations; still loads
 const int32_t kChronicleVersionNoEras = 1;          // v1 files (no eras) still load, with every race back at Camp
@@ -344,7 +345,12 @@ const int32_t kChronicleBlockAlly = 0x594C4C41;     // R59-F1 "ALLY": raceCount,
 const int32_t kChronicleBlockWar = 0x20524157;      // R60-F1 "WAR ": kMaxWars, then per war kChronicleWarWords words
 const int kChronicleWarWords = 8;                   // active, declarer, enemy, bypass ticks, ticks, wins x2, mustered bits
 const int32_t kChronicleBlockWonder = 0x444E4F57;   // R60-F3 "WOND": raceCount, then each race's wonder stage (no version bump)
-const int kChronicleMaxBlocks = 32;               // blocks per file; more is rejected
+// R65-F4 "VASL": raceCount, then per vassal race (its barbRace index, the stable id) {lord race, paidSeason, boundSeason,
+// resent * kChronicleResentScale, grumbled, snapped-chain lord race, snapped-chain frames left}
+const int32_t kChronicleBlockVassal = 0x4C534156;
+const int kChronicleVassalWords = 7;
+const float kChronicleResentScale = 10000.0f;       // resent stored as round(v * scale), clamped to 0..kResentSnap on load
+const int kChronicleMaxBlocks = 32;              // blocks per file; more is rejected
 const int kChronicleMaxBlockWords = 1 << 20;        // int32 words in one block; more is rejected
 const int kChronicleMaxBarbs = 2000;                // a load with more barbs than this is rejected; a save writes at most this many
 const int kChronicleBarbWordsV3 = 8;                // v3, per barb: name, race, birthRace, trait, leader, hunger, age, home
@@ -4503,7 +4509,7 @@ int rebelSnapSeason[raceCount] = {-1, -1, -1};   // R64-F1: absolute season of r
 int rebelCapSeason = -1, rebelCapCount = 0;      // R64-F1: snaps counted in rebelCapSeason (the global cap)
 struct chainSnapFx { int lord = -1; int frames = 0; };
 chainSnapFx chainSnap[raceCount];                // R64-F1: indexed by the former vassal; drawn while frames > 0
-void resetRebellion() {                          // chronicle load: snap marks and the snapped-chain visual are never saved
+void resetRebellion() {                          // chronicle load: snap marks are never saved; R65-F4 restores the chain after
     for (auto& s : fightLostSeason) s = -1;
     for (auto& s : rebelSnapSeason) s = -1;
     rebelCapSeason = -1; rebelCapCount = 0;
@@ -9665,6 +9671,8 @@ struct chronicleData {
     int war[kMaxWars][kChronicleWarWords] = {};    // raw words: checked by chronicleRestoreWar(), which ends a bad war
     bool haveWonder = false;                       // R60-F3: a "WOND" block of the expected size was read
     int wonderStage[raceCount] = {};               // raw: clamped to wonderStageCount() by chronicleRestore()
+    bool haveVassal = false;                       // R65-F4: a "VASL" block of the expected size was read (absent before v6)
+    int vassal[raceCount][kChronicleVassalWords] = {};   // raw words: judged by chronicleRestoreVassals(), which drops a bad entry
 };
 
 int chronicleNameIndex(const barb& b) {   // R55-F4: -1 for Sasuke; names only ever come from barbNames or shinobiName
@@ -9763,6 +9771,22 @@ bool chronicleSaveWar(FILE* f) {
     return ok;
 }
 
+// R65-F4: the "VASL" block. Races are written by barbRace index (stable across runs); an out-of-range lord is written
+// as -1 so the file never carries a link the loader would drop. The snapped-chain pip goes with its former vassal.
+bool chronicleSaveVassal(FILE* f) {
+    bool ok = chronPut(f, kChronicleBlockVassal) && chronPut(f, 1 + raceCount * kChronicleVassalWords) && chronPut(f, raceCount);
+    for (int r = 0; ok && r < raceCount; r++) {
+        const vassalage& v = vassalOf[r];
+        bool bound = v.lord >= 0 && v.lord < raceCount && v.lord != r;
+        const chainSnapFx& fx = chainSnap[r];
+        bool snap = fx.frames > 0 && fx.lord >= 0 && fx.lord < raceCount && fx.lord != r;
+        ok = chronPut(f, bound ? v.lord : -1) && chronPut(f, v.paidSeason) && chronPut(f, v.boundSeason)
+          && chronPut(f, (int32_t)lround(clamp(v.resent, 0.0f, kResentSnap) * kChronicleResentScale)) && chronPut(f, v.grumbled ? 1 : 0)
+          && chronPut(f, snap ? fx.lord : -1) && chronPut(f, snap ? min(fx.frames, kChainSnapFrames) : 0);
+    }
+    return ok;
+}
+
 // R60-F3: the "WOND" block: raceCount, then each race's standing wonder stages
 bool chronicleSaveWonder(FILE* f) {
     bool ok = chronPut(f, kChronicleBlockWonder) && chronPut(f, 1 + raceCount) && chronPut(f, raceCount);
@@ -9794,6 +9818,7 @@ bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
     ok = ok && chronicleSavePurse(f);                     // R55-F3: same v3 format, one more block
     ok = ok && chronicleSaveAlly(f, barbs);               // R59-F1 (v5)
     ok = ok && chronicleSaveWar(f);                       // R60-F1: one more tagged block, no version bump
+    ok = ok && chronicleSaveVassal(f);                    // R65-F4 (v6)
     ok = ok && chronicleSaveWonder(f);                    // R60-F3: likewise
     ok = ok && chronPut(f, kChronicleEndMark);
     if (fclose(f) != 0) ok = false;
@@ -9926,6 +9951,26 @@ bool chronicleReadWonder(FILE* f, int words, chronicleData& d, const char*& why)
     return true;
 }
 
+// R65-F4: the "VASL" block into d, raw. A block of another size or race count is skipped (no bond comes back) rather
+// than rejecting the file; chronicleRestoreVassals() bounds-checks every entry and drops a bad one.
+bool chronicleReadVassal(FILE* f, int words, chronicleData& d, const char*& why) {
+    int32_t v = 0;
+    if (words != 1 + raceCount * kChronicleVassalWords) {
+        for (int k = 0; k < words; k++) if (!chronGet(f, v)) { why = "truncated"; return false; }
+        printf("CHRONICLE - vassal block size differs: no vassal restored\n");
+        return true;
+    }
+    int32_t races = 0;
+    if (!chronGet(f, races)) { why = "truncated"; return false; }
+    for (int r = 0; r < raceCount; r++)
+        for (int k = 0; k < kChronicleVassalWords; k++) {
+            if (!chronGet(f, v)) { why = "truncated"; return false; }
+            d.vassal[r][k] = v;
+        }
+    d.haveVassal = races == raceCount;
+    return true;
+}
+
 // Reads and bounds-checks the whole file into out; nothing global is touched here. why = the rejection reason.
 bool chronicleRead(chronicleData& out, const char*& why) {
     why = nullptr;
@@ -9938,7 +9983,7 @@ bool chronicleRead(chronicleData& out, const char*& why) {
     const int offMax = (int)worldSize;
     do {
         if (!chronGet(f, v) || v != kChronicleMagic) { why = "not a chronicle file"; break; }
-        if (!chronGet(f, v) || (v != kChronicleVersion && v != kChronicleVersionDynasty && v != kChronicleVersionBlocks
+        if (!chronGet(f, v) || (v != kChronicleVersion && v != kChronicleVersionAlly && v != kChronicleVersionDynasty&& v != kChronicleVersionBlocks
                                 && v != kChronicleVersionEras && v != kChronicleVersionNoEras)) {
             why = "unknown version"; break;
         }
@@ -10001,6 +10046,9 @@ bool chronicleRead(chronicleData& out, const char*& why) {
                 } else if (tag == kChronicleBlockWonder) {   // R60-F3
                     if (d.haveWonder) { why = "two wonder blocks"; break; }
                     if (!chronicleReadWonder(f, words, d, why)) break;
+                } else if (tag == kChronicleBlockVassal) {   // R65-F4
+                    if (d.haveVassal) { why = "two vassal blocks"; break; }
+                    if (!chronicleReadVassal(f, words, d, why)) break;
                 } else {   // a block from a later feature: skipped word by word, so a short file still fails
                     for (int k = 0; k < words && !why; k++) if (!chronGet(f, v)) why = "truncated";
                 }
@@ -11544,6 +11592,55 @@ void chronicleRestoreWar(const chronicleData& d, const vector<barb>& barbs) {
         for (int r = 0; r < raceCount; r++) war.mustered[r] = r != dec && r != en && (x[7] & (1 << r)) != 0;
         printf("CHRONICLE - %s still at war with the %s (%d ticks of waiver left)\n", racePlurals[dec], racePlurals[en], war.bypassTicks);
     }
+}
+
+// R65-F4: last restore step, after chronicleRestoreBarbs() (returners back, resetRebellion() already run) and the war.
+// Each saved bond comes back only if both race ids resolve (in range, distinct, living barbs) and it closes no cycle;
+// anything else is dropped quietly (printf only). Resent is clamped to 0..kResentSnap, seasons to -1..now. A snapped
+// chain whose lord resolves gets its fading pip back through the live chainSnap[] (drawn by drawVassalChains()).
+// A v5-or-older file has no block: every race stays free. No ticker line of its own: the bond count is added to the
+// one "Chronicle restored" line.
+void chronicleRestoreVassals(const chronicleData& d, const vector<barb>& barbs) {
+    for (auto& v : vassalOf) v = vassalage{};
+    for (auto& p : vassalCoinPip) p = 0;
+    if (!d.haveVassal) return;
+    int living[raceCount] = {};
+    for (auto& b : barbs) if (b.health > 0) living[clampRace(b.race)]++;
+    auto resolves = [&](int r) { return r >= 0 && r < raceCount && living[r] > 0; };
+    const int now = absSeason();
+    int bonds = 0, dropped = 0, sparks = 0;
+    for (int r = 0; r < raceCount; r++) {
+        const int* x = d.vassal[r];
+        int lord = x[0];
+        if (lord >= 0) {
+            if (!resolves(r) || !resolves(lord) || lord == r || vassalCycle(r, lord)) {
+                printf("CHRONICLE - saved vassal bond %d -> %d does not resolve: dropped\n", r, lord);
+                dropped++;
+            } else {
+                vassalage& v = vassalOf[r];
+                v.lord = lord;
+                v.paidSeason = clamp(x[1], -1, now);
+                v.boundSeason = clamp(x[2], -1, now);
+                v.resent = clamp(x[3] / kChronicleResentScale, 0.0f, kResentSnap);
+                v.grumbled = x[4] != 0 && v.resent >= kResentGrumble;
+                bonds++;
+                printf("CHRONICLE - %s still serve the %s (resent %.2f)\n", racePlurals[r], racePlurals[lord], v.resent);
+            }
+        }
+        int snapLord = x[5], frames = x[6];
+        if (snapLord >= 0 && frames > 0 && resolves(r) && resolves(snapLord) && snapLord != r) {
+            chainSnap[r].lord = snapLord;
+            chainSnap[r].frames = min(frames, kChainSnapFrames);
+            sparks++;
+        }
+    }
+    printf("CHRONICLE - %d vassal bonds restored (%d dropped), %d snapped chains\n", bonds, dropped, sparks);
+    if (bonds == 0) return;
+    for (auto it = events.rbegin(); it != events.rend(); ++it)   // the one restore line: amended, never a second line
+        if (it->tint == kChronicleRestoreTint && it->text.rfind("Chronicle restored", 0) == 0) {
+            it->text += ", " + to_string(bonds) + (bonds == 1 ? " vassal bond" : " vassal bonds");
+            break;
+        }
 }
 
 // R25-F2: Sasuke's blink. Puffs live in their own vector, aged per drawn frame and removed in reverse.
@@ -21047,6 +21144,7 @@ int main() {
         if (chronicleRestore(barbs, houses, houseshapes, fields, trees, rocks, bushshapes, chron)) {
             chronicleRestoreBarbs(chron, barbs, squares, birthRings);   // R55-F4: after the houses, so home ids resolve
             chronicleRestoreWar(chron, barbs);   // R60-F1: after the alliances and returners, so the checks see them
+            chronicleRestoreVassals(chron, barbs);   // R65-F4: last, once the barbs exist, so both race ids resolve
         }
     }
 
