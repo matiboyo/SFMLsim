@@ -3116,6 +3116,32 @@ const int restYieldBonus = 1;                 // rested plot: extra food per she
 const Color fieldRestedColor(64, 136, 46);    // rested sprouts/stalks: deep green, hue-distinct from the brown soil
 const Color fieldTiredColor(184, 190, 132);   // same-crop sprouts/stalks: pale straw, light against the soil
 const int fieldBobFrames = 30;                // 1px up/down every ~0.5s
+// R67-F1b Crows and Scarecrows: while a plot is ripe its own counter (plot::crowTicks) rolls crowSpawnChance every
+// crowSpawnEvery ticks to send one crow in (at most crowMax alive, all in one vector<crow>). A crow that pecks for
+// crowPeckTicks takes one unit (plot::crowLoss, never past crowLossMax) and flies off; the reaper loses that much food
+// from the harvest. Once a race has lost scarecrowAfterLoss to crows it raises one scarecrow (jobScarecrow) in the
+// plot last pecked; any crow within scarecrowScareRadius of a standing scarecrow turns and flies off.
+const int crowMax = 3;                        // crows alive at once, map-wide
+const int crowSpawnEvery = 600;               // ripe ticks between spawn rolls (~10s at 1x)
+const float crowSpawnChance = 0.3f;
+const float crowSpawnDist = 70.0f;            // crows fly in from this far off the plot
+const float crowLeaveDist = 90.0f;            // and fly this far away before vanishing
+const float crowSpeed = 0.6f;                 // px per tick
+const int crowPeckTicks = 300;                // ~5s on the plot per stolen unit
+const int crowLossMax = 1;                    // hard cap: food crows can take from one harvest
+static_assert(crowLossMax < fieldFoodYield, "a raided harvest must still net food");
+const int crowPeckFrames = 12;                // pecking dip: 1px down every other ~0.2s
+const int crowFlapFrames = 8;                 // flying bob: 1px up/down every ~0.13s
+const Vector2f crowSize(2.0f, 1.0f);
+const Color crowColor(116, 100, 88);          // warm grey-brown: darker and browner than wolves, far from the pale birds
+const int scarecrowAfterLoss = 1;             // crow losses before a race raises its scarecrow
+const int scarecrowWoodCost = 2;
+const int scarecrowBuildTicks = 240;
+const float scarecrowScareRadius = 26.0f;     // crow position -> scarecrow centre: turns back inside this
+const Vector2f scarecrowOffset(3.0f, 2.0f);   // 3x4 cross top-left relative to the soil: centred on the 8x8 plot
+const Color scarecrowStickColor(62, 46, 30);  // dark weathered wood, reads on gold, straw and green rows
+const float scarecrowRagShade = 0.85f;        // rag = the race's lens colour, a touch muted
+const int scarecrowSwayFrames = 40;           // rag shifts 1px left/right every ~0.67s
 const Color barbHarvestColor(235, 205, 85);   // harvest stripe: gold, clear of mine orange and the other task colours
 const Color fieldBarColor(200, 165, 70);      // muted gold harvest progress bar
 const int bushFoodYield = 1;                  // food per picked bush (shared harvest path)
@@ -3234,8 +3260,8 @@ static_assert(weaponTierBonus[0] == 0, "an untiered weapon hits for its base dam
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
 // jobPave (R20-F2) is run by paveTick(): movingbspot while walking, building/timer while laying the cobbles.
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, jobHerbHut, jobLoreHall, jobWonder, jobBridge, jobJetty, jobFold, buildJobCount};   // R66-F2: jobJetty; R66-F3: jobFold
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks, herbHutBuildTicks, loreHallBuildTicks, wonderBuildTicks, kBridgeBuildTicks, kJettyBuildTicks, kFoldBuildTicks};
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, jobHerbHut, jobLoreHall, jobWonder, jobBridge, jobJetty, jobFold, jobScarecrow, buildJobCount};   // R66-F2: jobJetty; R66-F3: jobFold; R67-F1b: jobScarecrow
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks, herbHutBuildTicks, loreHallBuildTicks, wonderBuildTicks, kBridgeBuildTicks, kJettyBuildTicks, kFoldBuildTicks, scarecrowBuildTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesSheep, speciesCount};   // R66-F3: speciesSheep (fold flocks only, cap 0)
@@ -4173,6 +4199,8 @@ struct plot {
     int stallMask = 0;      // R37-F1: stall gates already logged for this plot (bit per gate), so each prints once
     cropKind crop = cropWheat;     // R67-F1a: crop growing now (set by replantField)
     cropKind lastCrop = cropWheat; // R67-F1a: crop of the previous sowing; != crop means the plot is rested
+    int crowTicks = 0;             // R67-F1b: ticks ripe since the last sowing (crow spawn rolls); reset by replantField
+    int crowLoss = 0;              // R67-F1b: units crows took this ripening, 0..crowLossMax; reset by replantField
 };
 using fieldGrid = plot[raceCount][fieldsPerRace];
 
@@ -4203,9 +4231,32 @@ void replantField(plot (&row)[fieldsPerRace], int k, int race) {   // R55-F2: ra
     row[k].lastCrop = row[k].crop;   // R67-F1a: rotate (or not) for the next sowing
     if (uniform_real_distribution<float>(0.0f, 1.0f)(gen) < rotateChance)
         row[k].crop = (cropKind)((row[k].crop + 1) % cropKindCount);
+    row[k].crowTicks = 0;   // R67-F1b
+    row[k].crowLoss = 0;
 }
 
 Vector2f fieldWorkSpot(const plot& fp) { return fp.rect.position + fieldStandOffset; }
+
+// R67-F1b: a crow is one 2x1 pixel pair. plotK >= 0: flying to / pecking that plot of fields[race] (a fixed grid slot,
+// never a vector index), at `target` on its soil; plotK < 0: flying off to `target`, removed on arrival by crowTick's
+// sweep (the only swapRemove of crows). No other state: leaving is plotK < 0, scaring is read from pos each tick.
+struct crow {
+    Vector2f pos, target;
+    int race = -1, plotK = -1;
+    int peck = 0;           // ticks pecked on the plot so far
+};
+
+// R67-F1b: one scarecrow per race, in a fixed array (nothing to swapRemove). The claim is not stored (a barb of that
+// race holding jobScarecrow is the claim), so a lost builder frees it through releaseBarbWork()'s reset. lastPeckK is
+// the plot crows last took from (written by crowTick); plotK is copied from it at claim and fixed from then on.
+// The plot's "has a scarecrow" flag is derived: plotScarecrowed() = built && plotK == k. Never saved.
+struct scarecrow {
+    bool built = false;
+    int plotK = -1, lastPeckK = -1;
+    int lost = 0;           // food the race has lost to crows so far (scarecrowAfterLoss starts the build)
+};
+scarecrow scarecrows[raceCount];
+bool plotScarecrowed(int r, int k) { return scarecrows[r].built && scarecrows[r].plotK == k; }
 
 // Soil + frame + the stand spot below it, padded by fieldClearPx
 FloatRect fieldZone(Vector2f pos) {
@@ -8851,7 +8902,9 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         const plot& fp = fields[r][k];
         if (fp.built) return string(cropNames[fp.crop]) + (plotRested(fp) ? " (rested), " : " (same crop), ")   // R67-F1a
                            + (fp.fallow > 0 ? string("fallow") : fieldRipe(fp, r) ? string("ripe")
-                                           : to_string(fp.growth * 100 / plotGrowTicks(fp, r)) + "% grown");
+                                           : to_string(fp.growth * 100 / plotGrowTicks(fp, r)) + "% grown")
+                           + (fp.crowLoss > 0 ? ", crows -" + to_string(fp.crowLoss) : string())   // R67-F1b
+                           + (plotScarecrowed(r, k) ? ", scarecrow" : "");
         if (fp.claimed) return string("being sown");
         if (k > 0 && !fp.placed && fp.fallback) return string("re-siting");   // R37-F1: slot given up, ring spot pending
         if (k > 0 && mills[r].placed && !fp.placed && !fp.reserved) return string("no room");
@@ -11726,15 +11779,116 @@ void craftspear(vector<barb>& barbs, vector<RectangleShape>& squares, const forg
     logRaceEvent(string(b.name) + " made " + weaponOf(b).article + " " + weaponLabel(b), b.race);
 }
 
-void fieldTick(fieldGrid& fields) {
+void fieldTick(fieldGrid& fields, vector<crow>& crows) {
     for (int r = 0; r < raceCount; r++)
-        for (auto& fp : fields[r])
+        for (int k = 0; k < fieldsPerRace; k++) {
+            plot& fp = fields[r][k];
             if (fp.built && fp.fallow > 0) fp.fallow--;   // R32-F1: resting before it grows again
             else if (fp.built && fp.growth < plotGrowTicks(fp, r)) {   // R67-F1a: sooner on a rested plot
                 fp.growth++;
                 if (fp.growth == plotGrowTicks(fp, r))
                     printf("%s RIPE - %s%s\n", fp.crop == cropBarley ? "BARLEY" : "WHEAT", racePlurals[r], plotRested(fp) ? " (rested plot)" : "");
             }
+            // R67-F1b: the plot's own ripe counter rolls for a crow; daylight only, and none once the cap is taken
+            if (!fieldRipe(fp, r)) continue;
+            if (++fp.crowTicks % crowSpawnEvery != 0) continue;
+            if ((int)crows.size() >= crowMax || fp.crowLoss >= crowLossMax || isNightHour(game_time)) continue;
+            if (uniform_real_distribution<float>(0.0f, 1.0f)(gen) >= crowSpawnChance) continue;
+            float ang = uniform_real_distribution<float>(0.0f, 6.2832f)(gen);
+            crow c;
+            c.race = r;
+            c.plotK = k;
+            c.target = fp.rect.position + Vector2f((float)uniform_int_distribution<int>(1, (int)fieldSize.x - 3)(gen),
+                                                   (float)uniform_int_distribution<int>(1, (int)fieldSize.y - 2)(gen));
+            c.pos = c.target + Vector2f(cos(ang), sin(ang)) * crowSpawnDist;
+            crows.push_back(c);
+            printf("CROW INBOUND - %s plot %d (%d crows)\n", racePlurals[r], k + 1, (int)crows.size());
+        }
+}
+
+// R67-F1b: turn a crow round: it flies straight away from the plot it was after, then vanishes (sweep in crowTick)
+void crowLeave(crow& c, const fieldGrid& fields) {
+    Vector2f from = c.pos;
+    if (c.plotK >= 0) from = fields[c.race][c.plotK].rect.position + fieldSize / 2.0f;
+    Vector2f d = c.pos - from;
+    float len = sqrt(d.x * d.x + d.y * d.y);
+    if (len < 0.5f) {
+        float ang = uniform_real_distribution<float>(0.0f, 6.2832f)(gen);
+        d = Vector2f(cos(ang), sin(ang));
+    } else d /= len;
+    c.target = c.pos + d * crowLeaveDist;
+    c.plotK = -1;
+    c.peck = 0;
+}
+
+bool crowStep(crow& c) {   // true once at the target
+    Vector2f d = c.target - c.pos;
+    float len = sqrt(d.x * d.x + d.y * d.y);
+    if (len <= crowSpeed) { c.pos = c.target; return true; }
+    c.pos += d / len * crowSpeed;
+    return false;
+}
+
+// R67-F1b: runs after fieldTick(). Inbound crows turn back when their own position is within scarecrowScareRadius of
+// any standing scarecrow, or when the plot is reaped or already stripped to crowLossMax. A crow on its spot pecks for
+// crowPeckTicks, takes one unit (capped) and leaves. No crow is removed inside the update loop: arrivals of leaving
+// crows are swept afterwards, back to front, through the single swapRemove below.
+void crowTick(vector<crow>& crows, fieldGrid& fields) {
+    const float scareSq = scarecrowScareRadius * scarecrowScareRadius;
+    for (auto& c : crows) {
+        if (c.plotK < 0) { crowStep(c); continue; }
+        plot& fp = fields[c.race][c.plotK];
+        if (!fieldRipe(fp, c.race) || fp.crowLoss >= crowLossMax) { crowLeave(c, fields); continue; }
+        bool scared = false;
+        for (int r = 0; r < raceCount && !scared; r++) {
+            if (!scarecrows[r].built) continue;
+            Vector2f s = fields[r][scarecrows[r].plotK].rect.position + scarecrowOffset + Vector2f(1.5f, 2.0f);
+            Vector2f d = c.pos - s;
+            scared = d.x * d.x + d.y * d.y < scareSq;
+        }
+        if (scared) {
+            printf("CROW SCARED OFF - %s plot %d\n", racePlurals[c.race], c.plotK + 1);
+            crowLeave(c, fields);
+            continue;
+        }
+        if (!crowStep(c)) continue;
+        if (++c.peck < crowPeckTicks) continue;
+        fp.crowLoss = min(crowLossMax, fp.crowLoss + 1);
+        scarecrow& sc = scarecrows[c.race];
+        sc.lost++;
+        sc.lastPeckK = c.plotK;
+        printf("CROW PECKED - %s plot %d lost %d/%d of its harvest\n", racePlurals[c.race], c.plotK + 1, fp.crowLoss, crowLossMax);
+        crowLeave(c, fields);
+    }
+    for (int i = (int)crows.size() - 1; i >= 0; i--)
+        if (crows[i].plotK < 0 && crows[i].pos == crows[i].target) swapRemove(crows, i);
+}
+
+// R67-F1b: runs after buildmills(). A race that has lost scarecrowAfterLoss food to crows sends one builder of its own
+// to the stand spot of the plot crows last took from, through buildOneOff (jobScarecrow), paid at claim with a house's
+// wood kept back. buildOneOff drives the job's barb fields as for every one-off: the claim sets moving + movingbspot
+// toward the stand spot; there it sets building and counts timer up (workTick) to scarecrowBuildTicks; on completion it
+// clears jobKind, building, moving, movingbspot and timer. The claim itself is derived (a barb holding jobScarecrow).
+void buildscarecrows(vector<barb>& barbs, vector<RectangleShape>& squares, const fieldGrid& fields) {
+    for (int r = 0; r < raceCount; r++) {
+        scarecrow& sc = scarecrows[r];
+        if (sc.built || sc.lost < scarecrowAfterLoss || sc.lastPeckK < 0) continue;
+        bool claimed = false;
+        for (auto& b : barbs) if (b.jobKind == jobScarecrow && b.race == r) claimed = true;
+        int siteK = claimed ? sc.plotK : sc.lastPeckK;
+        if (siteK < 0 || !fields[r][siteK].built) continue;
+        bool done = buildOneOff(barbs, squares, claimed, jobScarecrow, fieldWorkSpot(fields[r][siteK]), "SCARECROW",
+            [&](const barb&) {
+                if (!canAfford(stock[r], scarecrowWoodCost + houseWoodCost, 0)) return -1;
+                spend(stock[r], scarecrowWoodCost, 0);
+                sc.plotK = siteK;   // fixed from the claim on
+                return 1;
+            }, r);
+        if (!done) continue;
+        sc.built = true;
+        printf("---SCARECROW BUILT--- %s, in plot %d (crows had taken %d)\n", racePlurals[r], sc.plotK + 1, sc.lost);
+        logRaceEvent(string(racePlurals[r]) + " raise a scarecrow over their field", r);
+    }
 }
 
 // Soil with a dim 1px race-tinted frame; inside, three 6px crop rows (1px soil margin all round). Stalks sit on y = 2/4/6,
@@ -11787,6 +11941,44 @@ void drawField(RenderWindow& window, const plot& fp, int race, int frame) {
     r.setFillColor(fieldBobColor);
     r.setPosition(o + Vector2f(floor(fieldSize.x / 2), -fieldBorderPx - (up ? 3.0f : 2.0f)));
     window.draw(r);
+}
+
+// R67-F1b: each standing scarecrow, a 3x4 dark stick cross centred on its plot's soil (over the crop rows), with a 2x1
+// rag in the race's muted lens colour hanging under the crossbar and swaying 1px left/right. Drawn right after the plots.
+void drawScarecrows(RenderWindow& window, const fieldGrid& fields, int frame) {
+    RectangleShape r;
+    for (int race = 0; race < raceCount; race++) {
+        const scarecrow& sc = scarecrows[race];
+        if (!sc.built) continue;
+        Vector2f o = snapPx(fields[race][sc.plotK].rect.position + scarecrowOffset);
+        r.setFillColor(scarecrowStickColor);
+        r.setSize(Vector2f(1.0f, 4.0f));            // post
+        r.setPosition(o + Vector2f(1.0f, 0.0f));
+        window.draw(r);
+        r.setSize(Vector2f(3.0f, 1.0f));            // crossbar
+        r.setPosition(o + Vector2f(0.0f, 1.0f));
+        window.draw(r);
+        bool left = ((frame + race * 13) / scarecrowSwayFrames) % 2 == 0;
+        r.setFillColor(shade(lensRaceColors[race], scarecrowRagShade));
+        r.setSize(Vector2f(2.0f, 1.0f));            // rag
+        r.setPosition(o + Vector2f(left ? 0.0f : 1.0f, 2.0f));
+        window.draw(r);
+    }
+}
+
+// R67-F1b: crows as 2x1 grey-brown pairs; flying ones bob 1px, pecking ones dip 1px into the rows. With the birds,
+// above the trees and under the overlay.
+void drawCrows(RenderWindow& window, const vector<crow>& crows, int frame) {
+    RectangleShape r(crowSize);
+    r.setFillColor(crowColor);
+    for (auto& c : crows) {
+        int phase = frame + (int)c.target.x * 7;   // desynced per crow
+        bool pecking = c.plotK >= 0 && c.pos == c.target;
+        float dy = pecking ? ((phase / crowPeckFrames) % 2 == 0 ? 1.0f : 0.0f)
+                           : ((phase / crowFlapFrames) % 2 == 0 ? -1.0f : 0.0f);
+        r.setPosition(Vector2f(floor(c.pos.x), floor(c.pos.y) + dy));
+        window.draw(r);
+    }
 }
 
 // FARM-F2: 10x10 grey-tan tower with a dark inset rim and a dark door, under one sail shape (four 2px blades round a 1px
@@ -19842,6 +20034,12 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             // storehouse/campfire if no mill stands, and counted on arrival in haulTick() (Forager bonus applied there)
             if (harvestTick(b, wp, bpos, fieldHarvestTicks, 0)) {
                 bool rested = plotRested(fp);   // R67-F1a: read before replantField rotates the crop
+                int crowLost = min(fp.crowLoss, crowLossMax);   // R67-F1b: read before replantField clears it; hard-capped
+                if (crowLost > 0) {   // the crows' share comes off the race's food; the sheaf still nets yield - crowLossMax > 0
+                    raceStock& rs = stockOf(b);
+                    rs.food -= min(crowLost, rs.food);
+                    printf("CROWS TOOK %d food from the %s harvest\n", crowLost, racePlurals[b.race]);
+                }
                 replantField(fields[b.race], k, b.race);   // replanted at once (R32-F1: maybe fallow first, to stay staggered)
                 startHaul(b, carryWheat, stores, rested ? 1 + restYieldBonus : 1);   // R67-F1a: extra units = bonus food
                 printf("WHEAT REAPED - barb %d carries the sheaf to the %s\n", b.id, millDepot(b) ? "mill" : "storehouse");
@@ -23286,6 +23484,7 @@ int main() {
     VertexArray paveVerts(PrimitiveType::Triangles);   // cobbled cells (R20-F2), rebuilt only when a cell is paved
     VertexArray wallVerts(PrimitiveType::Triangles);   // R31-F2: scratch buffer for drawWalls, rebuilt every frame
     vector<bird> birds;
+    vector<crow> crows;   // R67-F1b: at most crowMax, removed only by crowTick's sweep
     Vector2f birdHeading(1.0f, 0.0f);
     RectangleShape birdShape;
     int frameCount = 0;
@@ -23375,6 +23574,7 @@ int main() {
                 buildfolds(wd, barbs, squares, houses, stores, fields, shrines, bushshapes);   // R66-F3: each race's sheep fold and flock
                 buildfield(barbs, squares, houses, shrines, stores, fields);
                 buildmills(barbs, squares, fields);   // FARM-F2
+                buildscarecrows(barbs, squares, fields);   // R67-F1b
                 buildkeeps(barbs, squares, stores);   // R31-F1: Town era
                 buildbarracks(barbs, squares, stores, bushshapes);   // R47-F6: once the keep stands; drill slot upkeep
                 buildherbhut(barbs, squares, houses, stores, bushshapes);   // R53-F2: elf herb hut and bed
@@ -23458,7 +23658,8 @@ int main() {
                 bushTick(bushes, bushshapes);
                 herbTick(barbs);   // R53-F2: seasons, growth, harvest-day bloom, ripe cache and winter spoilage
                 leanSeasonTick(barbs, bushes, bushshapes);   // R52-F2: first-frost shrivel + cached larder bars
-                fieldTick(fields);
+                fieldTick(fields, crows);   // R67-F1b: + crow spawn rolls
+                crowTick(crows, fields);    // R67-F1b
                 campfireTick(fire);
                 eraTick(barbs, houses);
                 paveTick(barbs, squares);
@@ -23564,6 +23765,7 @@ int main() {
 	for (auto& tw : towns) if (tw.flashFrames > 0 && !paused) tw.flashFrames--;   // R66-F1
 	for (int r = 0; r < raceCount; r++)
 	    for (auto& fp : fields[r]) drawField(window, fp, r, frameCount);
+	drawScarecrows(window, fields, frameCount);   // R67-F1b: over the crop rows
 	drawMills(window);   // FARM-F2: beside each race's plot
 	if (!paused) millFrameTick();
 
@@ -23605,6 +23807,7 @@ int main() {
 	drawForgeSparks(window, paused);   // POL-F5b: above barbs and trees so the sparks read, under the overlay
 	drawWearSparks(window, paused);    // R49-F1: one grey tool-wear chip per race; also ages the tier-drop dim
 	drawBirds(window, birds, birdShape, frameCount);
+	drawCrows(window, crows, frameCount);   // R67-F1b
 	if (raining) drawRain(window, rainVerts, frameCount);
 	for (int q = 0; q < (int)squares.size(); ++q) {
             auto& b = barbs[q];
