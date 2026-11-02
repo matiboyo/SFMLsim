@@ -1304,7 +1304,14 @@ const float kFoldGrazeMinPx = 40.0f;                 // pasture distance from th
 const float kFoldGrazeMaxPx = 80.0f;
 const float kFoldGrazeArcRad = 1.2f;                 // pasture angle within this of straight out from the crate
 const float kFoldGrazeClearPx = 12.0f;               // pasture box half-size that must be dry and on the map
-const int kFoldGrazeTries = 16;
+const int kFoldGrazeTries = 16;                      // R68-F1: hard cap on pasture samples per pick (forgeClear boxes rejected too)
+// R68-F1 Fold Penning Watchdog: every fold phase counts penTicks from its own start (reset at each phase change). Penning
+// that runs past kFoldPenTimeoutTicks snaps the stragglers into their pen slots; the shepherd's walks (fetch, out, home)
+// give up after kFoldWalkTimeoutTicks with a logged fallback, so no flock is stuck out for good.
+const int kFoldPenTimeoutTicks = 600;
+const int kFoldWalkTimeoutTicks = 6000;              // slow enough for a hungry shepherd wading in the rain (~32 ticks/px)
+const int kFoldLateFlashTicks = 180;                 // the small "!" over a late-penned fold fades out over this
+const Color kFoldLateFlashColor(206, 188, 150, 120);  // muted parchment, low alpha (fades from here to 0)
 const float kShepherdAmblePx = 10.0f;                // the shepherd shifts round the pasture within this...
 const int kShepherdAmbleTicks = 900;                 // ...this often
 const float kSheepTetherPx = 40.0f;                  // stray tether: past this from the shepherd a sheep shows "!" and runs back
@@ -3893,6 +3900,9 @@ struct sheepFold {
     int ambleTicks = 0;
     int siteRetry = 0, pickRetry = 0;
     bool siteLogged = false;       // the "no free spot" line is printed once
+    int penTicks = 0;              // R68-F1: ticks in the current phase; reset at every phase change
+    int grazeFails = 0;            // R68-F1: pasture picks in a row that found no clear spot (reset on a success)
+    int lateFlash = 0;             // R68-F1: ticks left on the "penned late" mark over the fold
 };
 sheepFold folds[raceCount];
 int nextFoldId = 0;
@@ -22435,6 +22445,7 @@ void buildfolds(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares,
         f.built = true;
         f.id = nextFoldId++;
         f.phase = foldPenned;
+        f.penTicks = 0;
         f.shepherdId = -1;
         f.pickRetry = 0;
         for (int k = 0; k < kFlockMax; k++) {
@@ -22465,21 +22476,33 @@ void releaseShepherd(vector<barb>& barbs, sheepFold& f, int r, const char* why) 
 }
 
 // R66-F3: a pasture stand spot (hitbox top-left for size sz) kFoldGrazeMinPx..kFoldGrazeMaxPx from the gate stand,
-// within kFoldGrazeArcRad of straight out from the crate, dry, on the map, out of the village clearing and walkable
-bool pickGrazeSpot(const sheepFold& f, int r, Vector2f sz, Vector2f& out) {
+// within kFoldGrazeArcRad of straight out from the crate, dry, on the map, out of the village clearing and walkable.
+// R68-F1: the box must also pass forgeClear() (no grazing on a reserved building or fold zone); at most kFoldGrazeTries
+// samples, and the last failed one logs "pasture blocked" with the race and the run of failed picks (grazeFails).
+bool pickGrazeSpot(sheepFold& f, int r, Vector2f sz, Vector2f& out) {
     Vector2f gate = foldGateStand(f, sz);
     Vector2f o = gate - quarterCentre(r);
     float base = atan2(o.y, o.x);
     uniform_real_distribution<float> ang(-kFoldGrazeArcRad, kFoldGrazeArcRad), dist(kFoldGrazeMinPx, kFoldGrazeMaxPx);
+    int reserved = 0;
     for (int t = 0; t < kFoldGrazeTries; t++) {
         float a = base + ang(gen);
         Vector2f p = snapPx(gate + Vector2f(cos(a), sin(a)) * dist(gen));
         Vector2f c = p + sz / 2.0f;
         FloatRect box(c - Vector2f(kFoldGrazeClearPx, kFoldGrazeClearPx), Vector2f(2 * kFoldGrazeClearPx, 2 * kFoldGrazeClearPx));
-        if (!layoutDiscOk(c, kFoldGrazeClearPx) || !lakeClear(box) || !lakeClear(FloatRect(p, sz), &gate)) continue;
-        if (!regionReachable(gate, p)) continue;
-        out = p;
-        return true;
+        bool ok = layoutDiscOk(c, kFoldGrazeClearPx) && lakeClear(box) && lakeClear(FloatRect(p, sz), &gate);
+        if (ok && !forgeClear(box)) { ok = false; reserved++; }
+        if (ok && !regionReachable(gate, p)) ok = false;
+        if (ok) {
+            f.grazeFails = 0;
+            out = p;
+            return true;
+        }
+        if (t == kFoldGrazeTries - 1) {
+            f.grazeFails++;
+            printf("FOLD - %s fold %d: pasture blocked (%d tries, %d on reserved ground; %d failed picks in a row)\n",
+                   racePlurals[clampRace(r)], f.id, kFoldGrazeTries, reserved, f.grazeFails);
+        }
     }
     return false;
 }
@@ -22501,6 +22524,8 @@ void foldTick(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares) {
         lead[r] = -1;
         sheepFold& f = folds[r];
         if (!f.built) continue;
+        if (f.lateFlash > 0) f.lateFlash--;
+        f.penTicks++;   // R68-F1: ticks in the current phase
         int si = -1;
         if (f.shepherdId >= 0) {
             si = findBarbById(barbs, f.shepherdId);
@@ -22509,8 +22534,10 @@ void foldTick(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares) {
                 si = -1;
             }
         }
-        if (si < 0 && f.phase != foldPenned && f.phase != foldPenning)
+        if (si < 0 && f.phase != foldPenned && f.phase != foldPenning) {
             f.phase = f.phase == foldFetch ? foldPenned : foldPenning;   // out with no shepherd: the flock walks home alone
+            f.penTicks = 0;
+        }
         bool goHome = offHours || raceBell[r] > 0;
         Vector2f fc = f.pos + kFoldSize / 2.0f;
         switch (f.phase) {
@@ -22531,27 +22558,52 @@ void foldTick(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares) {
                 b.orderTicks = 0;
                 f.shepherdId = b.id;
                 f.phase = foldFetch;
+                f.penTicks = 0;
                 printf("SHEPHERD - %s (%s) walks to fold %d\n", b.name, racePlurals[r], f.id);
                 break;
             }
             case foldFetch: {
-                if (goHome) { releaseShepherd(barbs, f, r, "too late to go out"); f.phase = foldPenned; break; }
+                if (goHome) { releaseShepherd(barbs, f, r, "too late to go out"); f.phase = foldPenned; f.penTicks = 0; break; }
+                if (f.penTicks >= kFoldWalkTimeoutTicks) {   // R68-F1: the shepherd never reached the gate: the flock stays in today
+                    printf("FOLD TIMEOUT - %s fold %d: %s never reached the gate in %d ticks, flock stays penned\n",
+                           racePlurals[r], f.id, barbs[si].name, kFoldWalkTimeoutTicks);
+                    releaseShepherd(barbs, f, r, "fetch timed out");
+                    f.phase = foldPenned;
+                    f.penTicks = 0;
+                    f.pickRetry = kFoldPickRetryTicks;
+                    break;
+                }
                 Vector2f sz = squares[si].getSize();
                 if (!expeditionWalk(barbs[si], squares[si], foldGateStand(f, sz))) break;
-                if (!pickGrazeSpot(f, r, sz, f.graze)) f.graze = foldGateStand(f, sz);   // no pasture: they graze at the gate
+                if (!pickGrazeSpot(f, r, sz, f.graze)) {   // no pasture: they graze at the gate
+                    f.graze = foldGateStand(f, sz);
+                    printf("FOLD - %s fold %d: no pasture, the flock grazes at the gate\n", racePlurals[r], f.id);
+                }
                 f.amble = f.graze;
                 f.ambleTicks = kShepherdAmbleTicks;
                 f.phase = foldOut;
+                f.penTicks = 0;
                 printf("FLOCK OUT - %s leads the %s flock out to (%.0f, %.0f)\n", barbs[si].name, racePlurals[r], f.graze.x, f.graze.y);
                 break;
             }
             case foldOut:
-                if (goHome) { f.phase = foldHome; break; }
-                if (expeditionWalk(barbs[si], squares[si], f.graze)) f.phase = foldGraze;
+                if (goHome) { f.phase = foldHome; f.penTicks = 0; break; }
+                if (expeditionWalk(barbs[si], squares[si], f.graze)) { f.phase = foldGraze; f.penTicks = 0; break; }
+                if (f.penTicks >= kFoldWalkTimeoutTicks) {   // R68-F1: pasture out of reach: graze where the shepherd stands
+                    Vector2f here = snapPx(squares[si].getPosition());
+                    printf("FOLD TIMEOUT - %s fold %d: %s never reached the pasture in %d ticks, grazing at (%.0f, %.0f)\n",
+                           racePlurals[r], f.id, barbs[si].name, kFoldWalkTimeoutTicks, here.x, here.y);
+                    f.graze = here;
+                    f.amble = here;
+                    f.ambleTicks = kShepherdAmbleTicks;
+                    f.phase = foldGraze;
+                    f.penTicks = 0;
+                }
                 break;
             case foldGraze: {
                 if (goHome) {
                     f.phase = foldHome;
+                    f.penTicks = 0;
                     printf("FLOCK HOME - %s brings the %s flock home%s\n", barbs[si].name, racePlurals[r], raceBell[r] > 0 ? " (the bell rings)" : "");
                     break;
                 }
@@ -22567,10 +22619,16 @@ void foldTick(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares) {
                 break;
             }
             case foldHome:
-                if (expeditionWalk(barbs[si], squares[si], foldGateStand(f, squares[si].getSize()))) f.phase = foldPenning;
+                if (expeditionWalk(barbs[si], squares[si], foldGateStand(f, squares[si].getSize()))) { f.phase = foldPenning; f.penTicks = 0; break; }
+                if (f.penTicks >= kFoldWalkTimeoutTicks) {   // R68-F1: the shepherd can't reach the gate: the flock files in alone
+                    printf("FOLD TIMEOUT - %s fold %d: %s never reached the gate in %d ticks, the flock walks in alone\n",
+                           racePlurals[r], f.id, barbs[si].name, kFoldWalkTimeoutTicks);
+                    f.phase = foldPenning;
+                    f.penTicks = 0;
+                }
                 break;
             case foldPenning:   // the shepherd waits at the gate (or the flock walks home alone); the sheep pass ends it
-                break;
+                break;           // R68-F1: past kFoldPenTimeoutTicks the end-of-tick check snaps the stragglers in
         }
         if (si >= 0 && (f.phase == foldOut || f.phase == foldGraze || f.phase == foldHome)) lead[r] = si;
     }
@@ -22662,10 +22720,34 @@ void foldTick(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares) {
 
     for (int r = 0; r < raceCount; r++) {
         sheepFold& f = folds[r];
-        if (!f.built || f.phase != foldPenning || penned[r] < flock[r]) continue;
-        printf("FLOCK PENNED - the %s fold %d holds its %d sheep for the night\n", racePlurals[r], f.id, flock[r]);
+        if (!f.built || f.phase != foldPenning) continue;
+        if (penned[r] < flock[r]) {
+            if (f.penTicks < kFoldPenTimeoutTicks) continue;
+            // R68-F1 watchdog: penning ran too long; every straggler of this fold is set in its pen slot (deers[i] and
+            // deershape[i] together, by index, no removal, so the pair stays in step)
+            int snapped = 0;
+            for (int i = 0; i < (int)deers.size() && i < (int)deershape.size(); i++) {
+                deer& d = deers[i];
+                if (!tame(d) || d.foldId != f.id) continue;
+                Vector2f slot = foldPenSpot(f, d.flockSlot);
+                if (deershape[i].getPosition() != slot) snapped++;
+                deershape[i].setPosition(slot);
+                d.targetx = (int)slot.x;
+                d.targety = (int)slot.y;
+                d.moving = false;
+                d.stray = false;
+                d.stepTimer = 0;
+            }
+            printf("FLOCK PENNED (late) - the %s fold %d: %d of %d sheep snapped into the pen after %d ticks\n",
+                   racePlurals[r], f.id, snapped, flock[r], f.penTicks);
+            logRaceEvent(string(racePlurals[r]) + ": FLOCK PENNED (late)", r);
+            f.lateFlash = kFoldLateFlashTicks;
+        } else {
+            printf("FLOCK PENNED - the %s fold %d holds its %d sheep for the night\n", racePlurals[r], f.id, flock[r]);
+        }
         if (f.shepherdId >= 0) releaseShepherd(barbs, f, r, "flock penned");
         f.phase = foldPenned;
+        f.penTicks = 0;
         f.pickRetry = 0;
     }
 }
@@ -22706,7 +22788,7 @@ void drawFolds(RenderWindow& window) {
 }
 
 // R66-F3: after the day/night overlay. Each standing fold's lamp, from the walk home to dawn: a soft stacked additive glow
-// and the lit head. Then a 1px "!" (3px bar, gap, dot) over every stray sheep, 2px above its back.
+// and the lit head. Then a 1px "!" (3px bar, gap, dot) over every stray sheep, 2px above its back (R68-F1: and over a late-penned fold).
 void drawFoldOverlay(RenderWindow& window, const View& worldView, const vector<deer>& deers, const vector<RectangleShape>& deershape) {
     window.setView(worldView);
     bool lit = foldLampLit();
@@ -22738,6 +22820,17 @@ void drawFoldOverlay(RenderWindow& window, const View& worldView, const vector<d
         float x = o.x + floor(deershape[i].getSize().x / 2.0f);
         pushQuad(va, Vector2f(x, o.y - 6.0f), Vector2f(1.0f, 3.0f), kSheepStrayMarkColor);
         pushQuad(va, Vector2f(x, o.y - 2.0f), Vector2f(1.0f, 1.0f), kSheepStrayMarkColor);
+    }
+    // R68-F1: a fold penned late by the watchdog shows a small muted "!" (same 1px shape) centred 2px above its top rail,
+    // clear of the lamp post at the right corner, fading out over kFoldLateFlashTicks
+    for (auto& f : folds) {
+        if (!f.built || f.lateFlash <= 0) continue;
+        Color col = kFoldLateFlashColor;
+        col.a = (uint8_t)(kFoldLateFlashColor.a * f.lateFlash / kFoldLateFlashTicks);
+        Vector2f o = snapPx(f.pos);
+        float x = o.x + floor(kFoldSize.x / 2.0f);
+        pushQuad(va, Vector2f(x, o.y - 6.0f), Vector2f(1.0f, 3.0f), col);
+        pushQuad(va, Vector2f(x, o.y - 2.0f), Vector2f(1.0f, 1.0f), col);
     }
     if (va.getVertexCount() > 0) window.draw(va);
 }
