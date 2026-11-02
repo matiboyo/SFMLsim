@@ -1344,6 +1344,33 @@ const float kFoldLampGlowPx = 12.0f;                 // outer layer radius
 const uint8_t kFoldLampGlowAlpha = 14;               // per layer: ~42 at the lamp, faint at the rim
 const Color kSheepStrayMarkColor(250, 214, 90);      // "!" over a stray: warm yellow on the dark green
 const Color kBarbShepherdColor(176, 150, 236);       // shepherd's task stripe: soft lavender, clear of every other stripe
+// R69-F2 Shearing, Loom and Wool Cloaks, phase 1: once a year in kShearSeason a standing fold's flock is shorn while it
+// is still in the pen (sheepFold::shearYear keeps it to once); each fleece gives one wool bale with kCloakChance, stored
+// at the fold (sheepFold::wool, drawn as bales left of the fence) and each sheep shows tan for kShornDays. With wool in
+// store the race builds one loom beside its fold (inside the fold zone, so it is reserved with the fold) through
+// buildOneOff (jobLoom). From then on jobLoom is the weave: the weaver walks to the fold gate for a bale (weaveStage 0),
+// carries it to the loom as a pip (weaveStage 1) and weaves one cloak for a cloakless barb of the race. A cloak is
+// barb::cloak plus barb::cloakAge (days): one muted grey-blue shoulder pixel that fades toward the body colour and wears
+// out after kCloakWearDays. A cloaked barb catches a housemate's cough at kCloakCoughMult of the rate. Phase 1 only: no
+// lambs, no wolves. Not saved here (R69-F4 saves shorn and the cloak age).
+const season kShearSeason = seasonSpring;
+const int kShornDays = 3;                            // a shorn sheep stays tan this many days
+const float kCloakChance = 0.5f;                     // chance one fleece makes a cloak's bale (~3 cloaks a fold a year)
+const float kCloakCoughMult = 0.75f;                 // cough spread chance for a cloaked barb (modest)
+const int kCloakWearDays = 16;                       // a cloak lasts two years, fading all the while
+const float kCloakFadeMax = 0.7f;                    // shoulder pixel blends this far toward the body by the end
+const int kWoolStoreMax = 6;                         // bales a fold holds; extra fleece is lost
+const int kLoomWoodCost = 6;                         // paid at claim, with a house's wood kept back
+const int kLoomTicks = 400;                          // the build and each weave (buildJobTicks[jobLoom])
+const Vector2f kLoomOffset(-7.0f, 3.0f);             // loom top-left from the fence top-left: 2px clear of the left rail
+const Vector2f kLoomSize(5.0f, 4.0f);                // two posts, top and bottom beams, a 3x2 warp between
+const float kLoomStandGapPx = 2.0f;                  // the weaver stands this far below the loom
+const int kWoolBaleShowMax = 2;                      // stored bales drawn above the loom (more are held, not drawn)
+const Vector2f kWoolBaleSize(2.0f, 2.0f);
+const Color kSheepShornColor(194, 168, 122);         // tan short fleece: warm and brownish, never pink
+const Color kWoolBaleColor(214, 204, 172);           // a shade under the fleece, so a carried bale reads off the barb body
+const Color kLoomWarpColor(214, 204, 172, 110);      // translucent warp threads on an idle loom
+const Color kCloakColor(108, 126, 150);              // muted grey-blue: the cloth on the loom and the shoulder pixel
 // R54-F1 Caravans and Coin, phase 1: a race with a spare stock sends one two-barb caravan (held by barb id, owned by
 // caravanTick()) along the route planner to a rival crate that is not cold. There the pair swaps one lot each of a
 // surplus kind, the relation warms, and a pair at or above kRelFriendlyMinRelation becomes "friendly" for
@@ -3302,8 +3329,8 @@ static_assert(weaponTierBonus[0] == 0, "an untiered weapon hits for its base dam
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
 // jobPave (R20-F2) is run by paveTick(): movingbspot while walking, building/timer while laying the cobbles.
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, jobHerbHut, jobLoreHall, jobWonder, jobBridge, jobJetty, jobFold, jobScarecrow, buildJobCount};   // R66-F2: jobJetty; R66-F3: jobFold; R67-F1b: jobScarecrow
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks, herbHutBuildTicks, loreHallBuildTicks, wonderBuildTicks, kBridgeBuildTicks, kJettyBuildTicks, kFoldBuildTicks, scarecrowBuildTicks};
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, jobHerbHut, jobLoreHall, jobWonder, jobBridge, jobJetty, jobFold, jobScarecrow, jobLoom, buildJobCount};   // R66-F2: jobJetty; R66-F3: jobFold; R67-F1b: jobScarecrow; R69-F2: jobLoom
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks, herbHutBuildTicks, loreHallBuildTicks, wonderBuildTicks, kBridgeBuildTicks, kJettyBuildTicks, kFoldBuildTicks, scarecrowBuildTicks, kLoomTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesSheep, speciesCount};   // R66-F3: speciesSheep (fold flocks only, cap 0)
@@ -3926,6 +3953,11 @@ struct sheepFold {
     int penTicks = 0;              // R68-F1: ticks in the current phase; reset at every phase change
     int grazeFails = 0;            // R68-F1: pasture picks in a row that found no clear spot (reset on a success)
     int lateFlash = 0;             // R68-F1: ticks left on the "penned late" mark over the fold
+    int shearYear = -1;            // R69-F2: year (game_day / yearDays) of the last shearing
+    int wool = 0;                  // R69-F2: bales in store, 0..kWoolStoreMax
+    bool loomBuilt = false;        // R69-F2: the loom beside the fence stands (before that, jobLoom is its build)
+    int weaveStage = 0;            // R69-F2: 0 = weaver (a barb of this race holding jobLoom) heads for the gate; 1 = carries a bale to the loom
+    float weaveFrac = 0.0f;        // R69-F2: cloth on the loom, 0..1 (draw only; set by woolTick())
 };
 sheepFold folds[raceCount];
 int nextFoldId = 0;
@@ -3935,9 +3967,10 @@ int findFoldById(int id) {   // index (= race) of the standing fold with this id
     return -1;
 }
 // Fence, lamp post above and the gate stand spot below, padded by kFoldClearPx
+// R69-F2: reaches -kLoomOffset.x further left for the loom, its bales and the weaver's stand spot below it
 FloatRect foldZone(Vector2f pos) {
-    return FloatRect(pos - Vector2f(kFoldClearPx, kFoldClearPx + kFoldLampH),
-                     kFoldSize + Vector2f(2 * kFoldClearPx, 2 * kFoldClearPx + kFoldLampH + kFoldGateRoomPx));
+    return FloatRect(pos - Vector2f(kFoldClearPx - kLoomOffset.x, kFoldClearPx + kFoldLampH),
+                     kFoldSize + Vector2f(2 * kFoldClearPx - kLoomOffset.x, 2 * kFoldClearPx + kFoldLampH + kFoldGateRoomPx));
 }
 // False if r touches any placed fold's zone
 bool foldClear(const FloatRect& r) {
@@ -4812,6 +4845,8 @@ struct barb {
     int gatherX = -1, gatherY = -1; // R63-F5a: slot top-left while activity == actGather; set only by gatherIdleAt(),
     int gatherTicks = 0;         //           ticks left before gatherTick() releases it; all three reset by endActivity()
     const char* gatherLabel = ""; // R63-F5a: tooltip words for the gathering (static string from the caller)
+    bool cloak = false;          // R69-F2: wears a wool cloak; given only by woolTick() (a finished weave), cleared when it wears out
+    int cloakAge = 0;            // R69-F2: days worn (0..kCloakWearDays); counted by woolTick(), 0 whenever cloak is false
 };
 // R57-F1: age and stage from bornHour on the live clock (same hour count as chronicleNowHour())
 enum lifeStageKind { stageChild, stageAdult, stageElder };
@@ -5643,6 +5678,8 @@ int fawnAge = 0;        // R64-F3: ticks until a fawn grows up; > 0 = fawn. Set 
 int foldId = -1;        // R66-F3: sheepFold.id of a fold sheep (stable id, never an index); -1 = wild. Read through tame()
 int flockSlot = 0;      // R66-F3: pen slot / place round the shepherd (0..kFlockMax-1)
 bool stray = false;     // R66-F3: past the tether, running back to the shepherd ("!" drawn over it)
+bool shorn = false;     // R69-F2: fleece taken this spring (drawn tan); set and cleared only by woolTick()
+int shornDay = 0;       // R69-F2: game_day of the shearing; the fleece is back kShornDays later
 };
 
 int nextDeerId = 0;
@@ -5652,7 +5689,7 @@ int nextDeerId = 0;
 bool tame(const deer& d) { return d.foldId >= 0; }
 
 const speciesDef& speciesOf(const deer& d) { return speciesDefs[d.species]; }
-Color animalBodyColor(const deer& d) { return d.fawnAge > 0 ? kFawnBody : speciesOf(d).body; }   // R64-F3: unflashed fill
+Color animalBodyColor(const deer& d) { return d.fawnAge > 0 ? kFawnBody : d.shorn ? kSheepShornColor : speciesOf(d).body; }   // R64-F3: unflashed fill; R69-F2: tan once shorn
 
 int countSpecies(const vector<deer>& deers, animalSpecies s) {
 	int n = 0;
@@ -8009,8 +8046,8 @@ void sickTick(vector<barb>& barbs) {
         for (int i : m) {
             barb& b = barbs[i];
             if (b.sick > 0 || b.sickImmune > 0 || healImmune(b) || b.health <= 0) continue;   // R60-F2: a fresh cure holds
-            // R53-F3: the race's omen scales the catch rate
-            if (roll(gen) < chance * omenMult(clampRace(b.race), omenCough)) { catchCough(b); printf("COUGH SPREADS - %s (house %d)\n", b.name, kv.first); }
+            // R53-F3: the race's omen scales the catch rate; R69-F2: a wool cloak lowers it a little
+            if (roll(gen) < chance * omenMult(clampRace(b.race), omenCough) * (b.cloak ? kCloakCoughMult : 1.0f)) { catchCough(b); printf("COUGH SPREADS - %s (house %d)\n", b.name, kv.first); }
         }
     }
 
@@ -8267,6 +8304,20 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
         // (hungry dwarf) so it never covers the trait dot.
         if (b.birthRace != b.race && bodyH - 1.0f > 1.0f)
             addLookQuad(Vector2f(base.x - 1.0f, bodyTop + bodyH - 1.0f), Vector2f(1.0f, 1.0f), kExileCloakColors[clampRace(b.birthRace)]);
+        // R69-F2: a wool cloak is one grey-blue pixel on the right shoulder (top-right body cell, clear of the left-hand
+        // sick dot), fading toward the body colour as it ages. Where a race mark sits on that cell (the dwarf beard) it
+        // drops to row 2, under the task stripe. Batched with the race marks, so it sits on top of them.
+        if (b.cloak) {
+            float cx = bodySize.x - 1.0f, cy = 0.0f;
+            for (int m = 0; m < lk.markCount; m++) {
+                const lookMark& mk = lk.marks[m];
+                float mx = mk.x + (mk.fromRight ? bodySize.x : 0.0f);
+                if (mk.y <= 0.0f && mk.y + (mk.toFeet ? bodyH : mk.h) > 0.0f && mx <= cx && cx < mx + mk.w) cy = barbStripeTop + 1.0f;
+            }
+            if (cy >= bodyH) cy = bodyH - 1.0f;
+            float worn = kCloakFadeMax * min(1.0f, (float)b.cloakAge / kCloakWearDays);
+            addLookQuad(Vector2f(base.x + cx, bodyTop + cy), Vector2f(1.0f, 1.0f), lerpColor(kCloakColor, bodyColor, worn));
+        }
         if (zoom >= crownMinZoom && isLeader(b)) {   // R28-F2: gold band on the very top of the head or hat (stays under the ballot pip)
             float headTop = bodyTop - rd.hatSize.y - rd.hatTipSize.y;
             stripe.setSize(crownSize);
@@ -8360,6 +8411,15 @@ void drawBarbs(RenderWindow& window, const vector<barb>& barbs, const vector<Rec
             stripe.setFillColor(kLootBundleColor);
             stripe.setPosition(Vector2f(side + 1.0f, bodyTop + bodyH - kLootBundleSize.y));   // bobs with the body
             window.draw(stripe);
+        }
+        if (b.jobKind == jobLoom && !b.building) {   // R69-F2: the wool bale on its way to the loom: 2x2 cream bundle, the
+            const sheepFold& wf = folds[clampRace(b.race)];   // loot pack's spot (bottom body rows, one column out); bobs with the body
+            if (wf.loomBuilt && wf.weaveStage == 1) {
+                stripe.setSize(kWoolBaleSize);
+                stripe.setFillColor(kWoolBaleColor);
+                stripe.setPosition(Vector2f(side + 1.0f, bodyTop + bodyH - kWoolBaleSize.y));
+                window.draw(stripe);
+            }
         }
         if (b.id == cartId) {   // R54-F1: 2x2 cart on the ground (no bob), one column clear of the arm/spear foot and the
             Vector2f cart(side + kTradeCartGapPx, feet - kTradeCartSize.y);   // health bar; coin pip on its top-right while laden
@@ -8779,6 +8839,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
                 label += ", of house " + to_string(b.homeHouse + 1) + ", " + to_string(kin) + " kin";
             }
             if (b.sick > 0) label += ", coughing";   // R52-F4
+            if (b.cloak) label += ", wool cloak (" + to_string(b.cloakAge) + "/" + to_string(kCloakWearDays) + " days worn)";   // R69-F2
             if (b.plagueTimer > 0) label += ", plague-stricken";   // R59-F2
             else if (b.plagueImmune > 0) label += ", plague survivor";
             lifeStageKind ls = lifeStage(b);         // R57-F1
@@ -22901,6 +22962,147 @@ void foldTick(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares) {
     }
 }
 
+// R69-F2: loom stand spot (hitbox top-left for size sz), centred under the loom left of the fence
+Vector2f loomStand(const sheepFold& f, Vector2f sz) {
+    return snapPx(f.pos + Vector2f(kLoomOffset.x + floor((kLoomSize.x - sz.x) / 2.0f), kLoomOffset.y + kLoomSize.y + kLoomStandGapPx));
+}
+
+// R69-F2: runs right after foldTick(). On a new day: shorn sheep past kShornDays regrow (fill reset through
+// animalBodyColor(), deers[i]/deershape[i] edited in place, nothing added or removed) and every cloak ages a day, wearing
+// out at kCloakWearDays. Then per race with a standing fold: the yearly shearing (kShearSeason, by day, flock in the pen),
+// the loom build (jobLoom through buildOneOff once wool is in store) and, with the loom up, the weave. The weaver is
+// derived (a barb of the race holding jobLoom, as for jobScarecrow); buildOneOff walks it to the gate stand, where this
+// function lifts a bale (weaveStage 1) and retargets it to the loom stand before buildOneOff can start a timer there.
+// buildOneOff then walks it on and counts the weave; a weaver lost with a bale in hand puts the bale back in store.
+void woolTick(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares) {
+    vector<deer>& deers = wd.deers;
+    vector<RectangleShape>& deershape = wd.deershape;
+    static int lastDay = game_day;
+    if (game_day != lastDay) {
+        lastDay = game_day;
+        for (int i = 0; i < (int)deers.size() && i < (int)deershape.size(); i++) {
+            deer& d = deers[i];
+            if (!d.shorn || game_day - d.shornDay < kShornDays) continue;
+            d.shorn = false;
+            deershape[i].setFillColor(animalBodyColor(d));
+        }
+        for (auto& b : barbs) {
+            if (!b.cloak) continue;
+            if (++b.cloakAge < kCloakWearDays) continue;
+            b.cloak = false;
+            b.cloakAge = 0;
+            printf("CLOAK WORN OUT - %s (%s)\n", b.name, racePlurals[clampRace(b.race)]);
+        }
+    }
+    int n = min((int)barbs.size(), (int)squares.size());
+    int year = game_day / yearDays;
+    bool dayHours = game_time >= kFoldOutHour && game_time < kFoldHomeHour;
+    for (int r = 0; r < raceCount; r++) {
+        sheepFold& f = folds[r];
+        f.weaveFrac = 0.0f;
+        if (!f.built) continue;
+
+        // Shearing: once a year, by day, while the flock is still in the pen (penned, or the shepherd on the way)
+        if (seasonOf(game_day) == kShearSeason && f.shearYear != year && dayHours
+            && (f.phase == foldPenned || f.phase == foldFetch)) {
+            f.shearYear = year;
+            int shorn = 0, bales = 0;
+            for (int i = 0; i < (int)deers.size() && i < (int)deershape.size(); i++) {
+                deer& d = deers[i];
+                if (!tame(d) || d.foldId != f.id) continue;
+                d.shorn = true;
+                d.shornDay = game_day;
+                deershape[i].setFillColor(animalBodyColor(d));
+                shorn++;
+                if (uniform_real_distribution<float>(0.0f, 1.0f)(gen) < kCloakChance) bales++;
+            }
+            int kept = clamp(bales, 0, kWoolStoreMax - f.wool);
+            f.wool += kept;
+            printf("SHEARING - %s shear %d sheep at fold %d: %d bales (%d kept, %d in store)\n",
+                   racePlurals[r], shorn, f.id, bales, kept, f.wool);
+            if (shorn > 0)
+                logRaceEvent(string(racePlurals[r]) + " shear their flock: " + to_string(kept) + (kept == 1 ? " bale" : " bales") + " of wool", r);
+        }
+
+        int wi = -1;
+        for (int i = 0; i < n; i++) if (barbs[i].jobKind == jobLoom && barbs[i].race == r) wi = i;
+        bool claimed = wi >= 0;
+        if (!claimed && f.weaveStage == 1) {   // the weaver was lost with a bale in hand: it goes back in store
+            f.wool = min(kWoolStoreMax, f.wool + 1);
+            printf("WOOL BALE RETURNED - the %s weaver is gone, bale back at fold %d (%d in store)\n", racePlurals[r], f.id, f.wool);
+        }
+        if (!claimed) f.weaveStage = 0;
+
+        if (!f.loomBuilt) {
+            if (!claimed && f.wool <= 0) continue;   // a loom only once there is wool to weave
+            bool done = buildOneOff(barbs, squares, claimed, jobLoom, loomStand(f, barbBodySize), "LOOM",
+                [&](const barb&) {
+                    if (!canAfford(stock[r], kLoomWoodCost + houseWoodCost, 0)) return -1;
+                    spend(stock[r], kLoomWoodCost, 0);
+                    return 1;
+                }, r);
+            if (!done) continue;
+            f.loomBuilt = true;
+            f.weaveStage = 0;
+            printf("---LOOM BUILT--- %s, beside fold %d (%d bales in store)\n", racePlurals[r], f.id, f.wool);
+            logRaceEvent(string(racePlurals[r]) + " build a loom by the sheep fold", r);
+            continue;
+        }
+
+        if (claimed && f.weaveStage == 0) {   // at the gate: lift a bale and carry it to the loom
+            barb& b = barbs[wi];
+            Vector2f d = Vector2f((float)b.targetx, (float)b.targety) - squares[wi].getPosition();
+            if (b.movingbspot && !b.building && d.x * d.x + d.y * d.y < 1.0f) {
+                if (f.wool <= 0) {   // the store ran dry under it: the weave is off
+                    b.jobKind = jobNone;
+                    b.moving = b.movingbspot = false;
+                    clearRoute(b);
+                    b.timer = 0;
+                    printf("WEAVE OFF - %s finds no wool at the %s fold\n", b.name, racePlurals[r]);
+                    continue;
+                }
+                f.wool--;
+                f.weaveStage = 1;
+                Vector2f ls = loomStand(f, squares[wi].getSize());
+                b.targetx = (int)ls.x;
+                b.targety = (int)ls.y;
+                b.moving = true;
+                clearRoute(b);
+                printf("WOOL BALE - %s carries a bale to the %s loom (%d left)\n", b.name, racePlurals[r], f.wool);
+            }
+        }
+        if (claimed && f.weaveStage == 1 && barbs[wi].building)
+            f.weaveFrac = min(1.0f, (float)barbs[wi].timer / kLoomTicks);
+        if (!claimed) {
+            if (f.wool <= 0) continue;
+            bool bare = false;
+            for (auto& b : barbs) if (b.race == r && !b.cloak) { bare = true; break; }
+            if (!bare) continue;   // every member is cloaked: the wool waits
+        }
+        bool done = buildOneOff(barbs, squares, claimed, jobLoom, foldGateStand(f, barbBodySize), "WEAVE",
+            [&](const barb&) { return 1; }, r);
+        if (!done) continue;
+        f.weaveStage = 0;
+        // The cloak: the weaver's own if it has none, else the eldest cloakless barb of the race
+        int to = (wi >= 0 && wi < n && !barbs[wi].cloak && barbs[wi].race == r) ? wi : -1;
+        if (to < 0)
+            for (int i = 0; i < n; i++) {
+                const barb& o = barbs[i];
+                if (o.race == r && !o.cloak && (to < 0 || o.bornHour < barbs[to].bornHour)) to = i;
+            }
+        if (to < 0) {
+            f.wool = min(kWoolStoreMax, f.wool + 1);
+            printf("WEAVE - the %s cloak has no one to wear it; the wool goes back to fold %d\n", racePlurals[r], f.id);
+            continue;
+        }
+        barbs[to].cloak = true;
+        barbs[to].cloakAge = 0;
+        const char* weaver = wi >= 0 && wi < n ? barbs[wi].name : "a weaver";
+        printf("CLOAK WOVEN - %s weaves a wool cloak for %s (%s, %d bales left)\n", weaver, barbs[to].name, racePlurals[r], f.wool);
+        logRaceEvent(string(weaver) + " weaves a wool cloak for " + barbs[to].name, r);
+    }
+}
+
 // R66-F3: world layer with the buildings, under the sheep and the barbs. Trampled translucent floor, woven rails with
 // darker posts, the 4px gate gap in the bottom rail (barred while the flock is in) and the lamp post at the top-right
 // corner with its dull head (drawFoldOverlay() lights it). A staked-out site not yet fenced shows its four corner posts.
@@ -22932,6 +23134,21 @@ void drawFolds(RenderWindow& window) {
         pushQuad(va, o + Vector2f(w - 1.0f, floor(h / 2.0f)), Vector2f(1.0f, 1.0f), kFoldPostColor);
         pushQuad(va, o + Vector2f(w - 1.0f, 1.0f - kFoldLampH), Vector2f(1.0f, kFoldLampH - 1.0f), kFoldPostColor);   // lamp post
         pushQuad(va, o + Vector2f(w - 1.0f, -kFoldLampH), Vector2f(1.0f, 1.0f), lanternUnlitColor);                   // lamp head
+        // R69-F2: the loom 2px left of the left rail: dark posts, wattle-brown beams, a translucent 3x2 warp that fills
+        // column by column with grey-blue cloth while a weave runs. Up to kWoolBaleShowMax stored bales sit above it.
+        Vector2f lo = o + kLoomOffset;
+        if (f.loomBuilt) {
+            float lw = kLoomSize.x, lh = kLoomSize.y;
+            pushQuad(va, lo, Vector2f(1.0f, lh), kFoldPostColor);                                  // left post
+            pushQuad(va, lo + Vector2f(lw - 1.0f, 0.0f), Vector2f(1.0f, lh), kFoldPostColor);      // right post
+            pushQuad(va, lo + Vector2f(1.0f, 0.0f), Vector2f(lw - 2.0f, 1.0f), kFoldWattleColor);  // top beam
+            pushQuad(va, lo + Vector2f(1.0f, lh - 1.0f), Vector2f(lw - 2.0f, 1.0f), kFoldWattleColor);   // bottom beam
+            pushQuad(va, lo + Vector2f(1.0f, 1.0f), Vector2f(lw - 2.0f, lh - 2.0f), kLoomWarpColor);    // warp
+            float cloth = ceil((lw - 2.0f) * f.weaveFrac);
+            if (cloth > 0.0f) pushQuad(va, lo + Vector2f(1.0f, 1.0f), Vector2f(cloth, lh - 2.0f), kCloakColor);
+        }
+        for (int k = 0; k < min(f.wool, kWoolBaleShowMax); k++)
+            pushQuad(va, lo + Vector2f(k * (kWoolBaleSize.x + 1.0f), -kWoolBaleSize.y - 1.0f), kWoolBaleSize, kWoolBaleColor);
     }
     if (va.getVertexCount() > 0) window.draw(va);
 }
@@ -23904,6 +24121,7 @@ int main() {
                 deerwander(wd, squares, barbs);
                 deerkilling(wd, barbs, squares, smoke);
                 foldTick(wd, barbs, squares);   // R66-F3: shepherds' day, flock follow/graze/tether and penning (after the hunt, before the wolves)
+                woolTick(wd, barbs, squares);   // R69-F2: spring shearing, the loom, weaving cloaks; cloak and fleece days
                 wolfPackDayTick(wd);   // R64-F3: once a day, before the wolves: pack size from the cached prey ratio
                 wolfTick(wolves, wd, barbs, squares, tris, houseshapes);   // R63-F6: + spring den, pups, den clearing
                 prowlerTick(prowlers, barbs, squares, houses, houseshapes, fire);   // R48-F1: bites land before starveDeathTick()
