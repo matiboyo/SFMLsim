@@ -3100,12 +3100,21 @@ constexpr Color fieldRaceTints[raceCount] = {
     Color(99, 95, 87),                        // dwarf: dark stone
     Color(92, 114, 80),                       // elf: dark sage
 };
-const Color fieldSproutColor(104, 150, 66);   // yellow-green, lighter and warmer than every pine
-const Color fieldStalkColor(118, 156, 70);
+// R67-F1a: sprouts/stalks are tinted by rest state (fieldRestedColor / fieldTiredColor below)
 const Color fieldHeadColor(196, 178, 84);     // yellowing heads (stage 3)
-const Color fieldRipeColor(236, 192, 60);     // bright gold heads
+const Color fieldRipeColor(212, 176, 70);     // R67-F1a: muted gold ripe heads (the bob ear stays pale gold above them)
 const float fieldRipeStalkShade = 0.72f;      // ripe stalk rows: darker gold so the rows still read apart
 const Color fieldBobColor(250, 226, 130);     // single pale-gold ear bobbing above a ripe plot
+// R67-F1a Crop Rotation: each plot alternates wheat/barley when replanted (rotateChance); a plot whose crop differs from
+// its last one (lastCrop) is rested: it ripens restGrowthBonus x faster and its sheaf brings restYieldBonus more food.
+// Its rows are tinted from that alone: rested deep green, same-crop (tired soil) pale straw, ripe heads muted gold.
+enum cropKind { cropWheat, cropBarley, cropKindCount };
+const char* const cropNames[cropKindCount] = {"wheat", "barley"};
+const float rotateChance = 0.65f;             // chance a replant switches crop; otherwise the same crop goes in again
+const float restGrowthBonus = 1.25f;          // rested plot: grow ticks / this
+const int restYieldBonus = 1;                 // rested plot: extra food per sheaf (carried as extra load units)
+const Color fieldRestedColor(64, 136, 46);    // rested sprouts/stalks: deep green, hue-distinct from the brown soil
+const Color fieldTiredColor(184, 190, 132);   // same-crop sprouts/stalks: pale straw, light against the soil
 const int fieldBobFrames = 30;                // 1px up/down every ~0.5s
 const Color barbHarvestColor(235, 205, 85);   // harvest stripe: gold, clear of mine orange and the other task colours
 const Color fieldBarColor(200, 165, 70);      // muted gold harvest progress bar
@@ -4162,13 +4171,20 @@ struct plot {
     int retryTicks = 0;     // R37-F1: >0 = ticks until the next slot check / fallback attempt (counted down in buildfield)
     int slotFails = 0;      // R37-F1: failed checks of the reserved slot
     int stallMask = 0;      // R37-F1: stall gates already logged for this plot (bit per gate), so each prints once
+    cropKind crop = cropWheat;     // R67-F1a: crop growing now (set by replantField)
+    cropKind lastCrop = cropWheat; // R67-F1a: crop of the previous sowing; != crop means the plot is rested
 };
 using fieldGrid = plot[raceCount][fieldsPerRace];
 
-bool fieldRipe(const plot& fp, int race) { return fp.built && fp.growth >= wheatGrowTicks(race); }   // R55-F2: race = row
+bool plotRested(const plot& fp) { return fp.crop != fp.lastCrop; }   // R67-F1a
+int plotGrowTicks(const plot& fp, int race) {   // R67-F1a: the race's wheatGrowTicks, shortened on a rested plot
+    return plotRested(fp) ? max(1, (int)(wheatGrowTicks(race) / restGrowthBonus)) : wheatGrowTicks(race);
+}
+
+bool fieldRipe(const plot& fp, int race) { return fp.built && fp.growth >= plotGrowTicks(fp, race); }   // R55-F2: race = row
 
 // 0..2 growing stages, fieldGrowStages = ripe
-int fieldStage(const plot& fp, int race) { return fieldRipe(fp, race) ? fieldGrowStages : fp.growth * fieldGrowStages / wheatGrowTicks(race); }
+int fieldStage(const plot& fp, int race) { return fieldRipe(fp, race) ? fieldGrowStages : fp.growth * fieldGrowStages / plotGrowTicks(fp, race); }
 
 // R32-F1: restart plot k of a race's row (just sown or reaped) at growth 0. If a growing sibling is less than
 // fieldStaggerStages stages ahead of it (effective growth = growth - fallow), it lies fallow until it is that far behind,
@@ -4184,6 +4200,9 @@ void replantField(plot (&row)[fieldsPerRace], int k, int race) {   // R55-F2: ra
         }
     row[k].growth = 0;
     row[k].fallow = delay;
+    row[k].lastCrop = row[k].crop;   // R67-F1a: rotate (or not) for the next sowing
+    if (uniform_real_distribution<float>(0.0f, 1.0f)(gen) < rotateChance)
+        row[k].crop = (cropKind)((row[k].crop + 1) % cropKindCount);
 }
 
 Vector2f fieldWorkSpot(const plot& fp) { return fp.rect.position + fieldStandOffset; }
@@ -8830,8 +8849,9 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
     }
     auto plotState = [&](int r, int k) {   // R32-F1: one plot's state, for the per-plot list
         const plot& fp = fields[r][k];
-        if (fp.built) return fp.fallow > 0 ? string("fallow") : fieldRipe(fp, r) ? string("ripe")
-                                           : to_string(fp.growth * 100 / wheatGrowTicks(r)) + "% grown";
+        if (fp.built) return string(cropNames[fp.crop]) + (plotRested(fp) ? " (rested), " : " (same crop), ")   // R67-F1a
+                           + (fp.fallow > 0 ? string("fallow") : fieldRipe(fp, r) ? string("ripe")
+                                           : to_string(fp.growth * 100 / plotGrowTicks(fp, r)) + "% grown");
         if (fp.claimed) return string("being sown");
         if (k > 0 && !fp.placed && fp.fallback) return string("re-siting");   // R37-F1: slot given up, ring spot pending
         if (k > 0 && mills[r].placed && !fp.placed && !fp.reserved) return string("no room");
@@ -8858,7 +8878,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         for (int k = 0; k < fieldsPerRace; k++) {
             const plot& fp = fields[r][k];
             if (!fp.built || !near(fp.shape)) continue;
-            return hoverHit{string(raceDefs[r].name) + " wheat field " + to_string(k + 1) + ": " + plotState(r, k) + "\n" + farmLine(r),
+            return hoverHit{string(raceDefs[r].name) + " field " + to_string(k + 1) + ": " + plotState(r, k) + "\n" + farmLine(r),
                             fp.shape, nullopt};
         }
     return nullopt;
@@ -11522,8 +11542,9 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
                 fp.claimed = false;
                 fp.sowerId = -1;
                 replantField(fields[r], k, r);   // R32-F1: may lie fallow first, so it ripens out of step with its siblings
-                printf("---FIELD SOWN--- %s plot %d, ripe in %d ticks (+%d fallow), +%d food per harvest\n", racePlurals[r], k + 1,
-                       wheatGrowTicks(r), fp.fallow, fieldFoodYield);
+                printf("---FIELD SOWN--- %s plot %d (%s%s), ripe in %d ticks (+%d fallow), +%d food per harvest\n", racePlurals[r], k + 1,
+                       cropNames[fp.crop], plotRested(fp) ? ", rested" : "", plotGrowTicks(fp, r), fp.fallow,
+                       fieldFoodYield + (plotRested(fp) ? restYieldBonus : 0));
                 logEvent(string(racePlurals[r]) + " sow a wheat field");
             }
             if (fp.claimed) return;   // one being sown at a time
@@ -11709,9 +11730,10 @@ void fieldTick(fieldGrid& fields) {
     for (int r = 0; r < raceCount; r++)
         for (auto& fp : fields[r])
             if (fp.built && fp.fallow > 0) fp.fallow--;   // R32-F1: resting before it grows again
-            else if (fp.built && fp.growth < wheatGrowTicks(r)) {
+            else if (fp.built && fp.growth < plotGrowTicks(fp, r)) {   // R67-F1a: sooner on a rested plot
                 fp.growth++;
-                if (fp.growth == wheatGrowTicks(r)) printf("WHEAT RIPE - %s\n", racePlurals[r]);
+                if (fp.growth == plotGrowTicks(fp, r))
+                    printf("%s RIPE - %s%s\n", fp.crop == cropBarley ? "BARLEY" : "WHEAT", racePlurals[r], plotRested(fp) ? " (rested plot)" : "");
             }
 }
 
@@ -11737,11 +11759,12 @@ void drawField(RenderWindow& window, const plot& fp, int race, int frame) {
         r.setSize(Vector2f(1.0f, 1.0f));
     }
     if (fp.fallow > 0) return;   // R32-F1: fallow plot is bare soil in its frame
+    const Color growTint = plotRested(fp) ? fieldRestedColor : fieldTiredColor;   // R67-F1a: from lastCrop alone
     for (int row = 0; row < 3; row++) {
         float stalkY = 2.0f + 2.0f * row, headY = stalkY - 1.0f;
         if (stage == 0) {                           // staggered 1px sprouts
             r.setSize(Vector2f(1.0f, 1.0f));
-            r.setFillColor(fieldSproutColor);
+            r.setFillColor(growTint);
             for (float x = 1.0f + (row % 2); x < 1.0f + rowW; x += 2.0f) {
                 r.setPosition(o + Vector2f(x, stalkY));
                 window.draw(r);
@@ -11750,7 +11773,7 @@ void drawField(RenderWindow& window, const plot& fp, int race, int frame) {
         }
         bool ripe = stage == fieldGrowStages;
         r.setSize(Vector2f(rowW, 1.0f));
-        r.setFillColor(ripe ? shade(fieldRipeColor, fieldRipeStalkShade) : fieldStalkColor);
+        r.setFillColor(ripe ? shade(fieldRipeColor, fieldRipeStalkShade) : growTint);
         r.setPosition(o + Vector2f(1.0f, stalkY));
         window.draw(r);
         if (stage == 1) continue;
@@ -19371,7 +19394,8 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
         if (milled && (b.targetx != (int)ms.x || b.targety != (int)ms.y)) milled = false;   // stood at another depot instead
         int tw = townOf(b.homeHouse);   // R66-F1: depotSpot() sent a town household to its town's crate
         storehouse* st = (!milled && tw < 0 && b.race >= 0 && b.race < raceCount && stores[b.race].built) ? &stores[b.race] : nullptr;
-        int yield = (milled ? millFoodYield : fieldFoodYield) + forageBonus(b);   // R25-F1: Forager +1
+        int yield = (milled ? millFoodYield : fieldFoodYield) + forageBonus(b)   // R25-F1: Forager +1
+                  + (b.carryAmount - 1);   // R67-F1a: a rested plot's sheaf carries restYieldBonus extra units
         raceStock& rs = stockOf(b);   // RACE-F1: the reaper's race
         rs.food += yield;
         if (milled) {
@@ -19817,8 +19841,9 @@ void minematerials(vector<RectangleShape>& squares, vector<barb>& barbs, vector<
             // FARM-F2: the reaped sheaf adds no food here; it is carried (carryWheat) to the race's mill, or to the
             // storehouse/campfire if no mill stands, and counted on arrival in haulTick() (Forager bonus applied there)
             if (harvestTick(b, wp, bpos, fieldHarvestTicks, 0)) {
+                bool rested = plotRested(fp);   // R67-F1a: read before replantField rotates the crop
                 replantField(fields[b.race], k, b.race);   // replanted at once (R32-F1: maybe fallow first, to stay staggered)
-                startHaul(b, carryWheat, stores);
+                startHaul(b, carryWheat, stores, rested ? 1 + restYieldBonus : 1);   // R67-F1a: extra units = bonus food
                 printf("WHEAT REAPED - barb %d carries the sheaf to the %s\n", b.id, millDepot(b) ? "mill" : "storehouse");
                 practice(b.race, techSeedSelection);
             }
