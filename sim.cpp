@@ -303,6 +303,14 @@ const float larderBarGap = 1.0f;                    // row -> bar
 const Color larderTrackColor(56, 62, 54);           // dim slate-green track: the bar's full width reads on the backing
 const Color larderOkColor(118, 156, 96);            // muted green: food covers the days to spring
 const Color larderShortColor(196, 150, 76);         // muted amber: it does not
+// R67-F1c Granary and Spoiling Grain: once a day (the first tick after midnight) a race without the Granary tech loses
+// spoilRate of its larder food (stock[r].food only, never a barb's own) above spoilFloorFood. A season's total loss is
+// capped at spoilCapFrac of the larder held when the season began, so spoilage alone can never run a larder dry.
+const float spoilRate = 0.08f;                      // share of the food above the floor lost per day
+const float spoilCapFrac = 0.12f;                   // most a season can spoil, as a share of the season's opening larder
+const int spoilFloorFood = 10;                      // food at or below this never spoils
+const Color kSpoilTickerTint(176, 172, 92);         // light olive ticker line, readable on the black strip
+const Color kSpoilTextColor(176, 172, 92);          // HUD "Spoiling" cell text, same olive
 struct seasonDef {
     const char* name;
     const char* arrivalLine;   // ticker line on the first midnight of the season
@@ -374,6 +382,9 @@ int leanHoursLeft() { return isWinter() ? (daysPerSeason - 1 - dayInSeason(game_
 float leanDaysToSpring() { return isWinter() ? leanHoursLeft() / 24.0f : (float)daysPerSeason; }
 float larderFill[raceCount] = {};      // R52-F2: cached by leanSeasonTick: days of food / days to spring, clamped 0..1
 bool larderCovered[raceCount] = {};    // R52-F2: days of food >= days to spring
+int spoilLastLoss[raceCount] = {};     // R67-F1c: food spoiled at the last midnight (HUD hint + tooltip)
+int spoilSeasonBase[raceCount] = {};   // R67-F1c: larder food when this season's spoiling began (the cap's base)
+int spoilSeasonLost[raceCount] = {};   // R67-F1c: food spoiled so far this season
 // Ground (clear) colour: the season's own, smoothstepped toward the next one over the season's last seasonBlendHours,
 // reaching it exactly at the midnight the season turns
 Color seasonGroundColor(int day, int hour) {
@@ -3225,6 +3236,7 @@ const int masonryStudy = 10;
 const int carpentryStudy = 10;
 const int irrigationStudy = 10;
 const int lamplightStudy = 16;                // the Town-era tech: needs two tier-1 techs and takes longest
+const int granaryStudy = 10;                  // R67-F1c: Hamlet-era, after Seed Selection; stops the race's grain spoiling
 const float knowTierGap = 4.0f;               // extra px between the tier-1 and tier-2 pips in each row
 const float knowLockedRimDim = 0.5f;          // a tier-2 pip whose prereqs/era are not met: rim eased this far toward the bar
 
@@ -3386,7 +3398,7 @@ const Vector2f barSize(20.0f, 3.0f);        // inner fill area of a progress bar
 const float barFramePx = 1.0f;
 
 // HUD icon table: 8x8 patterns, '.' = empty, 'a'..'d' = the icon's colour key
-enum hudIconId { iconWood, iconStone, iconFood, iconPeople, iconHouse, iconSun, iconMoon, iconSpeed, iconPause, iconRain, iconSeason, iconHerb, iconCount };
+enum hudIconId { iconWood, iconStone, iconFood, iconPeople, iconHouse, iconSun, iconMoon, iconSpeed, iconPause, iconRain, iconSeason, iconHerb, iconSpoil, iconCount };
 struct iconDef {
     const char* rows[hudIconGrid];
     Color key[4];
@@ -3428,6 +3440,9 @@ const iconDef hudIcons[iconCount] = {
     // herb (R53-F2): two lavender sprigs with pale tips on green stems
     {{"..b.....", ".aba..b.", "..a..aba", "..ac..a.", "...c.ca.", "...cc...", "...c....", "..ccc..."},
      {Color(176, 140, 206), Color(226, 206, 240), Color(96, 140, 76), Color::Transparent}},
+    // spoil (R67-F1c): an olive grain sack with dark mould spots and a pale tie
+    {{"..c..c..", "...cc...", "..aaaa..", ".abaaaa.", "aaaaabaa", "aabaaaaa", "aaaaabaa", ".aaaaaa."},
+     {Color(128, 124, 48), Color(70, 68, 26), Color(200, 190, 146), Color::Transparent}},
 };
 
 mt19937 gen(random_device{}());
@@ -4123,7 +4138,7 @@ void placeQuarters() {
 // Know-how (R20-F1): every counter, learned flag and pip pulse lives here; reset as a whole with resetKnowHow()
 // R59-F3: tier 1 is learned by practice; tier 2 by study at the Lore Hall, once every prereq is learned and the race's
 // era is at least minEra. prereq slots past the last real one hold techCount. Tier-1 techs come first (kTier1TechCount).
-enum techId {techHandAxe, techPickwork, techSeedSelection, techMasonry, techCarpentry, techIrrigation, techLamplight, techCount};
+enum techId {techHandAxe, techPickwork, techSeedSelection, techMasonry, techCarpentry, techIrrigation, techLamplight, techGranary, techCount};
 const int kTier1TechCount = 3;
 const int kTechMaxPrereq = 2;
 struct techDef {const char* name; int threshold; const char* effect; Color pip;
@@ -4136,6 +4151,7 @@ const techDef techDefs[techCount] = {
     {"Carpentry",  carpentryStudy,  "a woodpile stacked by every house", Color(160, 108, 60),  2, {techHandAxe, techCount}, eraHamlet},        // sawn timber brown
     {"Irrigation", irrigationStudy, "water channels in every plot",      Color(86, 138, 174),  2, {techSeedSelection, techCount}, eraHamlet},  // ditch blue
     {"Lamplight",  lamplightStudy,  "lanterns lit by every door at night", Color(244, 224, 166), 2, {techHandAxe, techPickwork}, eraTown},     // pale lamp cream
+    {"Granary",    granaryStudy,    "stored grain no longer spoils",     Color(184, 150, 108), 2, {techSeedSelection, techCount}, eraHamlet},  // R67-F1c: dry clay
 };
 struct knowHow {
     int count[techCount] = {};       // trees felled, rocks mined, wheat harvests
@@ -9245,6 +9261,8 @@ struct hudValues {
     bool atWar[raceCount];   // R60-F1: race is one of the two sides of a war (WAR chip in its stock panel row)
     int frame;               // R60-F1: drawn frame count, for the chip's slow pulse
     float truceFrac;         // R62-F3: wyrm truce time left, 0..1 (0 = no truce): white-flag pip left of each WAR chip
+    int spoilLoss[raceCount]; // R67-F1c: food spoiled at the last midnight; 0 once the race knows the Granary
+    bool spoiling;           // R67-F1c: any spoilLoss > 0: the strip's olive "Spoiling" cell
 };
 
 // Draws one table icon at pos (top-left, screen px), one quad per filled cell
@@ -9278,6 +9296,12 @@ string hudDetailText(const hudValues& v) {
          + to_string(daysPerSeason) + ", year " + to_string(v.day / yearDays + 1) + ")"
          + (seasonOf(v.day) == seasonWinter ? " - hunger grows faster" : "");   // R51-F3
     s += string("\nYear type: ") + kYearDefs[yearType(v.day / yearDays)].name;   // R65-F3
+    if (v.spoiling) {   // R67-F1c: the olive cell, in words
+        s += "\nGrain spoiling (last night):";
+        for (int r = 0; r < raceCount; r++)
+            if (v.spoilLoss[r] > 0) s += string(" ") + racePlurals[r] + " -" + to_string(v.spoilLoss[r]);
+        s += " food (a Granary stops it)";
+    }
     s += "\nStockpiles (wood/stone/food):";   // RACE-F1
     for (int r = 0; r < raceCount; r++)
         s += string("\n  ") + racePlurals[r] + ": " + to_string(v.stock[r].wood) + " / " + to_string(v.stock[r].stone) + " / " + to_string(v.stock[r].food);
@@ -9345,6 +9369,7 @@ FloatRect drawHud(RenderWindow& window, const Font& font, const hudValues& v) {
     };
     if (v.goldFound) cells.push_back({iconCount, "gold " + to_string(v.gold), hudGoldColor}); // R46-F1a: text only (iconCount = no icon)
     if (v.raining) cells.push_back({iconRain, "Rain", pal.hudText}); // last, so it never shifts the other cells
+    if (v.spoiling) cells.push_back({iconSpoil, "Spoiling", kSpoilTextColor}); // R67-F1c: after rain, so it shifts nothing
 
     // Centre on a fixed reference string so every number sits on the same baseline
     Text ref(font, hudMinNumber, hudFontSize);
@@ -23263,7 +23288,43 @@ void bushTick(vector<bush>& bushes, vector<CircleShape>& bushshapes) {
 // R52-F2: first frost (the tick winter begins) shrivels every ripe bush nobody is picking, with one ticker line; and
 // once every larderRefreshTicks the larder bar values are cached per race. Bushes are never removed, so the shrivel
 // pass edits bushes[i] and bushshapes[i] in place at the same index (no swaps, both vectors stay in step).
+// R67-F1c: called by leanSeasonTick() on the first tick of each new day. Takes spoilRate of the food above
+// spoilFloorFood from each living race's larder (stock[r].food; per-barb food is never touched) unless it knows the
+// Granary, never past spoilCapFrac of the larder it opened the season with. One olive ticker line names every loss.
+void spoilDailyTick(const vector<barb>& barbs) {
+    static int season = -1;
+    int absSeason = game_day / daysPerSeason;
+    if (absSeason != season) {   // a new season: a fresh cap from today's larder
+        season = absSeason;
+        for (int r = 0; r < raceCount; r++) { spoilSeasonBase[r] = stock[r].food; spoilSeasonLost[r] = 0; }
+    }
+    int members[raceCount] = {};
+    for (auto& b : barbs) members[clampRace(b.race)]++;
+    string parts;
+    for (int r = 0; r < raceCount; r++) {
+        spoilLastLoss[r] = 0;
+        if (members[r] == 0 || knows(r, techGranary)) continue;
+        int above = stock[r].food - spoilFloorFood;
+        if (above <= 0) continue;
+        int capLeft = (int)floor(spoilSeasonBase[r] * spoilCapFrac) - spoilSeasonLost[r];
+        int loss = min(min((int)round(above * spoilRate), capLeft), above);
+        if (loss <= 0) continue;
+        stock[r].food -= loss;
+        spoilSeasonLost[r] += loss;
+        spoilLastLoss[r] = loss;
+        printf("SPOIL - %s lose %d food (%d left, %d/%d this season)\n", racePlurals[r], loss, stock[r].food,
+               spoilSeasonLost[r], (int)floor(spoilSeasonBase[r] * spoilCapFrac));
+        parts += string(parts.empty() ? "" : ", ") + racePlurals[r] + " " + to_string(loss);
+    }
+    if (!parts.empty()) logEvent("Grain spoils in store: " + parts + " food lost", kSpoilTickerTint);
+}
+
 void leanSeasonTick(const vector<barb>& barbs, vector<bush>& bushes, vector<CircleShape>& bushshapes) {
+    static int spoilDay = game_day;   // R67-F1c: spoil once per day change, not on the first tick
+    if (game_day != spoilDay) {
+        spoilDay = game_day;
+        spoilDailyTick(barbs);
+    }
     static bool wasWinter = isWinter();
     bool winter = isWinter();
     if (winter && !wasWinter) {
@@ -23932,6 +23993,10 @@ int main() {
             for (auto& w : wars) if (w.active) hv.atWar[w.lo] = hv.atWar[w.hi] = true;
             hv.frame = frameCount;
             hv.truceFrac = truce.active ? clamp((float)truce.ticksLeft / kTruceTicks, 0.0f, 1.0f) : 0.0f;   // R62-F3
+            for (int r = 0; r < raceCount; r++) {   // R67-F1c: a Granary learned since midnight clears the hint at once
+                hv.spoilLoss[r] = knows(r, techGranary) ? 0 : spoilLastLoss[r];
+                if (hv.spoilLoss[r] > 0) hv.spoiling = true;
+            }
             for (int r = 0; r < raceCount; r++)   // R55-F2: one pip row per race
                 for (int k = 0; k < techCount; k++) {
                     hv.learned[r][k] = know[r].learned[k];
