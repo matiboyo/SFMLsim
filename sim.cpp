@@ -861,6 +861,10 @@ const int raceEventFadeTicks = 60;        // race lines hold at full opacity, th
 const float tooltipPickRadius = 7.0f;     // screen px around the cursor that counts as a hover hit
 const float tooltipOutlinePx = 1.0f;      // highlight outline width in screen px (scaled by zoom)
 const Color tooltipOutlineColor(240, 210, 90);
+// R68-F3: dark under-stroke drawn just beneath the hover outline, poking out past its outer edge so the gold reads on
+// pale ground (sand, snow, stone) too. Soft near-black, translucent so it only darkens the edge, never a hard black line.
+const Color hoverHaloColor(10, 14, 10, 150);
+const float hoverHaloExtraPx = 1.0f;      // screen px (scaled by zoom) the halo extends beyond the gold outline
 const unsigned int tooltipFontSize = 12;
 const Vector2f tooltipPad(5.0f, 3.0f);
 const Vector2f tooltipOffset(12.0f, 20.0f); // label offset below-right of the cursor (clears the arrow)
@@ -2503,7 +2507,9 @@ const Color inspectHungerFill(204, 168, 92);      // muted ochre while fed; uiSt
 const Color inspectHealthFill(118, 172, 96);      // muted leaf green, distinct from the red
 const float selectRingRadius = 4.5f;          // world px around the barb's centre: clears the 2x4 body and 2px hats
 const float selectRingPx = 1.0f;              // screen px (scaled by zoom), thin like the hover outline
-const Color selectRingColor(240, 210, 90, 230);   // tooltip-outline yellow
+const Color selectRingColor(240, 210, 90, 230);   // tooltip-outline yellow; R68-F3: alpha replaced by the pulse below
+const int selectRingPulseFrames = 90;             // R68-F3: one slow breath per ~1.5s at 60fps, from the drawn frame count
+const float selectRingAlphaLo = 0.70f, selectRingAlphaHi = 1.00f;   // R68-F3: alpha swing (fraction of 255), never below 70%
 // R44-F1: job target line. Hovered or selected barb -> faint dotted 1px line from its centre to its work target, plus a
 // small pulsing ring on the target. Dash/gap/line length are screen px (scaled by zoom like the outlines).
 const Color targetLineColor(236, 226, 170);   // pale cream-yellow; alpha comes from targetLineAlpha
@@ -8983,14 +8989,19 @@ int pickBarbAt(Vector2f p, float radius, const vector<barb>& barbs, const vector
 }
 
 // UIO-F2: thin ring around the selected barb, drawn above the overlays (like the hover outline) so it reads at night
-void drawSelectRing(RenderWindow& window, const View& worldView, const RectangleShape& square, float zoom) {
+void drawSelectRing(RenderWindow& window, const View& worldView, const RectangleShape& square, float zoom, int frame) {
     window.setView(worldView);
     CircleShape ring(selectRingRadius, 24);
     ring.setOrigin({selectRingRadius, selectRingRadius});
     ring.setPosition(square.getPosition() + square.getSize() / 2.0f);
     ring.setFillColor(Color::Transparent);
     ring.setOutlineThickness(selectRingPx / zoom);
-    ring.setOutlineColor(selectRingColor);
+    // R68-F3: slow cosine pulse on the drawn frame count; starts at full alpha, dips to the floor half a period later
+    float ph = (float)(frame % selectRingPulseFrames) / selectRingPulseFrames;
+    float t = 0.5f + 0.5f * cos(6.2831853f * ph);
+    Color rc = selectRingColor;
+    rc.a = (uint8_t)round(255.0f * (selectRingAlphaLo + (selectRingAlphaHi - selectRingAlphaLo) * t));
+    ring.setOutlineColor(rc);
     window.draw(ring);
 }
 
@@ -9210,14 +9221,21 @@ void drawHoverOutline(RenderWindow& window, const View& worldView, hoverHit& h, 
     window.setView(worldView);
     float th = (h.tint ? ledgerOutlinePx : tooltipOutlinePx) / zoom;   // POL-F1: ledger hits use the race tint
     Color oc = h.tint.value_or(tooltipOutlineColor);
+    float haloTh = th + hoverHaloExtraPx / zoom;   // R68-F3: same inner edge, 1 screen px wider, drawn first so the gold sits on top
     if (h.rect) {
         h.rect->setFillColor(Color::Transparent);
+        h.rect->setOutlineThickness(haloTh);
+        h.rect->setOutlineColor(hoverHaloColor);
+        drawSnapped(window, *h.rect);
         h.rect->setOutlineThickness(th);
         h.rect->setOutlineColor(oc);
         drawSnapped(window, *h.rect);
     }
     if (h.circle) {
         h.circle->setFillColor(Color::Transparent);
+        h.circle->setOutlineThickness(haloTh);
+        h.circle->setOutlineColor(hoverHaloColor);
+        drawSnapped(window, *h.circle);
         h.circle->setOutlineThickness(th);
         h.circle->setOutlineColor(oc);
         drawSnapped(window, *h.circle);
@@ -24089,7 +24107,7 @@ int main() {
         if (selIdx < 0) { selectedBarbId = -1; inspectRect = FloatRect(); }
         if (selIdx >= 0 && selIdx < (int)squares.size() && !barbHidden(barbs[selIdx]))   // R40-F1: a miner below is ringed in its pit
             drawSelectRing(window, worldView, barbInHollow(barbs[selIdx]) ? hollowShape()   // R47-F5: ringed at the mouth
-                           : barbUnderground(barbs[selIdx]) ? shaftPitRect(barbs[selIdx].race) : squares[selIdx], zoom);
+                           : barbUnderground(barbs[selIdx]) ? shaftPitRect(barbs[selIdx].race) : squares[selIdx], zoom, frameCount);   // R68-F3: pulse
         if (selIdx >= 0 && selIdx < (int)squares.size() && !barbHidden(barbs[selIdx]) && !barbUnderground(barbs[selIdx]))   // R44-F1
             if (auto tp = barbTargetPos(barbs[selIdx], squares[selIdx], deers, deershape))
                 drawTargetLine(window, worldView, squares[selIdx].getPosition() + squares[selIdx].getSize() / 2.0f, *tp, zoom, frameCount);
