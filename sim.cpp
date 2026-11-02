@@ -2856,6 +2856,43 @@ const Color kSellswordBandColor(255, 246, 214); // bright gold-white sash: white
 const Color kSellswordOutlineColor(30, 24, 16); // 1px dark frame round a hired hunter so the band reads on grass
 const Color kSellswordCoinColor(226, 190, 96);  // 2x1 coin pip above the head
 const Color kSellswordTickerTint(236, 226, 194);// pale gold-white hire and release lines
+// R66-F1 Daughter Towns, phase 1: at dawn a crowded Town-era race (kTownCrowdBarbs, a standing crate, the wood for the
+// cart) runs one bounded coarse-grid scan for a free site at least kTownMinDistPx from every quarter and town. No site
+// = a quiet fail (printf only) and that race never scans again. With a site, kTownFounders commoners walk there (one
+// trek at a time, activity actFound, the expedition walk); on arrival a second crate and kTownHouses houses rise at
+// once, the founders move into them and the flag clears. townOf(house id) is the one lookup: deposits, house builds
+// and one-off build claims go through it. Phase 1: one town per race, no growth, not saved.
+const int kTownFounders = 4;                    // founders per trek; all one race
+const int kMaxTownsPerRace = 1;
+const int kTownHouses = 2;                      // houses raised with the crate (never more in phase 1)
+const int kTownCrowdBarbs = 16;                 // race head count that counts as crowded (eraTownBarbs is 12)
+const int kTownWoodCost = storehouseWoodCost + kTownHouses * houseWoodCost;   // the cart: paid at launch, refunded on a fail
+const int kTownWoodReserve = houseWoodCost;     // the mother quarter keeps at least a house's wood after paying
+const float kTownMinDistPx = 250.0f;            // site centre from every quarter centre and every other town
+const float kTownScanStepPx = 48.0f;            // coarse grid pitch of the one-off site scan (50x50 cells on the map)
+const int kTownScanTreeTests = 120;             // nearest candidates given the full tree/rock/bush test, at most
+const float kTownClearPadPx = 2.0f;             // a tree/rock box this close to a town footprint is cleared (inClearing)
+const Vector2f kTownAreaLo(-20.0f, -12.0f);     // site footprint (houses + slabs + pennant) relative to the crate top-left
+const Vector2f kTownAreaSize(48.0f, 28.0f);
+const Vector2f kTownHouseOffset[kTownHouses] = {{-16.0f, 3.0f}, {storehouseSize.x + 8.0f, 3.0f}};   // house top-lefts
+const float kTownFounderGapPx = 4.0f;           // founders stand in a row under the crate on arrival
+const int kTownTrekMaxTicks = 36000;            // a trek still walking after this is abandoned quietly
+const int kTownDustEveryTicks = 20;             // each walking founder kicks up a puff this often
+const int kTownDustMax = 24;                    // puffs alive at once
+const int kTownDustFrames = 120;                // drawn frames a puff lives (~2s at 60fps), fading out
+const Vector2f kTownDustSize(2.0f, 1.0f);
+const Color kTownDustColor(170, 152, 116);      // dry road tan, a touch duller than the host dust
+const uint8_t kTownDustAlpha = 110;
+const Color kTownPennantPoleColor(78, 62, 44);  // dark timber pole, 10px tall; the flag takes lensRaceColors[race]
+const Color kTownPennantTipColor(214, 204, 172);// 1px pale finial
+const float kTownPennantX = 1.0f;               // pole column from the crate top-left (the pennant spans x 1..8)
+const float kTownPennantTop = -10.0f;           // pole top; the pole runs down to the lid (y 0)
+const unsigned int kTownLabelFontSize = 11;
+const Vector2f kTownLabelPad(4.0f, 2.0f);
+const float kTownLabelGapPx = 3.0f;             // screen px between the pennant top and the label panel
+const Color kTownLabelPanelColor(10, 14, 12, 160);   // the inspect panel's translucent near-black
+const uint8_t kTownLabelRimAlpha = 150;         // 1px rim in the race's lens colour, softened; the text takes it at full
+const float kTownPennantShade = 0.25f;          // the flag's bottom row, eased toward black for a little depth
 
 // Expeditions (R45-F2, phase 1): one party at a time of expPartySize same-race barbs walks from its crate to its race's
 // lean-to, delves at the ruin stones, and walks home with a relic (or nothing). Rations are paid from the race's food.
@@ -3718,6 +3755,31 @@ float quarterClearRadiusFor(int r) { return quarterRadiusFor(r) + quarterClearMa
 float houseSpreadFarFor(int r) { return houseSpreadFarAt(quarterStepOf(r)); }
 float quarterReachFor(int r) { return quarterReachAt(quarterStepOf(r)); }
 
+// R66-F1: a daughter town. Only townTick() (on the trek's arrival) adds one; none is ever removed in phase 1. houses holds house.id values
+// (stable ids, never indices). Not saved: after a load its houses come back as ordinary quarter houses.
+struct Town {
+    int id = -1;
+    int race = -1;
+    Vector2f crate;        // crate top-left (same size and stand offset as a quarter crate)
+    vector<int> houses;    // house.id of each house raised with it
+    int flashFrames = 0;   // deposit flash, per drawn frame (like storehouse::flashFrames)
+};
+vector<Town> towns;
+int nextTownId = 0;
+// The one town lookup: index into towns of the town house id belongs to, -1 = a quarter house (or no house)
+int townOf(int houseId) {
+    if (houseId < 0) return -1;
+    for (int t = 0; t < (int)towns.size(); t++)
+        for (int id : towns[t].houses) if (id == houseId) return t;
+    return -1;
+}
+int townsOfRace(int r) {
+    int n = 0;
+    for (auto& t : towns) if (t.race == r) n++;
+    return n;
+}
+FloatRect townArea(Vector2f crate) { return FloatRect(crate + kTownAreaLo, kTownAreaSize); }
+
 // True if a tree/rock at top-left p is inside the village clearing or any race quarter's clearing (removed every frame)
 bool inClearing(Vector2f p) {
     float dx = p.x - villageCenter.x, dy = p.y - villageCenter.y;
@@ -3726,6 +3788,11 @@ bool inClearing(Vector2f p) {
         Vector2f d = p - quarterCentre(r);
         float cr = quarterClearRadiusFor(r);   // R47-F10: grows with the race's step
         if (d.x * d.x + d.y * d.y < cr * cr) return true;
+    }
+    for (auto& t : towns) {   // R66-F1: a town's footprint (tree-sized box, so a canopy can't overhang a house)
+        FloatRect a = townArea(t.crate);
+        FloatRect pad(a.position - Vector2f(kTownClearPadPx, kTownClearPadPx), a.size + Vector2f(2 * kTownClearPadPx, 2 * kTownClearPadPx));
+        if (pad.findIntersection(FloatRect(p, Vector2f(treeFootprint, treeFootprint)))) return true;
     }
     return false;
 }
@@ -4348,7 +4415,7 @@ enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
 // R53-F4: the one exclusive state a barb is in (work flags like chopping/building stay separate). Set only by
 // beginActivity(), cleared only by endActivity(), which also runs the activity's cleanup.
 enum barbActivity { actNone, actShelter, actExpedition, actRaidAttack, actRaidDefend, actTemper, actSmelt, actDrill, actWatch,
-                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, actHeal, actHost, actHollowHunt, actGather, activityCount };   // R63-F5a: actGather = called to a gathering (gatherIdleAt)   // R62-F3b: actHollowHunt = a joint wyrm hunter   // R61-F2: actHost = a field host fighter. R60-F2: actHeal = an elf walking to cure a patient   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
+                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, actHeal, actHost, actHollowHunt, actGather, actFound, activityCount };   // R66-F1: actFound = a founder on the trek to a daughter town   // R63-F5a: actGather = called to a gathering (gatherIdleAt)   // R62-F3b: actHollowHunt = a joint wyrm hunter   // R61-F2: actHost = a field host fighter. R60-F2: actHeal = an elf walking to cure a patient   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
 struct activityDef {
     const char* name;
     bool ownsBarb;    // its tick owns the barb outright: every job selector skips it (barbAvailable() false)
@@ -4376,6 +4443,7 @@ const activityDef activityDefs[activityCount] = {
     {"host",          true,  false, false},  // R61-F2: hostTick() owns the fighter from muster to release
     {"wyrm hunt",     true,  false, false},  // R62-F3b: huntTick() owns the hunter from muster to release
     {"gathering",     false, false, true},   // R63-F5a: low priority: any claim or draft ends it; gatherTick() walks it
+    {"founding",      true,  false, false},  // R66-F1: townTick() owns the founder from launch to arrival or failure
 };
 
 // R62-F3b: what a hunter was doing when the hunt took it. Written only by the muster, read by releaseHuntBarb(), wiped
@@ -5233,6 +5301,7 @@ void endActivity(barb& b) {
         case actExile:       // R54-F3: the trip lives on the exile entry; exileTick() resets the walk
         case actEnvoy:       // R56-F2: the coin stays in the purse until arrival; envoyTick() resets the walk
         case actProcession:  // R59-F1: the trip lives on the marriage entry; marriageTick() resets the walk
+        case actFound:       // R66-F1: the trek lives on townTrek; endTownTrek() resets the walk
         case actNone:
         case activityCount:
             break;
@@ -5933,6 +6002,7 @@ const char* barbTaskName(const barb& b) {
     if (b.activity == actProcession)   // R59-F1
         return marriage.phase == marriageTrip::Home ? "wedding procession: heading home"
              : marriage.memberIds[0] == b.id ? "wedding procession: the bride" : "wedding procession: escort";
+    if (b.activity == actFound) return "founding a new town";   // R66-F1
     if (b.deertargeting) return b.hasSpear ? weaponOf(b).huntLabel : "hunting";   // R47-F8: "hunting (axe)" for dwarves
     if (b.building) return "building";
     if (b.activity == actTemper) return "tempering pick";   // R41-F2
@@ -8519,6 +8589,17 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         h.hoveredCrate = r;   // R47-F10
         return h;
     }
+    for (int i = 0; i < (int)towns.size(); i++) {   // R66-F1: a daughter town's crate names the town and its folk
+        RectangleShape crate(storehouseSize);
+        crate.setPosition(towns[i].crate);
+        if (!near(crate)) continue;
+        int r = clampRace(towns[i].race), folk = 0;
+        for (auto& b : barbs) if (townOf(b.homeHouse) == i) folk++;
+        hoverHit h{string(raceDefs[r].name) + " New Town: daughter town of the " + racePlurals[r] + "\n"
+                   + to_string(towns[i].houses.size()) + " houses, " + to_string(folk) + " townsfolk", crate, nullopt};
+        h.tint = lensRaceColors[r];
+        return h;
+    }
     {   // POL-F1: the campfire shows its shared fire wood plus any race still hauling there
         float cr = campfireStoneRadius + 1.0f;   // covers the 1px stone ring drawn outward
         CircleShape ring(cr);
@@ -9722,7 +9803,9 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
         if (!b.movingbspot && !b.moving) {
             if (b.race < 0 || b.race >= raceCount) continue;
             if (!canclaim || !canAfford(stockOf(b), houseWoodCost, 0)) continue;   // RACE-F1: the builder's race pays
-            Vector2f qc = quarterCentre(b.race);
+            int tw = townOf(b.homeHouse);   // R66-F1: a town household builds for its town; phase 1 towns never grow
+            if (tw >= 0 && (int)towns[tw].houses.size() >= kTownHouses) continue;
+            Vector2f qc = tw >= 0 ? towns[tw].crate + storehouseSize / 2.0f : quarterCentre(b.race);
             int tx = 0, ty = 0;
             bool homestead = false, triedHomestead = false;
             int own = 0;   // R44-F4a: this race's houses, standing or claimed
@@ -10429,6 +10512,7 @@ void buildshrine(vector<barb>& barbs, vector<RectangleShape>& squares, const vec
         if (b.chopping || (b.timer > 0 && !b.building)) continue;
         if (!b.movingbspot && !b.moving) {
             if (!canclaim || !canAfford(stockOf(b), 0, shrineStoneCost + houseStoneCost)) continue;
+            if (townOf(b.homeHouse) >= 0) continue;   // R66-F1: shrines ring villageCenter; a town household builds only for its town
             uniform_real_distribution<float> ang(0.0f, 6.2831853f), rad(shrineMinRadius, shrineMaxRadius);
             bool found = false;
             int tx = 0, ty = 0;
@@ -10527,6 +10611,7 @@ bool buildOneOff(vector<barb>& barbs, vector<RectangleShape>& squares, bool& cla
         if (onlyRace >= 0 && b.race != onlyRace) continue;
         if (!claimed) {
             if (b.jobKind != jobNone || b.chopping || b.timer > 0 || b.moving || b.movingbspot || b.building) continue;
+            if (townOf(b.homeHouse) >= 0) continue;   // R66-F1: one-offs stand at the mother quarter; a town household builds only for its town
             int r = ready(b);
             if (r < 0) return false;
             if (r == 0) continue;
@@ -10925,6 +11010,22 @@ void drawStorehouses(RenderWindow& window, const storehouse (&stores)[raceCount]
             };
             drawParts(va, pennant, 3, o, Color::White);
         }
+    }
+    for (auto& tw : towns) {   // R66-F1: a daughter town's crate, same build, under an 8x10 race-tinted swallowtail pennant
+        int r = clampRace(tw.race);
+        float t = storehouseFlashMix * (float)tw.flashFrames / storehouseFlashFrames;
+        Vector2f o = snapPx(tw.crate);
+        drawParts(va, storeShadowParts, o, Color::White);
+        drawParts(va, storeBodyParts, o, lerpColor(storehouseColors[r], Color::White, t));
+        drawParts(va, storeTrimParts, o, Color::White);
+        Color flag = lensRaceColors[r];
+        Vector2f p = o + Vector2f(kTownPennantX, kTownPennantTop);   // pole top
+        pushQuad(va, p, Vector2f(1.0f, 1.0f), kTownPennantTipColor);                        // finial
+        pushQuad(va, p + Vector2f(0.0f, 1.0f), Vector2f(1.0f, -kTownPennantTop - 1.0f), kTownPennantPoleColor);   // pole to the lid
+        pushQuad(va, p + Vector2f(1.0f, 0.0f), Vector2f(7.0f, 2.0f), flag);                 // flag rows 0-1
+        pushQuad(va, p + Vector2f(1.0f, 2.0f), Vector2f(5.0f, 1.0f), flag);                 // row 2: the swallowtail notch
+        pushQuad(va, p + Vector2f(1.0f, 3.0f), Vector2f(7.0f, 1.0f), flag);                 // row 3
+        pushQuad(va, p + Vector2f(1.0f, 4.0f), Vector2f(7.0f, 1.0f), lerpColor(flag, Color::Black, kTownPennantShade));   // row 4
     }
     if (va.getVertexCount() > 0) window.draw(va);
 }
@@ -12165,6 +12266,7 @@ void paveTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
         if (!barbAvailable(b) || b.jobKind != jobNone || b.deertargeting || b.chopping || b.timer > 0
             || b.moving || b.movingbspot || b.building) continue;
         if (!canAfford(stockOf(b), 0, paveStoneCost + houseStoneCost)) continue;
+        if (townOf(b.homeHouse) >= 0) continue;   // R66-F1: cobbles ring villageCenter; a town household builds only for its town
         Vector2f d = squares[i].getPosition() - bestCentre;
         float dSq = d.x * d.x + d.y * d.y;
         if (who < 0 || dSq < whoDSq) { who = i; whoDSq = dSq; }
@@ -15166,6 +15268,22 @@ void tryLaunchExpedition(vector<barb>& barbs, vector<RectangleShape>& squares, c
     }
 }
 
+// R45-F2: one step of a party member's walk to goal (hitbox top-left); snaps and stops on arrival. True = standing there.
+// R66-F1: shared with the daughter-town founders (townTick()).
+bool expeditionWalk(barb& b, RectangleShape& sq, Vector2f goal) {
+    b.targetx = (int)goal.x;
+    b.targety = (int)goal.y;
+    Vector2f diff = Vector2f((float)b.targetx, (float)b.targety) - sq.getPosition();
+    if (diff.x * diff.x + diff.y * diff.y < 1.0f) {
+        sq.setPosition(Vector2f((float)b.targetx, (float)b.targety));
+        if (b.moving) { b.moving = false; clearRoute(b); b.stepTimer = 0; }
+        return true;
+    }
+    b.moving = true;
+    walkStep(b, sq);
+    return false;
+}
+
 // R45-F2: runs after bellTick() (wolves have moved) and before hungerTick(). Re-resolves every member by id each tick;
 // a missing, dead or released member dissolves the party. Feeds hungry members from the rations, lets wolves on the road
 // wound (never below expWolfMinHp), walks each leg and advances the phase once every member has arrived.
@@ -15239,22 +15357,8 @@ void expeditionTick(vector<barb>& barbs, vector<RectangleShape>& squares, const 
             }
         }
     bool allThere = true;
-    for (int k = 0; k < expPartySize; k++) {
-        barb& b = barbs[idx[k]];
-        auto& sq = squares[idx[k]];
-        Vector2f goal = expeditionGoal(k);
-        b.targetx = (int)goal.x;
-        b.targety = (int)goal.y;
-        Vector2f diff = Vector2f((float)b.targetx, (float)b.targety) - sq.getPosition();
-        if (diff.x * diff.x + diff.y * diff.y < 1.0f) {
-            sq.setPosition(Vector2f((float)b.targetx, (float)b.targety));
-            if (b.moving) { b.moving = false; clearRoute(b); b.stepTimer = 0; }
-        } else {
-            allThere = false;
-            b.moving = true;
-            walkStep(b, sq);
-        }
-    }
+    for (int k = 0; k < expPartySize; k++)
+        if (!expeditionWalk(barbs[idx[k]], squares[idx[k]], expeditionGoal(k))) allThere = false;   // R66-F1: shared walk
     if (!allThere) return;
     if (party.phase == expeditionParty::Out) {
         party.phase = expeditionParty::Delve;
@@ -15335,6 +15439,244 @@ void expeditionTick(vector<barb>& barbs, vector<RectangleShape>& squares, const 
         printf("---EXPEDITION HOME--- %s %s, %d rations returned\n", racePlurals[r], outcome.c_str(), party.rations);
         logRaceEvent(string(racePlurals[r]) + "' expedition " + outcome, r);
         endExpedition(barbs, idx);
+    }
+}
+
+// R66-F1: the one founding trek (one at a time, any race). Members are held by barb id and re-resolved every tick, so a
+// founder removed by removeBarb() just fails the trek on the next tick. Not saved.
+struct townTrek {
+    bool active = false;
+    int race = -1;
+    int memberIds[kTownFounders] = {};
+    Vector2f site;      // crate top-left of the town to be
+    int ticks = 0;      // ticks on the road, against kTownTrekMaxTicks
+    int woodPaid = 0;   // the cart: refunded on a fail
+};
+townTrek trek;
+bool townScanned[raceCount] = {};   // this race's one site scan has run (found or not); never reset during a run
+vector<hostDust> townDusts;         // the trek's dust trail; capped at kTownDustMax, aged in drawn frames
+
+// R66-F1: may b found a town for race r? The expedition's idle/fed/healthy rules, a grown commoner (a founder keeps its
+// Commoner standing when its home house moves) and not already a townsman
+bool townFounderOk(const barb& b, int r) {
+    return barbAvailable(b) && expeditionEligible(b, r) && !isGentry(b) && lifeStage(b) == stageAdult && townOf(b.homeHouse) < 0;
+}
+
+// R66-F1: the checks a site (crate top-left c) must pass: in the map below the HUD and out of the village clearing,
+// kTownMinDistPx from every quarter and town, dry (lakes, river, sea), off every reserved building, lean-to, site and
+// the ruins, off every house slab, and walkable from race r's crate. trees/rocks/bushshapes non-null = also clear of
+// them (the scan's full test; the arrival check skips it, since inClearing() clears a standing town's ground).
+bool townSiteOk(int r, Vector2f c, const vector<house>& houses, const vector<tree>* trees, const vector<rock>* rocks,
+                const vector<CircleShape>* bushshapes) {
+    FloatRect a = townArea(c);
+    Vector2f centre = a.position + a.size / 2.0f;
+    if (!layoutDiscOk(centre, max(a.size.x, a.size.y) / 2.0f)) return false;
+    const float minSq = kTownMinDistPx * kTownMinDistPx;
+    for (int q = 0; q < raceCount; q++) {
+        Vector2f d = centre - quarterCentre(q);
+        if (d.x * d.x + d.y * d.y < minSq) return false;
+    }
+    for (auto& t : towns) {
+        Vector2f d = centre - (t.crate + kTownAreaLo + kTownAreaSize / 2.0f);
+        if (d.x * d.x + d.y * d.y < minSq) return false;
+    }
+    if (!lakeClear(a) || !forgeClear(a) || !campClear(a) || !poiClear(a) || !ruinsClear(a)) return false;
+    if (!regionReachable(storehousePos[clampRace(r)] + storehouseStandOffset, c + storehouseStandOffset)) return false;
+    for (auto& h : houses)
+        if (a.findIntersection(FloatRect(Vector2f(h.x - 3.0f, h.y - 3.0f), houseSlabSize))) return false;
+    if (trees)
+        for (auto& t : *trees)
+            if (a.findIntersection(FloatRect(Vector2f((float)t.x, (float)t.y), Vector2f(treeFootprint, treeFootprint)))) return false;
+    if (rocks)
+        for (auto& k : *rocks)
+            if (a.findIntersection(FloatRect(Vector2f((float)k.x, (float)k.y), Vector2f(12.0f, 12.0f)))) return false;   // 6px-radius pentagon
+    if (bushshapes)
+        for (auto& bs : *bushshapes)
+            if (a.findIntersection(bs.getGlobalBounds())) return false;
+    return true;
+}
+
+// R66-F1: the one bounded scan, run once per race: every kTownScanStepPx grid cell gets the cheap checks, then the
+// nearest kTownScanTreeTests survivors (by distance from the race's crate) get the tree/rock/bush test; first pass wins.
+bool findTownSite(int r, const vector<house>& houses, const vector<tree>& trees, const vector<rock>& rocks,
+                  const vector<CircleShape>& bushshapes, Vector2f& out) {
+    vector<pair<float, Vector2f>> cands;
+    Vector2f home = quarterCentre(r);
+    int cells = (int)(worldSize / kTownScanStepPx);
+    for (int gy = 0; gy < cells; gy++)
+        for (int gx = 0; gx < cells; gx++) {
+            Vector2f centre((gx + 0.5f) * kTownScanStepPx, (gy + 0.5f) * kTownScanStepPx);
+            Vector2f c = snapPx(centre - kTownAreaLo - kTownAreaSize / 2.0f);
+            if (!townSiteOk(r, c, houses, nullptr, nullptr, nullptr)) continue;
+            Vector2f d = centre - home;
+            cands.push_back({d.x * d.x + d.y * d.y, c});
+        }
+    sort(cands.begin(), cands.end(), [](const pair<float, Vector2f>& a, const pair<float, Vector2f>& b) { return a.first < b.first; });
+    int tests = min((int)cands.size(), kTownScanTreeTests);
+    for (int k = 0; k < tests; k++)
+        if (townSiteOk(r, cands[k].second, houses, &trees, &rocks, &bushshapes)) {
+            out = cands[k].second;
+            printf("TOWN SITE - %s: %d cells passed the cheap checks, site %d of them\n", raceDefs[r].name, (int)cands.size(), k + 1);
+            return true;
+        }
+    printf("TOWN SITE - %s: no free site (%d cells passed the cheap checks, %d tested for trees)\n", raceDefs[r].name, (int)cands.size(), tests);
+    return false;
+}
+
+// R66-F1: the one way a trek ends (arrived or failed): every founder still standing gets the walk reset and its flag
+// cleared; idx[k] < 0 = gone
+void endTownTrek(vector<barb>& barbs, const int (&idx)[kTownFounders]) {
+    for (int k = 0; k < kTownFounders; k++) {
+        if (idx[k] < 0 || idx[k] >= (int)barbs.size() || barbs[idx[k]].activity != actFound) continue;
+        expeditionReset(barbs[idx[k]]);
+        endActivity(barbs[idx[k]], actFound);
+    }
+    trek = townTrek{};
+}
+
+// R66-F1: at dawn, with no trek out, the first crowded Town-era race (fixed order) that can pay the cart and has
+// kTownFounders eligible founders runs its one scan; a site sends the trek, none is a quiet fail. No ticker here.
+void townDawn(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, const vector<tree>& trees,
+              const vector<rock>& rocks, const vector<CircleShape>& bushshapes, const storehouse (&stores)[raceCount]) {
+    if (trek.active) return;
+    int pop[raceCount] = {};
+    for (auto& b : barbs) pop[clampRace(b.race)]++;
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (int r = 0; r < raceCount; r++) {
+        if (townScanned[r] || townsOfRace(r) >= kMaxTownsPerRace || raceEra[r] < eraTown || !stores[r].built || raceBell[r] > 0) continue;
+        if (pop[r] < kTownCrowdBarbs || stock[r].wood < kTownWoodCost + kTownWoodReserve) continue;
+        int pick[kTownFounders];
+        bool ok = true;
+        for (int k = 0; k < kTownFounders && ok; k++) {
+            pick[k] = findNearest(storehousePos[r], worldSize, n, [&](int i) { return squares[i].getPosition(); },
+                                  [&](int i) {
+                                      for (int q = 0; q < k; q++) if (pick[q] == i) return true;
+                                      return !townFounderOk(barbs[i], r);
+                                  });
+            ok = pick[k] >= 0;
+        }
+        if (!ok) continue;
+        townScanned[r] = true;   // the one scan, found or not
+        Vector2f site;
+        if (!findTownSite(r, houses, trees, rocks, bushshapes, site)) continue;   // quiet: printf only, never retried
+        trek = townTrek{};
+        trek.active = true;
+        trek.race = r;
+        trek.site = site;
+        trek.woodPaid = kTownWoodCost;
+        spend(stock[r], kTownWoodCost, 0);
+        string names;
+        for (int k = 0; k < kTownFounders; k++) {
+            barb& b = barbs[pick[k]];
+            expeditionReset(b);
+            beginActivity(b, actFound);
+            b.order = needNone;
+            b.orderTicks = 0;
+            trek.memberIds[k] = b.id;
+            names += string(k == 0 ? "" : k == kTownFounders - 1 ? " and " : ", ") + b.name;
+        }
+        Vector2f d = site - storehousePos[r];
+        printf("---TOWN TREK--- %s: %s set out %s to (%.0f, %.0f), %.0fpx, %d wood on the cart (%d left)\n", racePlurals[r],
+               names.c_str(), compassName(d), site.x, site.y, hypot(d.x, d.y), kTownWoodCost, stock[r].wood);
+        return;
+    }
+}
+
+// R66-F1: after expeditionTick(). Re-resolves every founder by id; a missing, dead, released or re-raced founder (or a
+// trek past kTownTrekMaxTicks, or a site spoiled on arrival) fails quietly with the wood refunded. Founders walk with
+// the expedition walk and leave a dust trail; once all stand at the site the crate and houses rise, the founders move
+// in, their flag clears, and the one ticker line goes out.
+void townTick(vector<barb>& barbs, vector<RectangleShape>& squares, vector<house>& houses, vector<RectangleShape>& houseshapes) {
+    if (!trek.active) return;
+    int r = clampRace(trek.race);
+    int idx[kTownFounders];
+    bool broken = false;
+    for (int k = 0; k < kTownFounders; k++) {
+        idx[k] = findBarbById(barbs, trek.memberIds[k]);
+        bool bad = idx[k] < 0 || idx[k] >= (int)squares.size() || barbs[idx[k]].activity != actFound || barbs[idx[k]].race != r
+                || barbs[idx[k]].health <= 0;
+        if (bad) { broken = true; if (idx[k] >= (int)squares.size()) idx[k] = -1; }
+    }
+    const char* why = broken ? "a founder is lost" : ++trek.ticks > kTownTrekMaxTicks ? "the road is too long" : nullptr;
+    bool allThere = true;
+    if (!why) {
+        for (int k = 0; k < kTownFounders; k++) {
+            float x = storehouseSize.x / 2.0f - (kTownFounders - 1) * kTownFounderGapPx / 2.0f + k * kTownFounderGapPx - 1.0f;
+            Vector2f goal = snapPx(trek.site + Vector2f(x, storehouseSize.y + 2.0f));
+            if (expeditionWalk(barbs[idx[k]], squares[idx[k]], goal)) continue;
+            allThere = false;
+            if ((trek.ticks + k * (kTownDustEveryTicks / kTownFounders)) % kTownDustEveryTicks == 0 && (int)townDusts.size() < kTownDustMax) {
+                const RectangleShape& sq = squares[idx[k]];
+                townDusts.push_back(hostDust{snapPx(sq.getPosition() + Vector2f(sq.getSize().x / 2.0f - 1.0f, sq.getSize().y - 1.0f)), kTownDustFrames});
+            }
+        }
+        if (!allThere) return;
+        if (!townSiteOk(r, trek.site, houses, nullptr, nullptr, nullptr)) why = "the site is taken";
+    }
+    if (why) {
+        stock[r].wood += trek.woodPaid;
+        printf("TOWN TREK FAILED - %s: %s, %d wood back to the crate\n", racePlurals[r], why, trek.woodPaid);
+        endTownTrek(barbs, idx);
+        return;
+    }
+    Town t;
+    t.id = nextTownId++;
+    t.race = r;
+    t.crate = snapPx(trek.site);
+    for (int h = 0; h < kTownHouses; h++) {
+        Vector2f hp = snapPx(t.crate + kTownHouseOffset[h]);
+        t.houses.push_back(houses[addHouse(houses, houseshapes, (int)hp.x, (int)hp.y, false, (barbRace)r)].id);   // R54-F2
+    }
+    for (int k = 0; k < kTownFounders; k++) barbs[idx[k]].homeHouse = t.houses[k * kTownHouses / kTownFounders];   // two to a house
+    towns.push_back(t);
+    endTownTrek(barbs, idx);   // the flag clears on arrival
+    Vector2f d = t.crate - storehousePos[r];
+    printf("---TOWN FOUNDED--- %s New Town %d at (%.0f, %.0f), %.0fpx %s of the crate, %d houses\n", raceDefs[r].name, t.id,
+           t.crate.x, t.crate.y, hypot(d.x, d.y), compassName(d), kTownHouses);
+    logRaceEvent(string("The ") + racePlurals[r] + " found a new town to the " + compassName(d), r);
+}
+
+// R66-F1: the trek's dust trail, ground layer under the barbs; each puff fades out over kTownDustFrames drawn frames
+void drawTownDust(RenderWindow& window, bool paused) {
+    if (townDusts.empty()) return;
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (auto& p : townDusts) {
+        Color c = kTownDustColor;
+        c.a = (uint8_t)(kTownDustAlpha * p.frames / kTownDustFrames);
+        pushQuad(va, p.pos, kTownDustSize, c);
+    }
+    window.draw(va);
+    if (paused) return;
+    for (int i = (int)townDusts.size() - 1; i >= 0; i--)
+        if (--townDusts[i].frames <= 0) swapRemove(townDusts, i);
+}
+
+// R66-F1: "<Race> New Town" over each town's pennant, in screen space after the world and its overlays, before the HUD
+// (so every HUD panel covers it). Sized from the text's own bounds; skipped when the panel would leave the window or
+// reach the HUD strip.
+void drawTownLabels(RenderWindow& window, const Font& font, const View& worldView) {
+    Vector2u wsz = window.getSize();
+    for (auto& tw : towns) {
+        int r = clampRace(tw.race);
+        Vector2f anchor = snapPx(tw.crate) + Vector2f(kTownPennantX + 4.0f, kTownPennantTop);   // pennant top, centred
+        Vector2f s = window.mapPixelToCoords(window.mapCoordsToPixel(anchor, worldView), window.getDefaultView());
+        Text t(font, string(raceDefs[r].name) + " New Town", kTownLabelFontSize);
+        t.setFillColor(lensRaceColors[r]);
+        FloatRect lb = t.getLocalBounds();
+        Vector2f size = lb.size + 2.0f * kTownLabelPad;
+        Vector2f pos(round(s.x - size.x / 2.0f), round(s.y - kTownLabelGapPx - size.y));
+        if (pos.x - 1.0f < 0.0f || pos.x + size.x + 1.0f > (float)wsz.x || pos.y - 1.0f < hudBarHeight || pos.y + size.y + 1.0f > (float)wsz.y) continue;
+        RectangleShape panel(size);
+        panel.setPosition(pos);
+        panel.setFillColor(kTownLabelPanelColor);
+        Color rim = lensRaceColors[r];
+        rim.a = kTownLabelRimAlpha;
+        panel.setOutlineColor(rim);
+        panel.setOutlineThickness(1.0f);
+        window.draw(panel);
+        t.setPosition(pos + kTownLabelPad - lb.position);
+        window.draw(t);
     }
 }
 
@@ -18366,6 +18708,8 @@ bool millDepot(const barb& b) {
 }
 
 Vector2f depotSpot(const barb& b, const storehouse (&stores)[raceCount]) {
+    int tw = townOf(b.homeHouse);   // R66-F1: a town household hauls everything (sheaves too) to its own town's crate
+    if (tw >= 0) return towns[tw].crate + storehouseStandOffset;
     if (millDepot(b)) return millWorkSpot(mills[b.race]);   // FARM-F2: sheaves go to the mill while it stands
     if (b.race >= 0 && b.race < raceCount && stores[b.race].built) return storehousePos[b.race] + storehouseStandOffset;
     return villageCenter + campfireDepotOffset;
@@ -18574,7 +18918,8 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
         bool milled = millDepot(b);
         Vector2f ms = milled ? millWorkSpot(mills[b.race]) : Vector2f();
         if (milled && (b.targetx != (int)ms.x || b.targety != (int)ms.y)) milled = false;   // stood at another depot instead
-        storehouse* st = (!milled && b.race >= 0 && b.race < raceCount && stores[b.race].built) ? &stores[b.race] : nullptr;
+        int tw = townOf(b.homeHouse);   // R66-F1: depotSpot() sent a town household to its town's crate
+        storehouse* st = (!milled && tw < 0 && b.race >= 0 && b.race < raceCount && stores[b.race].built) ? &stores[b.race] : nullptr;
         int yield = (milled ? millFoodYield : fieldFoodYield) + forageBonus(b);   // R25-F1: Forager +1
         raceStock& rs = stockOf(b);   // RACE-F1: the reaper's race
         rs.food += yield;
@@ -18583,7 +18928,8 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
             m.turnFrames = millTurnFrames;
             m.puffFrames = millPuffFrames;
         } else if (st) { st->stored++; st->flashFrames = storehouseFlashFrames; }
-        printf("WHEAT %s at %s - %s food: %d\n", milled ? "MILLED" : "STORED", milled ? "mill" : st ? "storehouse" : "campfire",
+        else if (tw >= 0) towns[tw].flashFrames = storehouseFlashFrames;
+        printf("WHEAT %s at %s - %s food: %d\n", milled ? "MILLED" : "STORED", milled ? "mill" : st ? "storehouse" : tw >= 0 ? "new town crate" : "campfire",
                racePlurals[clampRace(b.race)], rs.food);
         logEvent(string(milled ? "Wheat milled (+" : "Wheat stored (+") + to_string(yield) + " food, " + to_string(rs.food) + ")");
     } else {
@@ -18600,10 +18946,12 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
             rs.stone += forgeStoneBonus;
             spawnForgeSparks();
         }
-        storehouse* st = (b.race >= 0 && b.race < raceCount && stores[b.race].built) ? &stores[b.race] : nullptr;
+        int tw = townOf(b.homeHouse);   // R66-F1: depotSpot() sent a town household to its town's crate
+        storehouse* st = (tw < 0 && b.race >= 0 && b.race < raceCount && stores[b.race].built) ? &stores[b.race] : nullptr;
         if (st) { st->stored++; st->flashFrames = storehouseFlashFrames; }
+        else if (tw >= 0) towns[tw].flashFrames = storehouseFlashFrames;
         printf("%s x%d DEPOSITED at %s%s%s - %s wood: %d stone: %d, campfire wood: %d\n", isWood ? "WOOD" : "STONE", b.carryAmount,
-               st ? "storehouse" : "campfire", tithe ? " (campfire tithe)" : "", forged ? " (+forge bonus)" : "",
+               st ? "storehouse" : tw >= 0 ? "new town crate" : "campfire", tithe ? " (campfire tithe)" : "", forged ? " (+forge bonus)" : "",
                racePlurals[clampRace(b.race)], rs.wood, rs.stone, campfireWood);
     }
     // R41-F2: a dwarf's stone haul ends at the forge to temper an untempered pick, if the stone is there to pay for it
@@ -22103,6 +22451,7 @@ int main() {
                 bellTick(barbs, squares, houses, houseshapes, wolves, stores, smoke, dwarfForge, fields,
                          trees, tris, rocks, octs, bushes);   // INBOX-F1: after the wolves move
                 expeditionTick(barbs, squares, wolves, stores);   // R45-F2: after the wolves and the bell, before hungerTick()
+                townTick(barbs, squares, houses, houseshapes);   // R66-F1: the founding trek's walk and the town raising
                 poiTick(barbs, squares);   // R47-F4: site discovery and spent-site crumbling, after the party's tick
                 {
                     int hourWas = game_time;
@@ -22111,6 +22460,7 @@ int main() {
                         chronicleDawn(barbs, houses);   // R54-F2: dawn autosave; R55-F4: with the named barbs
                         exileDawn(barbs, houses, stores);   // R54-F3: the dawn emigration check
                         marriageDawn(barbs, squares, houses, stores);   // R59-F1: a leader's child may set out to wed
+                        townDawn(barbs, squares, houses, trees, rocks, bushshapes, stores);   // R66-F1: a crowded race may send founders
                     }
                 }
                 vigilTick(barbs, squares);   // R63-F5: after clockk(): the year's first dusk lights the graveside vigil
@@ -22238,6 +22588,7 @@ int main() {
 	drawVassalChains(window, paused);   // R58-F1: translucent gold chain lord<->vassal crates + payday coin pip, under barbs
 	drawEnvyPips(window);   // R61-F4b: red pip at an envious rival's crate while its envy lasts
 	for (auto& st : stores) if (st.flashFrames > 0 && !paused) st.flashFrames--;
+	for (auto& tw : towns) if (tw.flashFrames > 0 && !paused) tw.flashFrames--;   // R66-F1
 	for (int r = 0; r < raceCount; r++)
 	    for (auto& fp : fields[r]) drawField(window, fp, r, frameCount);
 	drawMills(window);   // FARM-F2: beside each race's plot
@@ -22263,6 +22614,7 @@ int main() {
         drawCampHunters(window, camRect);   // R55-F1: with the barbs, under the trees
         drawHostGround(window);   // R61-F2: a broken host's dropped banner, on the ground under the barbs
         drawFootprints(window, camRect);   // R63-F1: faint snow prints, directly under the barbs
+        drawTownDust(window, paused);   // R66-F1: the founders' dust trail, under the barbs
         drawBarbs(window, barbs, squares, frameCount, zoom);
         drawTitlePips(window, camRect, zoom);   // R56-F3: pale 1px pip over titled barbs, capped
         for (auto& b : barbs) if (b.raidFlash > 0 && !paused) b.raidFlash--;   // R52-F1: the hit flash lasts 2 drawn frames
@@ -22408,6 +22760,7 @@ int main() {
                     hv.pulse[r][k] = know[r].pulseFrames[k];
                     hv.learnable[r][k] = canLearn(r, (techId)k);   // R59-F3
                 }
+            drawTownLabels(window, hudFont, worldView);   // R66-F1: over the world and overlays, under every HUD panel
             hudRect = drawHud(window, hudFont, hv);
             tickerRect = drawEvents(window, hudFont);
             drawMinimap(window, minimapVerts, worldView, barbs, squares, houses, houseshapes, stores);   // UIO-F1: after the HUD, under tooltips
