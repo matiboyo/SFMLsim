@@ -3100,6 +3100,8 @@ const int fieldWoodCost = 6;               // cheap: fences and a hoe
 const int fieldMinHouses = 1;              // a race's first home (and its storehouse) comes before its field
 const int popPerPlot = 4;                  // R46-F2a: every popPerPlot living barbs of a race also open one plot (capped)
 const int fieldBuildTicks = 600;           // same work as a house
+const int fieldClaimTimeoutTicks = 1800;   // R68-F2: a sowing claim held this long without a sown plot is released (3x fieldBuildTicks)
+const int fieldTimeoutTickerGap = 3600;    // R68-F2: min ticks between two "FIELD CLAIM TIMED OUT" ticker lines of one race
 const int fieldGrowTicks = 10800;          // ~3 min from sowing to ripe at 1x (3 growing stages of ~1 min each)
 const int fieldGrowStages = 3;
 const int fieldHarvestTicks = 240;         // ~4s to reap
@@ -4227,6 +4229,8 @@ struct plot {
     cropKind lastCrop = cropWheat; // R67-F1a: crop of the previous sowing; != crop means the plot is rested
     int crowTicks = 0;             // R67-F1b: ticks ripe since the last sowing (crow spawn rolls); reset by replantField
     int crowLoss = 0;              // R67-F1b: units crows took this ripening, 0..crowLossMax; reset by replantField
+    int claimTicks = 0;            // R68-F2: ticks the current sowing claim has been held; 0 when unclaimed
+    int stallTicks = 0;            // R68-F2: ticks spent stalled (a logged gate held it) since the last sow
 };
 using fieldGrid = plot[raceCount][fieldsPerRace];
 
@@ -11547,9 +11551,9 @@ bool placeField(fieldGrid& fields, int r, int kPlot, const vector<barb>& barbs, 
 }
 
 // Runs after buildstorehouses(). Each race sows its own plots once it has a house and a standing storehouse; only a
-// barb of that race may claim one (jobField through buildOneOff(), which clears it on completion). All plots share
-// jobField, so only one is being sown at a time. A claim is held only while its own sower (by id, same race) still
-// holds jobField; otherwise it is released so another barb of that race can take it.
+// barb of that race may claim one (jobField through buildOneOff(), which clears it on completion). R68-F2: each race
+// sows one plot at a time (races in parallel). A claim is held only while its own sower (by id, same race) still
+// holds jobField, the race's crate stands and fieldClaimTimeoutTicks have not passed; otherwise it is released.
 // R46-F2a: the one plot gate. Race r may sow max(home unlock, raceBarbs / popPerPlot) plots, capped at fieldsPerRace
 // so food stays earned. Nothing opens before the race's first home. Kept as a high-water mark in plotsOpen[r], so a
 // shrinking race (or a lost home) never closes a plot; each growth past one plot logs one "Farmstead expanded" line.
@@ -11569,6 +11573,24 @@ int plotsUnlocked(int r, int raceHouses, int raceBarbs) {
     return plotsOpen[r];
 }
 
+int fieldTimeoutCooldown[raceCount] = {};   // R68-F2: ticks until a race may post another "field claim timed out" ticker line
+
+// R68-F2: frees a plot's sowing claim. A sower still holding jobField drops it and stops walking, so it is idle again.
+void releaseFieldClaim(vector<barb>& barbs, plot& fp) {
+    int i = findBarbById(barbs, fp.sowerId);
+    if (i >= 0 && barbs[i].jobKind == jobField) {
+        barb& b = barbs[i];
+        b.jobKind = jobNone;
+        b.moving = b.movingbspot = b.building = false;
+        b.timer = 0;
+        clearRoute(b);
+    }
+    fp.claimed = false;
+    fp.sowerId = -1;
+    fp.claimTicks = 0;
+    fp.stallMask = 0;
+}
+
 void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, const vector<shrine>& shrines,
                 const storehouse (&stores)[raceCount], fieldGrid& fields) {
     int raceHouses[raceCount] = {};
@@ -11577,27 +11599,61 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
     for (auto& b : barbs) if (b.race >= 0 && b.race < raceCount) raceBarbs[b.race]++;
     int unlocked[raceCount];
     for (int r = 0; r < raceCount; r++) unlocked[r] = plotsUnlocked(r, raceHouses[r], raceBarbs[r]);
-    int activeRace = -1, activeK = -1;
+    // R68-F2: claims are per race. Each race sows at most one plot at a time (raceClaimed[r]), and buildOneOff() is limited
+    // to that race, so one race's sower never advances another race's plot and no race waits on another.
+    bool raceClaimed[raceCount] = {};
+    for (int r = 0; r < raceCount; r++) if (fieldTimeoutCooldown[r] > 0) fieldTimeoutCooldown[r]--;
     for (int r = 0; r < raceCount; r++)
         for (int k = 0; k < fieldsPerRace; k++) {
             plot& fp = fields[r][k];
             if (fp.retryTicks > 0) fp.retryTicks--;   // R37-F1: per-plot countdown to the next slot / fallback attempt
             if (fp.built || !fp.claimed) continue;
+            if (raceBarbs[r] == 0) {   // R68-F2: race extinct
+                printf("FIELD CLAIM RELEASED - %s plot %d, race extinct\n", racePlurals[r], k + 1);
+                releaseFieldClaim(barbs, fp);
+                continue;
+            }
+            if (!stores[r].built) {   // R68-F2: the crate is gone, so the sower would work for a quarter that no longer stands
+                printf("FIELD CLAIM RELEASED - %s plot %d, crate lost (sower %d)\n", racePlurals[r], k + 1, fp.sowerId);
+                releaseFieldClaim(barbs, fp);
+                continue;
+            }
             int i = findBarbById(barbs, fp.sowerId);
             if (i < 0 || barbs[i].jobKind != jobField || barbs[i].race != r) {   // per race: no other barb keeps this claim
                 printf("FIELD CLAIM RELEASED - %s plot %d, sower %d lost\n", racePlurals[r], k, fp.sowerId);
-                fp.claimed = false;
-                fp.sowerId = -1;
+                releaseFieldClaim(barbs, fp);
                 continue;
             }
-            activeRace = r;
-            activeK = k;
+            if (++fp.claimTicks >= fieldClaimTimeoutTicks) {   // R68-F2: held too long without sowing
+                printf("FIELD CLAIM TIMED OUT - %s plot %d, sower %d released after %d ticks (at %d,%d, target %d,%d)\n",
+                       racePlurals[r], k + 1, fp.sowerId, fp.claimTicks, barbs[i].x, barbs[i].y, barbs[i].targetx, barbs[i].targety);
+                if (fieldTimeoutCooldown[r] == 0) {   // ticker throttled per race; stdout logs every timeout
+                    logRaceEvent(string(racePlurals[r]) + ": field claim timed out (plot " + to_string(k + 1) + ")", r);
+                    fieldTimeoutCooldown[r] = fieldTimeoutTickerGap;
+                }
+                releaseFieldClaim(barbs, fp);
+                continue;
+            }
+            raceClaimed[r] = true;
         }
     for (int r = 0; r < raceCount; r++)
         for (int k = 0; k < fieldsPerRace; k++) {
             plot& fp = fields[r][k];
-            if (fp.built || (activeRace >= 0 && (r != activeRace || k != activeK))) continue;
+            if (fp.built || (raceClaimed[r] && !fp.claimed)) continue;   // R68-F2: this race is sowing another plot
             bool plotOpen = k < unlocked[r];   // R46-F2a: plotsUnlocked() is the only plot-count gate
+            // R37-F1/R68-F2: logged once per plot and gate, for every plot (extra plots once plot 0 is sown, so their normal
+            // wait for plot 0 stays quiet); the ticks it stays held count towards the "after N stalled ticks" of its sow line
+            auto stalled = [&](int gate) {
+                if (k > 0 && !fields[r][0].built) return;
+                fp.stallTicks++;
+                if (fp.stallMask & gate) return;
+                fp.stallMask |= gate;
+                const char* why = gate == 1 ? "store" : gate == 2 ? "homes/pop" : gate == 4 ? "wood" : gate == 8 ? "slot" : "a free sower";
+                printf("FIELD STALLED - %s plot %d waits on %s (plots open %d/%d, wood %d/%d, store %s, slot %s, barbs %d)\n",
+                       racePlurals[r], k + 1, why, unlocked[r], k + 1, stock[r].wood, fieldWoodCost,
+                       stores[r].built ? "built" : "none",
+                       fp.fallback ? "re-siting" : fp.reserved ? "reserved" : fp.placed ? "placed" : "none", raceBarbs[r]);
+            };
             if (!fp.placed) {
                 // R37-F1: the first gate holding the plot back; the slot gate also covers the wait between retries
                 int gate = !stores[r].built ? 1 : !plotOpen ? 2 : !canAfford(stock[r], fieldWoodCost, 0) ? 4
@@ -11605,17 +11661,13 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
                 if (gate == 0 && (fp.retryTicks > 0 || !placeField(fields, r, k, barbs, houses, shrines, k == 0 && !mills[r].placed)))
                     gate = 8;
                 if (gate) {
-                    // logged once per plot and gate; extra plots only, once plot 0 is sown (plot 0's start-up waits are normal)
-                    if (k > 0 && fields[r][0].built && !(fp.stallMask & gate)) {
-                        fp.stallMask |= gate;
-                        const char* why = gate == 1 ? "store" : gate == 2 ? "homes/pop" : gate == 4 ? "wood" : "slot";
-                        printf("FIELD STALLED - %s plot %d waits on %s (plots open %d/%d, wood %d/%d, store %s, slot %s)\n",
-                               racePlurals[r], k + 1, why, unlocked[r], k + 1, stock[r].wood, fieldWoodCost,
-                               stores[r].built ? "built" : "none",
-                               fp.fallback ? "re-siting" : fp.reserved ? "reserved" : "none");
-                    }
+                    stalled(gate);
                     continue;
                 }
+            }
+            if (!fp.claimed && !stores[r].built) {   // R68-F2: a placed plot waits for its crate before anyone is sent
+                stalled(1);
+                continue;
             }
             bool done = buildOneOff(barbs, squares, fp.claimed, jobField, fieldWorkSpot(fp), "FIELD",
                 [&](const barb& b) {
@@ -11623,8 +11675,9 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
                     if (b.race != r) return 0;   // only that race sows its plot
                     spend(stock[r], fieldWoodCost, 0);   // RACE-F1: the race's own wood
                     fp.sowerId = b.id;
+                    fp.claimTicks = 0;   // R68-F2
                     return 1;
-                });
+                }, r);   // R68-F2: only this race's barbs claim or advance its plot
             if (done) {
                 fp.built = true;
                 fp.claimed = false;
@@ -11633,9 +11686,16 @@ void buildfield(vector<barb>& barbs, vector<RectangleShape>& squares, const vect
                 printf("---FIELD SOWN--- %s plot %d (%s%s), ripe in %d ticks (+%d fallow), +%d food per harvest\n", racePlurals[r], k + 1,
                        cropNames[fp.crop], plotRested(fp) ? ", rested" : "", plotGrowTicks(fp, r), fp.fallow,
                        fieldFoodYield + (plotRested(fp) ? restYieldBonus : 0));
+                if (fp.stallTicks > 0)   // R68-F2: pairs with its FIELD STALLED lines
+                    printf("FIELD SOWN after %d stalled ticks - %s plot %d\n", fp.stallTicks, racePlurals[r], k + 1);
+                fp.claimTicks = 0;
+                fp.stallMask = 0;
+                fp.stallTicks = 0;
                 logEvent(string(racePlurals[r]) + " sow a wheat field");
+            } else if (!fp.claimed) {   // R68-F2: placed but nobody took it this tick
+                stalled(!plotOpen ? 2 : !canAfford(stock[r], fieldWoodCost, 0) ? 4 : 16);
             }
-            if (fp.claimed) return;   // one being sown at a time
+            if (fp.claimed) raceClaimed[r] = true;   // R68-F2: one plot per race at a time; other races carry on
         }
 }
 
@@ -13463,7 +13523,7 @@ void releaseBarbWork(barb& b, smokehouseSet& sh, forge& fg, storehouse (&stores)
         case jobField:   // FARM-F1: only the plot this barb sows, in its own race's row
             if (b.race >= 0 && b.race < raceCount)
                 for (auto& fp : fields[b.race])
-                    if (!fp.built && fp.sowerId == b.id) { fp.claimed = false; fp.sowerId = -1; }
+                    if (!fp.built && fp.sowerId == b.id) { fp.claimed = false; fp.sowerId = -1; fp.claimTicks = 0; fp.stallMask = 0; }   // R68-F2
             break;
         case jobMill:    // FARM-F2: only its own race's mill, and only if this barb holds the claim
             if (b.race >= 0 && b.race < raceCount && !mills[b.race].built && mills[b.race].builderId == b.id) {
