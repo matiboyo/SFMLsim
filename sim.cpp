@@ -3102,6 +3102,23 @@ const float kTownLabelGapPx = 3.0f;             // screen px between the pennant
 const Color kTownLabelPanelColor(10, 14, 12, 160);   // the inspect panel's translucent near-black
 const uint8_t kTownLabelRimAlpha = 150;         // 1px rim in the race's lens colour, softened; the text takes it at full
 const float kTownPennantShade = 0.25f;          // the flag's bottom row, eased toward black for a little depth
+// R69-F1b Supply Cart, phase 2: one townCart per town (not a barb) waits by the mother crate, loads kTownGrainOutflow food
+// only through townTitheOk() (townGrow()'s own floor check), rolls in a straight line to the town crate (no route or tree
+// search; slowed on water like a wader, sped by worn road like a barb), unloads there and rolls home empty. The town
+// crate feeds the race's one larder, so the grain is only off the books while it rides. Never touches Town::growth:
+// growth keeps its own tithe and never waits on the cart. Each cell it enters takes kTownCartWearPerCell wear, so a
+// steady run wears a road between the crates. Not saved: a chronicle load starts a fresh empty cart (a load in transit
+// at the dawn save is not in that save's larder).
+const int kTownCartWaitTicks = 300;             // standing time at either crate between runs (~5s at 1x)
+const int kTownCartWearPerCell = 4 * trailWearPerCell;   // heavy wheels: outpaces trail decay on a ~250px run at 1x
+const Vector2f kTownCartSize(2.0f, 2.0f);
+const Vector2f kTownCartStandOffset(storehouseSize.x / 2.0f - 1.0f, storehouseSize.y + 2.0f);   // under the crate's middle
+const Color kTownCartColor(196, 226, 228, 210); // pale cyan-white, a little translucent so it stays small and quiet
+const Color kTownCartGrainColor(206, 182, 110); // 1px grain pip on its top-right while laden (caravan-cart style)
+const int kTownCartDustEveryTicks = 40;         // a rolling cart drops one faint dust dot this often
+const int kTownCartDustMax = 8;
+const int kTownCartDustFrames = 90;             // drawn frames a dot lives, fading out
+const uint8_t kTownCartDustAlpha = 60;          // fainter than the trek's dust (kTownDustAlpha 110)
 
 // Expeditions (R45-F2, phase 1): one party at a time of expPartySize same-race barbs walks from its crate to its race's
 // lean-to, delves at the ruin stones, and walks home with a relic (or nothing). Rations are paid from the race's food.
@@ -16602,6 +16619,10 @@ int townAddHouse(Town& t, vector<house>& houses, vector<RectangleShape>& housesh
     return hi;
 }
 
+// R69-F1: the one floor check for a tithe of kTownGrainOutflow from race r's larder (head count pop): the larder keeps
+// at least kTownFoodFloor + pop afterwards. R69-F1b: the supply cart loads through this too.
+bool townTitheOk(int r, int pop) { return stock[r].food - kTownGrainOutflow >= kTownFoodFloor + pop; }
+
 // R69-F1: every kTownGrowEveryTicks each town takes kTownGrainOutflow food from its race's larder, only while the larder
 // stays at or above kTownFoodFloor + the race's head count afterwards (so the mother is never starved). Each
 // kTownGrowthPerStep tithed grain raises the next thing beside the pennant: a grown house, the plot once the first grown
@@ -16625,7 +16646,7 @@ void townGrow(const vector<barb>& barbs, vector<house>& houses, vector<Rectangle
         }
         bool plotNext = !t.plot && ((int)t.houses.size() > kTownHouses || slot < 0);
         if (!plotNext && slot < 0) continue;   // fully grown: no more tithe
-        if (stock[r].food - kTownGrainOutflow < kTownFoodFloor + pop[r]) continue;   // the mother's floor
+        if (!townTitheOk(r, pop[r])) continue;   // the mother's floor
         stock[r].food -= kTownGrainOutflow;
         t.growth += kTownGrainOutflow;
         if (t.growth < kTownGrowthPerStep) continue;
@@ -16643,12 +16664,126 @@ void townGrow(const vector<barb>& barbs, vector<house>& houses, vector<Rectangle
     }
 }
 
+// R69-F1b: a town's supply cart. Held by town id (never an index); not a barb, so no job, route or tree search.
+struct townCart {
+    int townId = -1;
+    int race = -1;          // the town's race, so a load can go home if the town is ever gone
+    Vector2f pos;           // top-left, world px (drawn snapped)
+    bool outbound = false;  // rolling to (or standing at) the town crate
+    bool rolling = false;
+    int load = 0;           // food aboard, taken from the mother's larder through townTitheOk()
+    int waitTicks = 0;      // standing time at the current crate
+    int stepTicks = 0;      // ticks since the last 1px step
+    int lastCell = -1;      // trail cell last worn, so each cell entered is worn once
+    int dustTicks = 0;
+};
+vector<townCart> townCarts;
+vector<hostDust> townCartDusts;   // faint wheel dust; capped at kTownCartDustMax, aged in drawn frames
+
+// R69-F1b: one tick of every town's cart, after townGrow() and independent of it. A town without a cart gets one at
+// its mother crate; a cart whose town is gone hands its load back and is dropped.
+void townCartTick(const vector<barb>& barbs) {
+    int pop[raceCount] = {};
+    if (!towns.empty()) for (auto& b : barbs) pop[clampRace(b.race)]++;
+    for (auto& t : towns) {
+        bool have = false;
+        for (auto& c : townCarts) if (c.townId == t.id) { have = true; break; }
+        if (have) continue;
+        townCart c;
+        c.townId = t.id;
+        c.race = t.race;
+        c.pos = snapPx(storehousePos[clampRace(t.race)] + kTownCartStandOffset);
+        townCarts.push_back(c);
+    }
+    for (int i = (int)townCarts.size() - 1; i >= 0; i--) {
+        townCart& c = townCarts[i];
+        int ti = -1;
+        for (int k = 0; k < (int)towns.size() && ti < 0; k++) if (towns[k].id == c.townId) ti = k;
+        if (ti < 0) {
+            stock[clampRace(c.race)].food += c.load;   // the load goes back to the mother's larder
+            swapRemove(townCarts, i);
+            continue;
+        }
+        Town& t = towns[ti];
+        int r = clampRace(t.race);
+        Vector2f goal = snapPx((c.outbound ? t.crate : storehousePos[r]) + kTownCartStandOffset);
+        if (!c.rolling) {
+            if (++c.waitTicks < kTownCartWaitTicks) continue;
+            if (!c.outbound) {   // at the mother crate: load the tithe, or keep standing while the larder is at its floor
+                if (!townTitheOk(r, pop[r])) { c.waitTicks = 0; continue; }
+                stock[r].food -= kTownGrainOutflow;
+                c.load = kTownGrainOutflow;
+            }
+            c.outbound = !c.outbound;
+            c.rolling = true;
+            c.waitTicks = c.stepTicks = 0;
+            continue;
+        }
+        int lim = stepLimit();   // a barb's pace: slowed in rain and on water, sped by worn road
+        if (riverPlaced) {
+            int cell = riverCellAt(c.pos);
+            riverCell rc = riverWet[cell];
+            if (seaBlocked(cell) || (rc != riverCell::dry && rc != riverCell::bridge)) lim *= kFordWadeMult;
+        }
+        int tc = trailCell(c.pos);
+        if (tc >= 0 && lim == stepLimit()) lim = max(1, lim - trailSpeedBonus[trailTier[tc]]);
+        if (++c.stepTicks < lim) continue;
+        c.stepTicks = 0;
+        Vector2f d = goal - c.pos;
+        float len = hypot(d.x, d.y);
+        c.pos = len <= 1.0f ? goal : c.pos + d / len;   // straight line, 1px a step
+        int cell = trailCell(c.pos + kTownCartSize / 2.0f);
+        if (cell >= 0 && cell != c.lastCell) {   // the walk wears the road: once per cell entered
+            c.lastCell = cell;
+            trailWear[cell] = min(trailMaxWear, trailWear[cell] + kTownCartWearPerCell);
+            trailSetTier(cell);
+        }
+        if (++c.dustTicks >= kTownCartDustEveryTicks && (int)townCartDusts.size() < kTownCartDustMax) {
+            c.dustTicks = 0;
+            Vector2f back = len > 0.0f ? d / len * -(kTownCartSize.x + 1.0f) : Vector2f();   // just clear of the body, behind it
+            townCartDusts.push_back(hostDust{snapPx(c.pos + Vector2f(0.5f, kTownCartSize.y - 1.0f) + back), kTownCartDustFrames});
+        }
+        if (c.pos != goal) continue;
+        c.rolling = false;
+        c.waitTicks = 0;
+        if (c.outbound && c.load > 0) {   // at the town crate: the grain goes into the race's larder there
+            stock[r].food += c.load;
+            t.flashFrames = storehouseFlashFrames;
+            printf("TOWN CART - %s New Town %d unloads %d food (food %d)\n", raceDefs[r].name, t.id, c.load, stock[r].food);
+            c.load = 0;
+        }
+    }
+}
+
+// R69-F1b: the carts and their wheel dust, on the ground under the barbs (after the trek's dust). 2x2 pale cyan-white
+// body with a 1px grain pip on its top-right while laden; the dust is a faint 1x1 dot fading out.
+void drawTownCarts(RenderWindow& window, bool paused) {
+    if (townCarts.empty() && townCartDusts.empty()) return;
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (auto& p : townCartDusts) {
+        Color c = kTownDustColor;
+        c.a = (uint8_t)(kTownCartDustAlpha * p.frames / kTownCartDustFrames);
+        pushQuad(va, p.pos, Vector2f(1.0f, 1.0f), c);
+    }
+    for (auto& c : townCarts) {
+        Vector2f p = snapPx(c.pos);
+        pushQuad(va, p, kTownCartSize, kTownCartColor);
+        if (c.load > 0) pushQuad(va, p + Vector2f(kTownCartSize.x - 1.0f, -1.0f), Vector2f(1.0f, 1.0f), kTownCartGrainColor);
+    }
+    window.draw(va);
+    if (paused) return;
+    for (int i = (int)townCartDusts.size() - 1; i >= 0; i--)
+        if (--townCartDusts[i].frames <= 0) swapRemove(townCartDusts, i);
+}
+
 // R66-F1: after expeditionTick(). Re-resolves every founder by id; a missing, dead, released or re-raced founder (or a
 // trek past kTownTrekMaxTicks, or a site spoiled on arrival) fails quietly with the wood refunded. Founders walk with
 // the expedition walk and leave a dust trail; once all stand at the site the crate and houses rise, the founders move
 // in, their flag clears, and the one ticker line goes out. R69-F1: townGrow() runs first, every tick, trek or not.
 void townTick(vector<barb>& barbs, vector<RectangleShape>& squares, vector<house>& houses, vector<RectangleShape>& houseshapes) {
     townGrow(barbs, houses, houseshapes);
+    townCartTick(barbs);   // R69-F1b: the supply carts, independent of growth
     if (!trek.active) return;
     int r = clampRace(trek.race);
     int idx[kTownFounders];
@@ -25018,6 +25153,7 @@ int main() {
         drawHostGround(window);   // R61-F2: a broken host's dropped banner, on the ground under the barbs
         drawFootprints(window, camRect);   // R63-F1: faint snow prints, directly under the barbs
         drawTownDust(window, paused);   // R66-F1: the founders' dust trail, under the barbs
+        drawTownCarts(window, paused);   // R69-F1b: supply carts and their wheel dust, on the ground under the barbs
         drawBarbs(window, barbs, squares, frameCount, zoom);
         drawTitlePips(window, camRect, zoom);   // R56-F3: pale 1px pip over titled barbs, capped
         for (auto& b : barbs) if (b.raidFlash > 0 && !paused) b.raidFlash--;   // R52-F1: the hit flash lasts 2 drawn frames
