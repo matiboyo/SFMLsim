@@ -1222,6 +1222,45 @@ const Color kSeaRaiderColor(122, 156, 178);          // steel-blue cloak: apart 
 const Color kSeaRaiderHelmColor(196, 202, 206);      // pale iron helm row, drawn again above the night overlay
 const Color kSeaRaiderFlashColor(255, 255, 255);
 const Color kSeaRaidTickerTint(150, 184, 206);       // landing ticker line, the raiders' steel-blue lifted for the black strip
+// R66-F2 Jetties and Fishing Boats, phase 1: the race whose quarter lies nearest the sea is the coastal race. Its jetty
+// site (a coast column deep and even enough for the deck, the mooring and the row out) is scanned once and cached.
+// With kJettyMinHouses houses a builder raises a 12x3 plank jetty through buildOneOff (jobJetty) and one dark-hulled
+// 7x3 boat is moored at its sea end. Each dawn one fisher (activity actFisher, owned by jettyTick(), so never chopping or
+// building) walks to the jetty, boards, rows out, casts and rows home to land kBoatCatchFood. A beached longship holes
+// the boat nearest its strand (one line in seaRaidTick(), boat looked up by stable id); a holed boat sits low with a red
+// stripe for kBoatRebuildTicks, then is rebuilt. One ticker line per loss. Shore angling never needs a jetty or a boat.
+const int kJettyMinHouses = 4;                       // houses of its own before the coastal race builds the jetty
+const int kJettyWoodCost = 30;                       // paid at claim, with a house's wood kept back
+const int kJettyBuildTicks = 700;
+const int kJettyMinSeaCells = 4;                     // coast column at least this deep (32px): deck, mooring and row out stay at sea
+const int kJettyEdgeCells = 6;                       // site columns keep this many cells off the map corners...
+const int kJettyRiverCells = 6;                      // ...and this many off the river band at the strand row
+const float kJettyLengthPx = 12.0f;                  // deck length out from the strand (kJettyLandPx of it on the sand)
+const float kJettyWidthPx = 3.0f;
+const float kJettyLandPx = 2.0f;
+const float kJettyStandInlandPx = 4.0f;              // builder and fisher stand this far inland of the waterline
+const Vector2f kBoatSize(7.0f, 3.0f);                // side view: gunwale, hull, keel rows
+const float kBoatRowOutPx = 12.0f;                   // rowed this far out from the mooring to fish
+const int kBoatRowStepTicks = 30;                    // ticks per 1px rowed (~6s out at 1x)
+const int kBoatBoardStepTicks = 10;                  // ticks per 1px walked along the deck, boarding or landing
+const int kBoatCastTicks = 1800;                     // ticks fishing out at sea (~30s at 1x)
+const int kBoatCatchFood = 6;                        // food landed per trip (an angler lands 1 per catch)
+const int kBoatWalkMaxTicks = 2 * ticksPerGameHour;  // backstop on the walk to the jetty
+const int kBoatRebuildTicks = 24 * ticksPerGameHour; // a holed boat is rebuilt after a day
+const int kBoatWakeFrames = 60;                      // a wake ripple spreads and fades over this many drawn frames
+const int kBoatWakeMax = 16;
+const float kBoatWakeAlpha = 140.0f;
+const int kBoatOarStrokeFrames = 12;                 // oar blade dips and lifts on this beat while rowing
+const Color kJettyPlankColor(138, 112, 80);          // weathered planks, lighter than the hulls so the boat reads beside it
+const Color kJettySeamColor(104, 82, 58);
+const Color kJettyPostColor(70, 54, 40);             // piling heads at the sea end
+const Color kBoatHullColor(46, 36, 30);              // dark tarred hull, darker than the longship (84, 62, 46)
+const Color kBoatGunwaleColor(96, 76, 58);           // lighter top strake so the hull edge reads on the sea
+const Color kBoatOarColor(160, 138, 104);
+const Color kBoatHoledStripeColor(176, 62, 52);      // muted red, below the raid red (226, 50, 44)
+const Color kBoatHoleColor(30, 44, 62);              // dark sea showing through the hole
+const Color kBoatWakeColor(214, 226, 232);           // pale wake, alpha faded
+const Color kBoatLineColor(200, 210, 214, 150);      // translucent fishing line from the rod tip into the sea
 // R54-F1 Caravans and Coin, phase 1: a race with a spare stock sends one two-barb caravan (held by barb id, owned by
 // caravanTick()) along the route planner to a rival crate that is not cold. There the pair swaps one lot each of a
 // surplus kind, the relation warms, and a pair at or above kRelFriendlyMinRelation becomes "friendly" for
@@ -3125,8 +3164,8 @@ static_assert(weaponTierBonus[0] == 0, "an untiered weapon hits for its base dam
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
 // jobPave (R20-F2) is run by paveTick(): movingbspot while walking, building/timer while laying the cobbles.
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, jobHerbHut, jobLoreHall, jobWonder, jobBridge, buildJobCount};
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks, herbHutBuildTicks, loreHallBuildTicks, wonderBuildTicks, kBridgeBuildTicks};
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, jobHerbHut, jobLoreHall, jobWonder, jobBridge, jobJetty, buildJobCount};   // R66-F2: jobJetty
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks, herbHutBuildTicks, loreHallBuildTicks, wonderBuildTicks, kBridgeBuildTicks, kJettyBuildTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
 enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
@@ -4415,7 +4454,7 @@ enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
 // R53-F4: the one exclusive state a barb is in (work flags like chopping/building stay separate). Set only by
 // beginActivity(), cleared only by endActivity(), which also runs the activity's cleanup.
 enum barbActivity { actNone, actShelter, actExpedition, actRaidAttack, actRaidDefend, actTemper, actSmelt, actDrill, actWatch,
-                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, actHeal, actHost, actHollowHunt, actGather, actFound, activityCount };   // R66-F1: actFound = a founder on the trek to a daughter town   // R63-F5a: actGather = called to a gathering (gatherIdleAt)   // R62-F3b: actHollowHunt = a joint wyrm hunter   // R61-F2: actHost = a field host fighter. R60-F2: actHeal = an elf walking to cure a patient   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
+                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, actHeal, actHost, actHollowHunt, actGather, actFound, actFisher, activityCount };   // R66-F2: actFisher = the jetty boat's fisher   // R66-F1: actFound = a founder on the trek to a daughter town   // R63-F5a: actGather = called to a gathering (gatherIdleAt)   // R62-F3b: actHollowHunt = a joint wyrm hunter   // R61-F2: actHost = a field host fighter. R60-F2: actHeal = an elf walking to cure a patient   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
 struct activityDef {
     const char* name;
     bool ownsBarb;    // its tick owns the barb outright: every job selector skips it (barbAvailable() false)
@@ -4444,6 +4483,7 @@ const activityDef activityDefs[activityCount] = {
     {"wyrm hunt",     true,  false, false},  // R62-F3b: huntTick() owns the hunter from muster to release
     {"gathering",     false, false, true},   // R63-F5a: low priority: any claim or draft ends it; gatherTick() walks it
     {"founding",      true,  false, false},  // R66-F1: townTick() owns the founder from launch to arrival or failure
+    {"boat fishing",  true,  false, false},  // R66-F2: jettyTick() owns the fisher from the dawn pick to the landing
 };
 
 // R62-F3b: what a hunter was doing when the hunt took it. Written only by the muster, read by releaseHuntBarb(), wiped
@@ -5302,6 +5342,7 @@ void endActivity(barb& b) {
         case actEnvoy:       // R56-F2: the coin stays in the purse until arrival; envoyTick() resets the walk
         case actProcession:  // R59-F1: the trip lives on the marriage entry; marriageTick() resets the walk
         case actFound:       // R66-F1: the trek lives on townTrek; endTownTrek() resets the walk
+        case actFisher:      // R66-F2: the trip lives on the boat; jettyTick() re-resolves the fisher by id and frees the boat
         case actNone:
         case activityCount:
             break;
@@ -5497,6 +5538,56 @@ struct seaRaider {
 };
 vector<seaRaider> seaRaiders;
 int nextSeaRaiderId = 0;
+// R66-F2: one vector of jetties, each with its one embedded boat. Boats hold their jetty's stable id and have a stable
+// id of their own (the longship looks a boat up by it); the fisher is held by barb id and re-resolved every tick.
+enum boatState { boatAfloat, boatFishing, boatHoled };
+enum boatTrip { tripNone, tripWalk, tripBoard, tripOut, tripCast, tripBack, tripLand };   // tripBoard..tripLand = on the deck or aboard
+struct fishingBoat {
+    int id = -1;
+    int jettyId = -1;         // stable id of the jetty it is moored at
+    boatState state = boatAfloat;
+    boatTrip trip = tripNone;
+    int fisherId = -1;        // barb id (never an index); -1 = no fisher
+    float out = 0.0f;         // px rowed out from the mooring
+    int timer = 0;
+    int holedTicks = 0;       // ticks until a holed boat is rebuilt
+};
+struct jetty {
+    int id = -1;
+    int race = -1;
+    Vector2f deck, deckSize;  // plank deck top-left and size (12x3 or 3x12 with the coast)
+    Vector2f moor;            // boat top-left when moored
+    Vector2f seaward;         // unit step out to sea
+    Vector2f foot;            // strand point at the deck's land end (builder and fisher stand on it)
+    fishingBoat boat;
+};
+vector<jetty> jetties;
+int nextJettyId = 0, nextBoatId = 0;
+struct jettySiteCache { bool scanned = false, found = false; int race = -1; Vector2f deck, deckSize, moor, seaward, foot; };
+jettySiteCache jettySite;     // the coastal race's one site, scanned once by scanJettySite()
+struct boatWake { Vector2f c; bool horiz; int frames; };
+vector<boatWake> boatWakes;   // capped at kBoatWakeMax, aged in drawn frames
+int findJettyByBoatId(int boatId) {
+    if (boatId < 0) return -1;
+    for (int k = 0; k < (int)jetties.size(); k++) if (jetties[k].boat.id == boatId) return k;
+    return -1;
+}
+// R66-F2: tooltip words for a fisher, from its boat's trip
+const char* fisherTaskName(int barbId) {
+    for (auto& j : jetties) {
+        if (j.boat.fisherId != barbId) continue;
+        switch (j.boat.trip) {
+            case tripWalk:  return "boat fishing: to the jetty";
+            case tripBoard: return "boat fishing: boarding";
+            case tripOut:   return "boat fishing: rowing out";
+            case tripCast:  return "fishing from the boat";
+            case tripBack:  return "boat fishing: rowing home";
+            case tripLand:  return "boat fishing: landing the catch";
+            case tripNone:  break;
+        }
+    }
+    return "boat fishing";
+}
 // R61-F1: the one wyrm (a single global, nothing to swapRemove). id is stable for its life and fresh on each waking; the
 // house it hunts is held by house id and re-resolved every tick. Never saved: awake is re-derived from hollowLootLeft.
 enum wyrmPhase { wyrmLair, wyrmHunt, wyrmLoiter, wyrmRetreat };
@@ -5959,7 +6050,7 @@ int treeAtWorkSpot(const vector<CircleShape>& tris, int x, int y) {
 }
 
 // R44-F2: no task stripe -> idle. Shared by barbColor() and the H beacons so both agree on who is jobless
-bool barbIdle(const barb& b) { return !b.deertargeting && !b.building && !atForgeTask(b) && !b.chopping; }   // R47-F7: or smelting
+bool barbIdle(const barb& b) { return !b.deertargeting && !b.building && !atForgeTask(b) && !b.chopping && b.activity != actFisher; }   // R47-F7: or smelting; R66-F2: or boat fishing
 
 // Priority when flags overlap: hunting > building > picking > harvesting > fishing > mining > chopping > idle
 Color barbColor(const barb& b) {
@@ -5968,6 +6059,7 @@ Color barbColor(const barb& b) {
     if (b.building) return barbBuildColor;
     if (b.activity == actTemper) return barbMineColor;   // R41-F2: pick work at the forge; never overlaps chopping/building
     if (b.activity == actSmelt) return barbMineColor;    // R47-F7: stone work at the forge, same stripe
+    if (b.activity == actFisher) return barbFishColor;   // R66-F2: the boat fisher wears the angler's stripe
     if (b.chopping && b.target == targetBush) return barbPickColor;
     if (b.chopping && b.target == targetField) return barbHarvestColor;
     if (b.chopping && b.target == targetLake) return barbFishColor;
@@ -6003,6 +6095,7 @@ const char* barbTaskName(const barb& b) {
         return marriage.phase == marriageTrip::Home ? "wedding procession: heading home"
              : marriage.memberIds[0] == b.id ? "wedding procession: the bride" : "wedding procession: escort";
     if (b.activity == actFound) return "founding a new town";   // R66-F1
+    if (b.activity == actFisher) return fisherTaskName(b.id);   // R66-F2
     if (b.deertargeting) return b.hasSpear ? weaponOf(b).huntLabel : "hunting";   // R47-F8: "hunting (axe)" for dwarves
     if (b.building) return "building";
     if (b.activity == actTemper) return "tempering pick";   // R41-F2
@@ -16677,6 +16770,31 @@ void liftSeaLoot(seaRaider& r) {
     printf("SEA LOOT LIFTED - raider %d lifts %s from the %s\n", r.id, lootText(got).c_str(), racePlurals[def]);
 }
 
+// R66-F2: stable id of the boat whose jetty foot lies nearest p; -1 with no jetty
+int nearestBoatId(Vector2f p) {
+    int best = -1;
+    float bestDSq = 0.0f;
+    for (auto& j : jetties) {
+        Vector2f d = j.foot - p;
+        float dSq = d.x * d.x + d.y * d.y;
+        if (best < 0 || dSq < bestDSq) { best = j.boat.id; bestDSq = dSq; }
+    }
+    return best;
+}
+// R66-F2: the landing holes a boat, looked up by its stable id; skipped if it is missing or already holed. A fisher
+// aboard or on the way is sent back to idle by jettyTick() on its next tick. One ticker line per loss.
+void seaRaidHoleBoat(int boatId) {
+    int k = findJettyByBoatId(boatId);
+    if (k < 0 || jetties[k].boat.state == boatHoled) return;
+    fishingBoat& bt = jetties[k].boat;
+    int r = clampRace(jetties[k].race);
+    bt.state = boatHoled;
+    bt.holedTicks = kBoatRebuildTicks;
+    printf("BOAT HOLED - sea raiders hole the %s boat %d at jetty %d%s\n", racePlurals[r], bt.id, jetties[k].id,
+           bt.fisherId >= 0 ? " (its fisher turns back)" : "");
+    logEvent(string("Sea raiders hole the ") + racePlurals[r] + "' fishing boat at the jetty", kSeaRaidTickerTint);
+}
+
 // R65-F1: runs right after raidTick(). The dusk roll and the sail in; the landing (one ticker line); every raider's
 // walk, lift, flight and boarding (backward over seaRaiders, so swapRemove only pulls in a visited raider; the ship is
 // re-checked by id every tick and a raider whose ship is gone is stranded); then the ship's exit: away with anyone
@@ -16726,6 +16844,7 @@ void seaRaidTick(const vector<barb>& barbs) {
                    s.strand.y, kSeaRaiderCount, racePlurals[race]);
             logEvent(string("A longship beaches on the ") + dir + " strand - raiders make for the " + racePlurals[race],
                      kSeaRaidTickerTint);
+            seaRaidHoleBoat(nearestBoatId(s.strand));   // R66-F2: the landing holes the nearest fishing boat (skipped if holed or missing)
         }
     }
 
@@ -16917,6 +17036,216 @@ void drawSeaRaidOverlay(RenderWindow& window, const View& worldView, int frame) 
     }
     if (glow.getVertexCount() > 0) window.draw(glow, BlendAdd);
     if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R66-F2: boat top-left now (moored plus the row out), the fisher's stand spot on the strand and its seat in the boat
+// (feet on the gunwale row, centred on the 7px hull), all as hitbox top-lefts for a hitbox of size sz
+Vector2f boatPos(const jetty& j) { return snapPx(j.moor + j.seaward * j.boat.out); }
+Vector2f jettyStandSpot(const jetty& j, Vector2f sz) { return snapPx(j.foot - sz / 2.0f); }
+Vector2f boatSeat(const jetty& j, Vector2f sz) {
+    return boatPos(j) + Vector2f(floor((kBoatSize.x - sz.x) / 2.0f), 1.0f - sz.y);
+}
+// R66-F2: a pale wake ripple behind a boat moving along m (capped; dashes run across the motion)
+void pushBoatWake(const jetty& j, Vector2f m) {
+    if ((int)boatWakes.size() >= kBoatWakeMax) return;
+    Vector2f c = boatPos(j) + kBoatSize / 2.0f;
+    float half = m.x != 0.0f ? kBoatSize.x / 2.0f : kBoatSize.y / 2.0f;
+    boatWakes.push_back(boatWake{snapPx(c - m * (half + 1.0f)), m.x == 0.0f, kBoatWakeFrames});
+}
+// R66-F2: the one way a boat trip ends (landed, lost fisher, holed boat, too long a walk). A fisher still aboard or on the
+// deck is set down on the strand at the jetty's foot; its walk is reset and its flag cleared; the boat is moored again.
+void releaseFisher(vector<barb>& barbs, vector<RectangleShape>& squares, jetty& j, const char* why) {
+    fishingBoat& bt = j.boat;
+    int i = findBarbById(barbs, bt.fisherId);
+    if (i >= 0 && i < (int)squares.size()) {
+        if (bt.trip >= tripBoard) squares[i].setPosition(jettyStandSpot(j, squares[i].getSize()));
+        if (barbs[i].activity == actFisher) {
+            expeditionReset(barbs[i]);
+            endActivity(barbs[i], actFisher);
+        }
+    }
+    printf("FISHER RELEASED - barb %d leaves the %s boat %d (%s)\n", bt.fisherId, racePlurals[clampRace(j.race)], bt.id, why);
+    bt.fisherId = -1;
+    bt.trip = tripNone;
+    bt.out = 0.0f;
+    bt.timer = 0;
+    if (bt.state == boatFishing) bt.state = boatAfloat;
+}
+
+// R66-F2: at dawn, each afloat boat with no fisher takes the nearest free grown barb of its race (the expedition's idle,
+// fed and healthy rules, so never one chopping or building) unless the race's bell is ringing
+void jettyDawn(vector<barb>& barbs, vector<RectangleShape>& squares) {
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (auto& j : jetties) {
+        fishingBoat& bt = j.boat;
+        int r = clampRace(j.race);
+        if (bt.state != boatAfloat || bt.fisherId >= 0 || raceBell[r] > 0) continue;
+        int i = findNearest(quarterCentre(r), worldSize, n, [&](int k) { return squares[k].getPosition(); },
+                            [&](int k) {
+                                const barb& b = barbs[k];
+                                return !(barbAvailable(b) && expeditionEligible(b, r) && lifeStage(b) == stageAdult);
+                            });
+        if (i < 0) { printf("BOAT IDLE - no free %s fisher at dawn\n", raceDefs[r].name); continue; }
+        barb& b = barbs[i];
+        expeditionReset(b);
+        beginActivity(b, actFisher);
+        b.order = needNone;
+        b.orderTicks = 0;
+        bt.fisherId = b.id;
+        bt.trip = tripWalk;
+        bt.timer = 0;
+        bt.out = 0.0f;
+        printf("BOAT FISHER - %s (%s) walks to the jetty at (%.0f, %.0f)\n", b.name, racePlurals[r], j.foot.x, j.foot.y);
+    }
+}
+
+// R66-F2: runs right after seaRaidTick(). A holed boat sends its fisher back to idle and counts down to its rebuild.
+// Otherwise the fisher is re-resolved by id (a missing, dead, released or re-raced one frees the boat) and taken
+// through the trip: walk to the jetty, along the deck, row out, cast, row home, along the deck and land the catch.
+void jettyTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
+    for (auto& j : jetties) {
+        fishingBoat& bt = j.boat;
+        int r = clampRace(j.race);
+        if (bt.state == boatHoled) {
+            if (bt.fisherId >= 0) releaseFisher(barbs, squares, j, "the boat is holed");
+            bt.out = 0.0f;
+            if (--bt.holedTicks <= 0) {
+                bt.state = boatAfloat;
+                printf("BOAT REBUILT - the %s boat %d is afloat again at jetty %d\n", racePlurals[r], bt.id, j.id);
+            }
+            continue;
+        }
+        if (bt.fisherId < 0) continue;
+        int i = findBarbById(barbs, bt.fisherId);
+        if (i < 0 || i >= (int)squares.size() || barbs[i].activity != actFisher || barbs[i].race != r || barbs[i].health <= 0) {
+            releaseFisher(barbs, squares, j, "the fisher is lost");
+            continue;
+        }
+        barb& b = barbs[i];
+        RectangleShape& sq = squares[i];
+        Vector2f sz = sq.getSize();
+        // 1px per kBoatBoardStepTicks: boarding walks out along the deck first, then steps across into the boat; landing
+        // steps back onto the deck first, then walks in. True = standing at goal.
+        auto deckStep = [&](Vector2f goal, bool alongFirst) {
+            Vector2f d = goal - sq.getPosition();
+            if (fabs(d.x) < 0.5f && fabs(d.y) < 0.5f) { sq.setPosition(goal); return true; }
+            if (++bt.timer >= kBoatBoardStepTicks) {
+                bt.timer = 0;
+                Vector2f m(clamp(d.x, -1.0f, 1.0f), clamp(d.y, -1.0f, 1.0f));
+                bool alongX = j.seaward.x != 0.0f;
+                float alongLeft = alongX ? m.x : m.y, acrossLeft = alongX ? m.y : m.x;
+                bool stepAlong = alongFirst ? fabs(alongLeft) > 0.0f : fabs(acrossLeft) == 0.0f;
+                if (stepAlong) m = alongX ? Vector2f(m.x, 0.0f) : Vector2f(0.0f, m.y);
+                else m = alongX ? Vector2f(0.0f, m.y) : Vector2f(m.x, 0.0f);
+                sq.setPosition(sq.getPosition() + m);
+            }
+            return false;
+        };
+        switch (bt.trip) {
+            case tripWalk:
+                if (++bt.timer > kBoatWalkMaxTicks) { releaseFisher(barbs, squares, j, "the jetty is too far"); continue; }
+                if (expeditionWalk(b, sq, jettyStandSpot(j, sz))) {
+                    bt.trip = tripBoard;
+                    bt.state = boatFishing;
+                    bt.timer = 0;
+                }
+                break;
+            case tripBoard:
+                if (deckStep(boatSeat(j, sz), true)) {
+                    bt.trip = tripOut;
+                    bt.timer = 0;
+                    printf("BOAT OUT - %s rows the %s boat %d out\n", b.name, racePlurals[r], bt.id);
+                }
+                break;
+            case tripOut:
+                if (++bt.timer >= kBoatRowStepTicks) {
+                    bt.timer = 0;
+                    bt.out = min(bt.out + 1.0f, kBoatRowOutPx);
+                    pushBoatWake(j, j.seaward);
+                    if (bt.out >= kBoatRowOutPx) bt.trip = tripCast;
+                }
+                break;
+            case tripCast:
+                if (++bt.timer >= kBoatCastTicks) { bt.trip = tripBack; bt.timer = 0; }
+                break;
+            case tripBack:
+                if (++bt.timer >= kBoatRowStepTicks) {
+                    bt.timer = 0;
+                    bt.out = max(bt.out - 1.0f, 0.0f);
+                    pushBoatWake(j, -j.seaward);
+                    if (bt.out <= 0.0f) bt.trip = tripLand;
+                }
+                break;
+            case tripLand:
+                if (deckStep(jettyStandSpot(j, sz), false)) {
+                    stockOfRace(r).food += kBoatCatchFood;
+                    printf("BOAT CATCH - %s lands %d fish for the %s (food %d)\n", b.name, kBoatCatchFood, racePlurals[r], stockOfRace(r).food);
+                    releaseFisher(barbs, squares, j, "catch landed");
+                    continue;
+                }
+                break;
+            case tripNone:
+                releaseFisher(barbs, squares, j, "no trip");
+                continue;
+        }
+        if (bt.trip == tripOut || bt.trip == tripCast || bt.trip == tripBack) sq.setPosition(boatSeat(j, sz));
+    }
+}
+
+// R66-F2: world layer, under the sea raid and the barbs (the fisher stands in the boat over its hull). Plank deck with
+// seams and dark piling heads at the sea end; the boat in side view (lighter gunwale, dark hull, keel), an oar blade
+// dipping while rowing and a rod and line while casting. Holed: one row lower with the keel under water, the gunwale a
+// red stripe and a dark hole in the hull. Wake ripples widen and fade (aged here in drawn frames).
+void drawJetties(RenderWindow& window, int frame, bool paused) {
+    if (jetties.empty() && boatWakes.empty()) return;
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (auto& j : jetties) {
+        Vector2f d = snapPx(j.deck);
+        pushQuad(va, d, j.deckSize, kJettyPlankColor);
+        bool alongX = j.seaward.x != 0.0f;   // the deck runs along x
+        float len = alongX ? j.deckSize.x : j.deckSize.y;
+        for (float s = 2.0f; s < len - 1.0f; s += 3.0f)   // a seam every third px across the deck
+            pushQuad(va, d + (alongX ? Vector2f(s, 0.0f) : Vector2f(0.0f, s)), alongX ? Vector2f(1.0f, j.deckSize.y) : Vector2f(j.deckSize.x, 1.0f), kJettySeamColor);
+        Vector2f endLo = d + Vector2f(j.seaward.x > 0.0f ? j.deckSize.x - 1.0f : 0.0f, j.seaward.y > 0.0f ? j.deckSize.y - 1.0f : 0.0f);
+        Vector2f across = alongX ? Vector2f(0.0f, j.deckSize.y - 1.0f) : Vector2f(j.deckSize.x - 1.0f, 0.0f);
+        pushQuad(va, endLo, Vector2f(1.0f, 1.0f), kJettyPostColor);
+        pushQuad(va, endLo + across, Vector2f(1.0f, 1.0f), kJettyPostColor);
+
+        const fishingBoat& bt = j.boat;
+        Vector2f o = boatPos(j);
+        if (bt.state == boatHoled) {
+            o.y += 1.0f;   // sits low: the keel row is under water
+            pushQuad(va, o, Vector2f(kBoatSize.x, 1.0f), kBoatHoledStripeColor);
+            pushQuad(va, o + Vector2f(0.0f, 1.0f), Vector2f(kBoatSize.x, 1.0f), kBoatHullColor);
+            pushQuad(va, o + Vector2f(4.0f, 1.0f), Vector2f(1.0f, 1.0f), kBoatHoleColor);
+            continue;
+        }
+        pushQuad(va, o, Vector2f(kBoatSize.x, 1.0f), kBoatGunwaleColor);
+        pushQuad(va, o + Vector2f(0.0f, 1.0f), Vector2f(kBoatSize.x, 1.0f), kBoatHullColor);
+        pushQuad(va, o + Vector2f(1.0f, 2.0f), Vector2f(kBoatSize.x - 2.0f, 1.0f), kBoatHullColor);
+        if (bt.trip == tripOut || bt.trip == tripBack) {   // oar blades either side, dipping and lifting
+            float y = (frame / kBoatOarStrokeFrames) % 2 == 0 ? 2.0f : 1.0f;
+            pushQuad(va, o + Vector2f(-1.0f, y), Vector2f(1.0f, 1.0f), kBoatOarColor);
+            pushQuad(va, o + Vector2f(kBoatSize.x, y), Vector2f(1.0f, 1.0f), kBoatOarColor);
+        } else if (bt.trip == tripCast) {   // rod up and out past the bow, line down to the water
+            pushQuad(va, o + Vector2f(kBoatSize.x - 1.0f, -2.0f), Vector2f(1.0f, 1.0f), fishRodColor);
+            pushQuad(va, o + Vector2f(kBoatSize.x, -3.0f), Vector2f(1.0f, 1.0f), fishRodColor);
+            pushQuad(va, o + Vector2f(kBoatSize.x + 1.0f, -3.0f), Vector2f(1.0f, 4.0f), kBoatLineColor);
+        }
+    }
+    for (auto& w : boatWakes) {
+        float age = 1.0f - (float)w.frames / kBoatWakeFrames;
+        float half = round(2.0f * age);   // 1px, then 3, then 5 wide
+        Color c = kBoatWakeColor;
+        c.a = (uint8_t)(kBoatWakeAlpha * w.frames / kBoatWakeFrames);
+        Vector2f p = w.horiz ? w.c - Vector2f(half, 0.0f) : w.c - Vector2f(0.0f, half);
+        pushQuad(va, p, w.horiz ? Vector2f(2.0f * half + 1.0f, 1.0f) : Vector2f(1.0f, 2.0f * half + 1.0f), c);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+    if (paused) return;
+    for (int i = (int)boatWakes.size() - 1; i >= 0; i--)
+        if (--boatWakes[i].frames <= 0) swapRemove(boatWakes, i);
 }
 
 // R61-F2: armed, drilled (wears the drill pip), hale, fed and free (raidIdle()); never a leader or the shinobi
@@ -21552,6 +21881,93 @@ void buildbridges(vector<barb>& barbs, vector<RectangleShape>& squares, const ve
     }
 }
 
+// R66-F2: the one scan, run once: every coast column clear of the corners and the river band, at least kJettyMinSeaCells
+// deep and as deep as both neighbours (so the boat beside the deck and its row out stay at sea), with a dry, lake-free
+// strand reachable from a crate. The race whose crate is nearest such a strand is the coastal race; its nearest strand
+// is cached as the site (deck, mooring, seaward step, foot). Found or not, never rescanned.
+void scanJettySite() {
+    if (jettySite.scanned || !riverPlaced) return;
+    jettySite.scanned = true;
+    const int N = trailGridN;
+    const float cell = trailCellSize;
+    float best = numeric_limits<float>::infinity();
+    int bestX = -1;
+    for (int x = kJettyEdgeCells; x < N - kJettyEdgeCells; x++) {
+        int d = seaDepth[x];
+        if (d < kJettyMinSeaCells || seaDepth[x - 1] != d || seaDepth[x + 1] != d) continue;
+        int row = seaLow ? d : N - 1 - d;   // first land row in from the coast
+        int c = riverCellOf(row, x);
+        if (seaBlocked(c) || riverBase[c] != riverCell::dry) continue;
+        if (x >= riverLo[row] - kJettyRiverCells && x <= riverHi[row] + kJettyRiverCells) continue;
+        float wl = seaLow ? d * cell : worldSize - d * cell;
+        Vector2f foot = riverPoint(seaLow ? wl + kJettyStandInlandPx : wl - kJettyStandInlandPx, (x + 0.5f) * cell);
+        if (!lakeClear(FloatRect(foot - Vector2f(4.0f, 4.0f), Vector2f(8.0f, 8.0f)))) continue;
+        for (int r = 0; r < raceCount; r++) {
+            if (!regionReachable(quarterCentre(r), foot)) continue;
+            Vector2f dv = quarterCentre(r) - foot;
+            float dSq = dv.x * dv.x + dv.y * dv.y;
+            if (dSq < best) { best = dSq; bestX = x; jettySite.race = r; }
+        }
+    }
+    if (bestX < 0) { printf("JETTY SITE - no coast column fits a jetty\n"); return; }
+    int x = bestX, d = seaDepth[x];
+    float wl = seaLow ? d * cell : worldSize - d * cell;   // waterline: first land px (low sea) / first sea px (high sea)
+    float sgn = seaLow ? -1.0f : 1.0f;                     // along step out to sea
+    float acrossLo = x * cell + floor((cell - kJettyWidthPx) / 2.0f);
+    float alongLo = seaLow ? wl - (kJettyLengthPx - kJettyLandPx) : wl - kJettyLandPx;
+    jettySite.deck = riverPoint(alongLo, acrossLo);
+    jettySite.deckSize = riverPoint(kJettyLengthPx, kJettyWidthPx);
+    jettySite.seaward = riverPoint(sgn, 0.0f);
+    jettySite.foot = riverPoint(wl - sgn * kJettyStandInlandPx, (x + 0.5f) * cell);
+    float seaEnd = seaLow ? alongLo : alongLo + kJettyLengthPx;   // along px at the deck's sea end edge
+    if (riverVertical)   // coast runs east-west: the boat lies right of the deck, flush with its sea end
+        jettySite.moor = Vector2f(acrossLo + kJettyWidthPx, seaLow ? seaEnd : seaEnd - kBoatSize.y);
+    else                 // coast runs north-south: the boat lies under the deck along its sea end
+        jettySite.moor = Vector2f(seaLow ? seaEnd : seaEnd - kBoatSize.x, acrossLo + kJettyWidthPx);
+    jettySite.deck = snapPx(jettySite.deck);
+    jettySite.moor = snapPx(jettySite.moor);
+    jettySite.found = true;
+    printf("JETTY SITE - the %s are the coastal race: strand at (%.0f, %.0f), %.0fpx from their crate\n",
+           racePlurals[jettySite.race], jettySite.foot.x, jettySite.foot.y, sqrt(best));
+}
+
+// R66-F2: runs after buildbridges(). The coastal race (one jetty, one boat) with a standing crate and kJettyMinHouses
+// houses sends one builder to the strand at the cached site through buildOneOff (jobJetty), paid at claim with a house's
+// wood kept back. The claim is not stored, so a lost builder frees it through releaseBarbWork()'s reset.
+void buildjetties(vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses, const storehouse (&stores)[raceCount]) {
+    scanJettySite();
+    if (!jettySite.found) return;
+    int r = clampRace(jettySite.race);
+    for (auto& j : jetties) if (j.race == r) return;
+    if (!stores[r].built) return;
+    bool claimed = false;
+    for (auto& b : barbs) if (b.jobKind == jobJetty && b.race == r) claimed = true;
+    Vector2f stand = snapPx(jettySite.foot - barbBodySize / 2.0f);
+    bool done = buildOneOff(barbs, squares, claimed, jobJetty, stand, "JETTY",
+        [&](const barb&) {
+            int raceHouses = 0;
+            for (auto& h : houses) if (h.race == r) raceHouses++;
+            if (raceHouses < kJettyMinHouses) return -1;
+            if (!canAfford(stock[r], kJettyWoodCost + houseWoodCost, 0)) return -1;
+            spend(stock[r], kJettyWoodCost, 0);
+            return 1;
+        }, r);
+    if (!done) return;
+    jetty j;
+    j.id = nextJettyId++;
+    j.race = r;
+    j.deck = jettySite.deck;
+    j.deckSize = jettySite.deckSize;
+    j.moor = jettySite.moor;
+    j.seaward = jettySite.seaward;
+    j.foot = jettySite.foot;
+    j.boat.id = nextBoatId++;
+    j.boat.jettyId = j.id;
+    jetties.push_back(j);
+    printf("---JETTY BUILT--- %s jetty %d at (%.0f, %.0f), boat %d moored\n", raceDefs[r].name, j.id, j.foot.x, j.foot.y, j.boat.id);
+    logRaceEvent(string(racePlurals[r]) + " build a jetty and moor a fishing boat", r);
+}
+
 // R47-F6: runs after buildkeeps(). Each race whose keep stands builds one barracks at its fixed spot left of the crate,
 // through buildOneOff (jobBarracks) by a barb of that race, paid at claim with a house's wood and stone kept back. The
 // claim is not stored ("a barb of this race holds jobBarracks"), so a lost builder frees it through releaseBarbWork().
@@ -22404,6 +22820,7 @@ int main() {
                 buildshafts(barbs, squares, stores);   // R34-F1
                 buildcamps(barbs, squares, houses, stores);   // R45-F1b: lean-tos at the ruins
                 buildbridges(barbs, squares, houses, stores);   // R62-F2b: timber bridges over each race's ford
+                buildjetties(barbs, squares, houses, stores);   // R66-F2: the coastal race's jetty and boat
                 buildfield(barbs, squares, houses, shrines, stores, fields);
                 buildmills(barbs, squares, fields);   // FARM-F2
                 buildkeeps(barbs, squares, stores);   // R31-F1: Town era
@@ -22442,6 +22859,7 @@ int main() {
                 huntTick(barbs, squares);   // R62-F3b: the truce's joint Hollow hunt (muster, gather, march, hoard)
                 raidTick(barbs, squares, stores);   // R52-F1: raid march and fight; sets raidThreat[] for bellTick() just below
                 seaRaidTick(barbs);   // R65-F1: longship landing, raiders' walk/lift/flight; removes raiders watchTick() slew
+                jettyTick(barbs, squares);   // R66-F2: boat trips, holed-boat fisher release and rebuild, after the landing
                 caravanTick(barbs, squares, stores);   // R54-F1: caravans, swaps and the friendly timers, once per sim tick
                 campTick(barbs, squares, wd);   // R55-F1: wildfolk hunters, deer trade, trespass and tents
                 exileTick(barbs, squares, stores);     // R54-F3: walks the migrant; an arrival is only queued here...
@@ -22461,6 +22879,7 @@ int main() {
                         exileDawn(barbs, houses, stores);   // R54-F3: the dawn emigration check
                         marriageDawn(barbs, squares, houses, stores);   // R59-F1: a leader's child may set out to wed
                         townDawn(barbs, squares, houses, trees, rocks, bushshapes, stores);   // R66-F1: a crowded race may send founders
+                        jettyDawn(barbs, squares);   // R66-F2: each afloat boat takes a fisher for the day's trip
                     }
                 }
                 vigilTick(barbs, squares);   // R63-F5: after clockk(): the year's first dusk lights the graveside vigil
@@ -22604,6 +23023,7 @@ int main() {
 	drawProwlers(window, prowlers);   // R48-F1: bodies under the night overlay; eyes after it
 	for (auto& p : prowlers) if (p.flashFrames > 0 && !paused) p.flashFrames--;   // R51-F1: the hit flash lasts 2 drawn frames
 	drawWyrm(window, frameCount);   // R61-F1: body under the night overlay; ember eye and hp bar after it
+	drawJetties(window, frameCount, paused);   // R66-F2: jetty deck, boat and wake, under the longship and the barbs (the fisher stands in the boat)
 	drawSeaRaid(window);   // R65-F1: longship + sea raiders, under the night overlay; helms, hp bars and hull flames after it
 
         drawStumps(window, stumps, stumpVerts, camRect);   // R45-F1a: ~12k stumps (R47-F1), only those touching the view
