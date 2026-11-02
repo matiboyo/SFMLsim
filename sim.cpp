@@ -1276,6 +1276,35 @@ const Color kBoatHoledStripeColor(176, 62, 52);      // muted red, below the rai
 const Color kBoatHoleColor(30, 44, 62);              // dark sea showing through the hole
 const Color kBoatWakeColor(214, 226, 232);           // pale wake, alpha faded
 const Color kBoatLineColor(200, 210, 214, 150);      // translucent fishing line from the rod tip into the sea
+// R69-F3 Summer Merchant Cog, phase 1 (coin only): at the first summer dawn of each year with a jetty standing (and no
+// longship on the coast) one merchant cog sails in from the offing and docks beside the jetty, opposite the fishing boat.
+// On docking cogTrade() buys the jetty race's grain (food) above kCogSurplusFloor + its head count, in kTradeLot lots at
+// kPriceNormal coin each (the caravan price), minted into the race's purse: a gold "+Nc" pip rises from the cog. Gold
+// itself is the coin, so the cog never buys it; ingots are deferred until a forge use is defined. The sail furls while
+// docked and is let down again before the cog leaves. The cog is NOT saved (chronicle v7 included): a load resets it to
+// absent, and the year's visit may come again.
+const Vector2f kCogSize(14.0f, 5.0f);                // hull box: gunwale, three strakes, keel; castle, mast and sail rise above
+const float kCogMastPx = 10.0f;                      // mast height above the gunwale
+const float kCogSailW = 7.0f;                        // sail width (centred on the mast) and its rows when let down
+const int kCogSailRows = 5;
+const float kCogDockGapPx = 1.0f;                    // water between the hull and the jetty deck
+const float kCogOffingPx = 24.0f;                    // sails in from (and back out to) this far out to sea, fading
+const int kCogSailTicks = 1200;                      // in or out (~20s at 1x)
+const int kCogDockTicks = 3 * ticksPerGameHour;      // docked (~30 min at 1x): long enough to notice
+const int kCogFurlTicks = 600;                       // the sail furls after docking, and is let down over the same before leaving
+const int kCogSurplusFloor = 20;                     // food kept back above the race's head count; only the rest is sold
+const int kCogMaxLots = 6;                           // lots bought per visit at most
+const int kCogPipFrames = 300;                       // "+Nc" pip life in drawn frames (~5s at 60fps)
+const float kCogPipRisePx = 12.0f;                   // screen px the pip rises over its life
+const unsigned int kCogPipFontSize = 13;
+const Color kCogHullColor(98, 82, 66);               // muted weathered oak, a touch greyer than the longship hull
+const Color kCogGunwaleColor(134, 114, 88);          // lighter top strake and stern castle
+const Color kCogMastColor(70, 56, 44);               // mast and yard
+const Color kCogSailColor(188, 178, 154);            // undyed canvas, paler than the longship's wool
+const Color kCogSailSeamColor(168, 158, 136);        // faint seam row so the sail reads as cloth
+const Color kCogPipColor(240, 222, 150);             // gold, the paid-cart pip's brass
+const Color kCogPipOutlineColor(20, 16, 10);         // dark rim so the pip reads on sea, sand or grass
+const Color kCogTickerTint(206, 190, 136);           // pale brass ticker line for the arrival
 // R66-F3 Sheep Folds and Shepherds, phase 1: with kFoldMinHouses houses a race picks one fold site just outside its house
 // disc (reserved through forgeClear(), its ground cleared through inClearing()) and a builder fences it (jobFold). The
 // fold is penned with a fixed flock of kFlockMax sheep: pale off-white speciesSheep animals in the deer vectors, marked
@@ -5836,6 +5865,20 @@ struct jetty {
 };
 vector<jetty> jetties;
 int nextJettyId = 0, nextBoatId = 0;
+// R69-F3: the one merchant cog. Not saved: a chronicle load resets it to absent.
+enum class cogState { absent, arriving, docked, leaving };   // scoped, so the short names never clash
+struct cog {
+    cogState state = cogState::absent;
+    int jettyId = -1;          // stable id of the jetty it docks at
+    int timer = 0;             // ticks left in the current state (arriving, docked, leaving)
+    int visitYear = -1;        // game year of the last visit: one visit per summer
+    Vector2f dock;             // hull top-left when docked
+    Vector2f seaward;          // unit step out to sea (the offing lies along it)
+    bool faceLeft = false;     // prow toward the strand when the coast runs north-south
+    int pipCoin = 0;           // coin shown in the "+Nc" pip
+    int pipFrames = 0;         // drawn frames the pip has left
+};
+cog merchantCog;
 struct jettySiteCache { bool scanned = false, found = false; int race = -1; Vector2f deck, deckSize, moor, seaward, foot; };
 jettySiteCache jettySite;     // the coastal race's one site, scanned once by scanJettySite()
 struct boatWake { Vector2f c; bool horiz; int frames; };
@@ -10798,6 +10841,7 @@ bool chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
     for (auto& row : relationClashCooldown) for (auto& c : row) c = 0;
     for (int r = 0; r < raceCount; r++) { allyOf[r] = -1; allyBrideId[r] = -1; marriageCooldown[r] = 0; }   // R59-F1: chronicleRestoreBarbs() re-binds
     marriage = marriageTrip{};
+    merchantCog = cog{};   // R69-F3: the cog is never saved; a load sends it away (absent, this year's visit may come again)
     releaseSellswords("the chronicle is restored");   // R65-F2: hunters are never saved; free them before the wars go
     for (auto& w : wars) w = warState{};   // R60-F1: chronicleRestoreWar() re-declares a valid saved war
     for (auto& row : warCooldown) for (auto& c : row) c = 0;
@@ -17681,10 +17725,133 @@ void jettyDawn(vector<barb>& barbs, vector<RectangleShape>& squares) {
     }
 }
 
+// R69-F3: jetty index by stable id, -1 if gone
+int findJettyById(int id) {
+    for (int k = 0; k < (int)jetties.size(); k++) if (jetties[k].id == id) return k;
+    return -1;
+}
+// R69-F3: the cog's hull top-left when docked at j, on the side away from the boat and over the deck's wet end. Coast
+// north-south (deck along x, boat under it): the cog lies above the deck, hull flush with the waterline. Coast east-west
+// (deck along y, boat right of it): the cog lies left of the deck, hull and mast both out over the sea.
+Vector2f cogDockPos(const jetty& j) {
+    float wet = kJettyLengthPx - kJettyLandPx;
+    if (j.seaward.x != 0.0f) {
+        float x = j.seaward.x < 0.0f ? j.deck.x + wet - kCogSize.x : j.deck.x + kJettyLandPx;
+        return snapPx(Vector2f(x, j.deck.y - kCogDockGapPx - kCogSize.y));
+    }
+    float y = j.seaward.y < 0.0f ? j.deck.y + 1.0f : j.deck.y + j.deckSize.y;
+    return snapPx(Vector2f(j.deck.x - kCogDockGapPx - kCogSize.x, y));
+}
+// R69-F3: hull top-left now (out along the offing while arriving or leaving) and its fade (1 docked)
+Vector2f cogPos(const cog& c) {
+    float t = clamp((float)c.timer / kCogSailTicks, 0.0f, 1.0f);
+    float out = c.state == cogState::arriving ? t : c.state == cogState::leaving ? 1.0f - t : 0.0f;
+    return snapPx(c.dock + c.seaward * (kCogOffingPx * out));
+}
+float cogAlpha(const cog& c) {
+    float t = clamp((float)c.timer / kCogSailTicks, 0.0f, 1.0f);
+    return c.state == cogState::arriving ? 1.0f - t : c.state == cogState::leaving ? t : 1.0f;
+}
+// R69-F3: sail rows let down: all of them under way; docked, furled to one row over kCogFurlTicks after docking and let
+// down again over the last kCogFurlTicks before leaving
+int cogSailRows(const cog& c) {
+    if (c.state != cogState::docked) return kCogSailRows;
+    int edge = min(kCogDockTicks - c.timer, c.timer);
+    float f = clamp((float)edge / kCogFurlTicks, 0.0f, 1.0f);
+    return kCogSailRows - (int)round((kCogSailRows - 1) * f);
+}
+
+// R69-F3: the one trade. The cog buys whole kTradeLot lots of the jetty race's grain (food) above kCogSurplusFloor + the
+// race's head count (at most kCogMaxLots), paying kPriceNormal coin per lot into the race's purse (clamped to the purse
+// bound). The stock never goes below the floor, so never negative. Coin only: gold is the coin itself, ingots deferred.
+// Returns the coin paid (0 = nothing to sell).
+int cogTrade(const vector<barb>& barbs, const jetty& j) {
+    int r = clampRace(j.race);
+    int pop = 0;
+    for (auto& b : barbs) if (clampRace(b.race) == r) pop++;
+    raceStock& s = stockOfRace(r);
+    int surplus = max(0, s.food - (kCogSurplusFloor + pop));
+    int lots = min(kCogMaxLots, surplus / kTradeLot);
+    if (lots <= 0) {
+        printf("COG NO TRADE - the %s have no grain to spare (food %d, floor %d)\n", racePlurals[r], s.food, kCogSurplusFloor + pop);
+        return 0;
+    }
+    int sold = lots * kTradeLot;
+    int coin = clamp(lots * kPriceNormal, 0, kChronicleMaxPurse - clamp(purse[r], 0, kChronicleMaxPurse));
+    s.food = max(0, s.food - sold);
+    purse[r] = clamp(purse[r] + coin, 0, kChronicleMaxPurse);
+    if (coin > 0) goldFound = true;
+    printf("---COG TRADE--- the %s sell %d grain to the merchant cog for %dc (food %d, purse %d)\n", racePlurals[r], sold, coin,
+           s.food, purse[r]);
+    return coin;
+}
+
+// R69-F3: called at the top of jettyTick(). Absent: the first summer dawn of a year with a jetty (and no longship about)
+// brings the cog in, with one ticker line. Arriving: sails in and fades up; on docking cogTrade() runs once and a "+Nc"
+// pip rises. Docked for kCogDockTicks (the sail furls, then is let down), then it sails out and is absent again. A jetty
+// gone from under it sends it away at once.
+void cogTick(const vector<barb>& barbs) {
+    static bool wasNight = false;
+    bool night = isNightHour(game_time);
+    bool dawn = wasNight && !night;
+    wasNight = night;
+    cog& c = merchantCog;
+    if (c.state == cogState::absent) {
+        int year = game_day / yearDays;
+        if (!dawn || seasonOf(game_day) != seasonSummer || c.visitYear == year || jetties.empty() || seaShip.phase != shipAway) return;
+        const jetty& j = jetties.front();
+        c.state = cogState::arriving;
+        c.jettyId = j.id;
+        c.timer = kCogSailTicks;
+        c.visitYear = year;
+        c.dock = cogDockPos(j);
+        c.seaward = j.seaward;
+        c.faceLeft = j.seaward.x > 0.0f;   // prow toward the strand
+        c.pipCoin = c.pipFrames = 0;
+        int r = clampRace(j.race);
+        printf("---MERCHANT COG--- sails in to the %s jetty %d, docking at (%.0f, %.0f)\n", racePlurals[r], j.id, c.dock.x, c.dock.y);
+        logEvent(string("A merchant cog sails in to the ") + racePlurals[r] + "' jetty", kCogTickerTint);
+        return;
+    }
+    int k = findJettyById(c.jettyId);
+    if (k < 0) {
+        printf("MERCHANT COG - its jetty %d is gone; it sails away\n", c.jettyId);
+        int year = c.visitYear;
+        c = cog{};
+        c.visitYear = year;
+        return;
+    }
+    if (--c.timer > 0) return;
+    switch (c.state) {
+        case cogState::arriving: {
+            c.state = cogState::docked;
+            c.timer = kCogDockTicks;
+            int coin = cogTrade(barbs, jetties[k]);
+            if (coin > 0) { c.pipCoin = coin; c.pipFrames = kCogPipFrames; }
+            break;
+        }
+        case cogState::docked:
+            c.state = cogState::leaving;
+            c.timer = kCogSailTicks;
+            printf("MERCHANT COG - casts off from jetty %d\n", c.jettyId);
+            break;
+        case cogState::leaving: {
+            printf("MERCHANT COG - gone over the horizon until next summer\n");
+            int year = c.visitYear;
+            c = cog{};
+            c.visitYear = year;
+            break;
+        }
+        case cogState::absent:
+            break;
+    }
+}
+
 // R66-F2: runs right after seaRaidTick(). A holed boat sends its fisher back to idle and counts down to its rebuild.
 // Otherwise the fisher is re-resolved by id (a missing, dead, released or re-raced one frees the boat) and taken
 // through the trip: walk to the jetty, along the deck, row out, cast, row home, along the deck and land the catch.
 void jettyTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
+    cogTick(barbs);   // R69-F3: the summer merchant cog's visit and its one trade
     for (auto& j : jetties) {
         fishingBoat& bt = j.boat;
         int r = clampRace(j.race);
@@ -17816,6 +17983,32 @@ void drawJetties(RenderWindow& window, int frame, bool paused) {
             pushQuad(va, o + Vector2f(kBoatSize.x + 1.0f, -3.0f), Vector2f(1.0f, 4.0f), kBoatLineColor);
         }
     }
+    // R69-F3: the merchant cog in side view, written prow-right and mirrored when it faces left: tapering hull under a
+    // lighter gunwale, raised stern castle and stem, mast and yard, and the undyed sail (one furled row while docked).
+    // Faded along the offing while it sails in or out.
+    if (merchantCog.state != cogState::absent) {
+        const cog& c = merchantCog;
+        float a = cogAlpha(c);
+        auto fa = [&](Color col) { col.a = (uint8_t)(col.a * a); return col; };
+        Vector2f o = cogPos(c);
+        const float w = kCogSize.x;
+        auto at = [&](float x, float y, float sw, float sh, Color col) {
+            pushQuad(va, o + Vector2f(c.faceLeft ? w - x - sw : x, y), Vector2f(sw, sh), fa(col));
+        };
+        const float mastX = floor(w / 2.0f), sailX = mastX - floor(kCogSailW / 2.0f), yardY = 1.0f - kCogMastPx;
+        at(0.0f, 0.0f, w, 1.0f, kCogGunwaleColor);          // gunwale
+        at(0.0f, 1.0f, w, 2.0f, kCogHullColor);             // upper strakes
+        at(1.0f, 3.0f, w - 2.0f, 1.0f, kCogHullColor);      // lower strake
+        at(3.0f, 4.0f, w - 6.0f, 1.0f, kCogHullColor);      // keel
+        at(0.0f, -2.0f, 4.0f, 1.0f, kCogHullColor);         // stern castle rail
+        at(0.0f, -1.0f, 4.0f, 1.0f, kCogGunwaleColor);      // stern castle
+        at(w - 1.0f, -1.0f, 1.0f, 1.0f, kCogHullColor);     // stem head
+        at(mastX, -kCogMastPx, 1.0f, kCogMastPx, kCogMastColor);
+        int rows = cogSailRows(c);
+        for (int k = 0; k < rows; k++)
+            at(sailX, yardY + 1.0f + k, kCogSailW, 1.0f, rows == kCogSailRows && k == kCogSailRows / 2 ? kCogSailSeamColor : kCogSailColor);
+        at(sailX, yardY, kCogSailW, 1.0f, kCogMastColor);  // yard
+    }
     for (auto& w : boatWakes) {
         float age = 1.0f - (float)w.frames / kBoatWakeFrames;
         float half = round(2.0f * age);   // 1px, then 3, then 5 wide
@@ -17828,6 +18021,33 @@ void drawJetties(RenderWindow& window, int frame, bool paused) {
     if (paused) return;
     for (int i = (int)boatWakes.size() - 1; i >= 0; i--)
         if (--boatWakes[i].frames <= 0) swapRemove(boatWakes, i);
+}
+
+// R69-F3: the gold "+Nc" pip over the cog's masthead, in screen space after the world and its overlays and before the
+// HUD (like the town labels), so it keeps its size at any zoom. Held, then fading over the last 40% of its life while it
+// rises kCogPipRisePx; dark-rimmed so it reads on sea or sand. Placed from the text's own bounds; skipped when it would
+// leave the window or reach the HUD strip. Aged here in drawn frames.
+void drawCogPip(RenderWindow& window, const Font& font, const View& worldView, bool paused) {
+    cog& c = merchantCog;
+    if (c.pipFrames <= 0 || c.state == cogState::absent) return;
+    float life = 1.0f - (float)c.pipFrames / kCogPipFrames;   // 0 fresh .. 1 gone
+    float a = life < 0.6f ? 1.0f : clamp((1.0f - life) / 0.4f, 0.0f, 1.0f);
+    Vector2f anchor = cogPos(c) + Vector2f(floor(kCogSize.x / 2.0f) + 0.5f, -kCogMastPx - 1.0f);   // just over the masthead
+    Vector2f s = window.mapPixelToCoords(window.mapCoordsToPixel(anchor, worldView), window.getDefaultView());
+    Text t(font, "+" + to_string(c.pipCoin) + "c", kCogPipFontSize);
+    Color fill = kCogPipColor, rim = kCogPipOutlineColor;
+    fill.a = (uint8_t)(255.0f * a);
+    rim.a = (uint8_t)(220.0f * a);
+    t.setFillColor(fill);
+    t.setOutlineColor(rim);
+    t.setOutlineThickness(1.0f);
+    FloatRect lb = t.getLocalBounds();
+    Vector2f pos(round(s.x - lb.size.x / 2.0f), round(s.y - 2.0f - kCogPipRisePx * life - lb.size.y));
+    Vector2u wsz = window.getSize();
+    if (!paused) c.pipFrames--;
+    if (pos.x < 0.0f || pos.x + lb.size.x > (float)wsz.x || pos.y < hudBarHeight || pos.y + lb.size.y > (float)wsz.y) return;
+    t.setPosition(pos - lb.position);
+    window.draw(t);
 }
 
 // R61-F2: armed, drilled (wears the drill pip), hale, fed and free (raidIdle()); never a leader or the shinobi
@@ -24464,6 +24684,7 @@ int main() {
                     hv.learnable[r][k] = canLearn(r, (techId)k);   // R59-F3
                 }
             drawTownLabels(window, hudFont, worldView);   // R66-F1: over the world and overlays, under every HUD panel
+            drawCogPip(window, hudFont, worldView, paused);   // R69-F3: the cog's "+Nc", same layer as the town labels
             hudRect = drawHud(window, hudFont, hv);
             tickerRect = drawEvents(window, hudFont);
             drawMinimap(window, minimapVerts, worldView, barbs, squares, houses, houseshapes, stores);   // UIO-F1: after the HUD, under tooltips
