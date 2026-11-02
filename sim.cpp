@@ -1261,6 +1261,67 @@ const Color kBoatHoledStripeColor(176, 62, 52);      // muted red, below the rai
 const Color kBoatHoleColor(30, 44, 62);              // dark sea showing through the hole
 const Color kBoatWakeColor(214, 226, 232);           // pale wake, alpha faded
 const Color kBoatLineColor(200, 210, 214, 150);      // translucent fishing line from the rod tip into the sea
+// R66-F3 Sheep Folds and Shepherds, phase 1: with kFoldMinHouses houses a race picks one fold site just outside its house
+// disc (reserved through forgeClear(), its ground cleared through inClearing()) and a builder fences it (jobFold). The
+// fold is penned with a fixed flock of kFlockMax sheep: pale off-white speciesSheep animals in the deer vectors, marked
+// by foldId and told apart only through tame(), so wolves, the deer wander and hunters never touch them. Each day one
+// shepherd (actShepherd, owned by foldTick()) opens the gate, leads the flock out to a pasture and minds it; every sheep
+// follows the one leader target (the shepherd, or the fold when it walks home alone). A sheep whose squared distance
+// from the shepherd passes kSheepTetherDistSq shows "!" and runs back. From kFoldHomeHour (or a bell) the flock walks
+// home, files in through the gate and is penned; the fold lamp burns from then to dawn. No wolves, slaughter, wool or
+// lambs here. Phase 2 (next): wolves take unpenned strays, shipped together with a flock-recovery path (a spring lamb
+// or a restock to kFlockMax), so a flock can always regrow before any wolf can thin it.
+const int kFlockMax = 6;                             // fixed flock size (also the fold's pen slots)
+const int kFoldMinHouses = 3;                        // houses of its own before a race fences a fold
+const int kFoldWoodCost = 15;                        // paid at claim, with a house's wood kept back
+const int kFoldBuildTicks = 500;
+const Vector2f kFoldSize(18.0f, 12.0f);              // fence outer size: 1px wattle round a 16x10 pen
+const float kFoldGateX = 7.0f;                       // gate gap in the bottom rail: x 7..10 from the fence's left edge
+const float kFoldGateW = 4.0f;
+const float kFoldLampH = 4.0f;                       // lamp post rises this far above the top-right corner (head on top)
+const float kFoldClearPx = 3.0f;                     // houses, plots and buildings keep this far off the fold zone
+const float kFoldGateRoomPx = 7.0f;                  // zone reaches this far below the fence: the gate stand spot
+const float kFoldRingPx = 16.0f;                     // fold centre at least this far past the quarter clearing edge...
+const float kFoldRingSpreadPx = 30.0f;               // ...plus up to this much more
+const float kFoldArcRad = 1.4f;                      // site angle within this of straight out from the village
+const int kFoldSiteTries = 80;                       // random spots per scan
+const int kFoldSiteRetryTicks = 600;                 // a failed scan waits this long before the next
+const int kFoldOutHour = nightEndHour + 1;           // the flock goes out from this hour...
+const int kFoldHomeHour = eveningStartHour + 1;      // ...and walks home from this one (penned by dusk); lamp lit until dawn
+const int kFoldPickRetryTicks = 300;                 // a penned flock looks for a shepherd this often by day
+const float kFoldGrazeMinPx = 40.0f;                 // pasture distance from the gate stand
+const float kFoldGrazeMaxPx = 80.0f;
+const float kFoldGrazeArcRad = 1.2f;                 // pasture angle within this of straight out from the crate
+const float kFoldGrazeClearPx = 12.0f;               // pasture box half-size that must be dry and on the map
+const int kFoldGrazeTries = 16;
+const float kShepherdAmblePx = 10.0f;                // the shepherd shifts round the pasture within this...
+const int kShepherdAmbleTicks = 900;                 // ...this often
+const float kSheepTetherPx = 40.0f;                  // stray tether: past this from the shepherd a sheep shows "!" and runs back
+const float kSheepTetherDistSq = kSheepTetherPx * kSheepTetherPx;
+const float kSheepRegroupPx = 12.0f;                 // a stray is back in the flock inside this
+const float kSheepRegroupDistSq = kSheepRegroupPx * kSheepRegroupPx;
+const int kSheepStepTicks = 6;                       // ticks per 1px walking (a little quicker than a barb, so it keeps up)
+const int kSheepRunStepTicks = 2;                    // ticks per 1px running back to the shepherd
+const int kSheepGrazeOneIn = 240;                    // 1-in-N per tick an idle grazer picks a fresh nibble spot
+const float kSheepGrazeSpreadPx = 8.0f;              // nibble spot within this of its place round the shepherd
+const int kSheepStrayOneIn = 20;                     // 1-in-N nibble picks is a long wander instead...
+const float kSheepStrayLegPx = 50.0f;                // ...this long (past the tether, so it ends in a run back)
+const Vector2f kFlockOffsets[kFlockMax] = {          // each sheep's place round the leader (body centre from leader centre)
+    {-7.0f, 4.0f}, {7.0f, 4.0f}, {-4.0f, 9.0f}, {4.0f, 9.0f}, {-11.0f, -1.0f}, {11.0f, -1.0f}};
+const Vector2f kFoldPenSlots[kFlockMax] = {          // sheep body top-left in the pen: 3 columns x 2 rows, clear of the rails
+    {3.0f, 2.0f}, {8.0f, 2.0f}, {13.0f, 2.0f}, {3.0f, 6.0f}, {8.0f, 6.0f}, {13.0f, 6.0f}};
+const Color kSheepWoolColor(234, 228, 204);          // pale cream wool: a wide 3x2 body with a dark face, unlike the tall 2x4 barbs
+const Color kSheepFaceColor(64, 54, 46);             // dark face and legs (wolves are mid grey 150,150,160)
+const Color kFoldWattleColor(146, 116, 76);          // woven rails
+const Color kFoldPostColor(84, 64, 44);              // darker posts at the corners, gate and mid rails
+const Color kFoldGateColor(178, 150, 104);           // closed gate bar, lighter than the rails
+const Color kFoldGroundColor(112, 96, 62, 90);       // trampled pen floor, translucent over the ground
+const Color kFoldLampGlowColor(255, 190, 110);       // soft additive glow round the lit lamp
+const int kFoldLampGlowLayers = 3;
+const float kFoldLampGlowPx = 12.0f;                 // outer layer radius
+const uint8_t kFoldLampGlowAlpha = 14;               // per layer: ~42 at the lamp, faint at the rim
+const Color kSheepStrayMarkColor(250, 214, 90);      // "!" over a stray: warm yellow on the dark green
+const Color kBarbShepherdColor(176, 150, 236);       // shepherd's task stripe: soft lavender, clear of every other stripe
 // R54-F1 Caravans and Coin, phase 1: a race with a spare stock sends one two-barb caravan (held by barb id, owned by
 // caravanTick()) along the route planner to a rival crate that is not cold. There the pair swaps one lot each of a
 // surplus kind, the relation warms, and a pair at or above kRelFriendlyMinRelation becomes "friendly" for
@@ -3164,11 +3225,11 @@ static_assert(weaponTierBonus[0] == 0, "an untiered weapon hits for its base dam
 // Build jobs: which structure a barb's movingbspot/building belongs to. jobNone = no job, or a house (buildhouse()).
 // jobSpear is a craft, not a structure: it uses movingbspot (so no other system grabs the barb) but never building/timer.
 // jobPave (R20-F2) is run by paveTick(): movingbspot while walking, building/timer while laying the cobbles.
-enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, jobHerbHut, jobLoreHall, jobWonder, jobBridge, jobJetty, buildJobCount};   // R66-F2: jobJetty
-const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks, herbHutBuildTicks, loreHallBuildTicks, wonderBuildTicks, kBridgeBuildTicks, kJettyBuildTicks};
+enum buildJob {jobNone, jobShrine, jobSmoke, jobStall, jobForge, jobField, jobSpear, jobPave, jobStore, jobMill, jobKeep, jobShaft, jobCamp, jobBarracks, jobHerbHut, jobLoreHall, jobWonder, jobBridge, jobJetty, jobFold, buildJobCount};   // R66-F2: jobJetty; R66-F3: jobFold
+const int buildJobTicks[buildJobCount] = {houseBuildTicks, shrineBuildTicks, smokehouseBuildTicks, stallBuildTicks, forgeBuildTicks, fieldBuildTicks, spearCraftTicks, paveTicks, storehouseBuildTicks, millBuildTicks, keepBuildTicks, shaftBuildTicks, campBuildTicks, barracksBuildTicks, herbHutBuildTicks, loreHallBuildTicks, wonderBuildTicks, kBridgeBuildTicks, kJettyBuildTicks, kFoldBuildTicks};
 // Game animals share the deer code (deers/deershape vectors); per-species numbers live in speciesDefs below.
 // Sprite offsets are relative to the logic shape (body = hitbox), written for an animal facing right.
-enum animalSpecies {speciesDeer, speciesRabbit, speciesCount};
+enum animalSpecies {speciesDeer, speciesRabbit, speciesSheep, speciesCount};   // R66-F3: speciesSheep (fold flocks only, cap 0)
 enum animalGait {gaitWalk, gaitHop};       // walk: diagonal leg pairs alternate; hop: whole sprite bobs up, back leg pushes off
 const int animalMaxLegs = 4;
 const int animalMaxAccent = 2;
@@ -3212,6 +3273,12 @@ const speciesDef speciesDefs[speciesCount] = {
      gaitHop, 8, 2, {0.0f, 3.0f, 0.0f, 0.0f}, 1.0f, 1.0f, 1.0f,
      {3.0f, -1.0f}, {2.0f, 2.0f}, 2, {{3.0f, -2.0f}, {3.0f, -3.0f}}, 1, {-1.0f, 0.0f},
      Color(216, 194, 150), Color(200, 178, 136), Color(138, 112, 80), Color(176, 136, 118), Color(244, 242, 234)},
+    // R66-F3 Sheep: 3x2 pale wool body, 1px dark face at the front, two dark 1px legs. Cap 0: deerspawn() never adds or
+    // breeds one; only buildfolds() makes them (kFlockMax per fold). Food 0: nothing may kill one in phase 1.
+    {"Sheep", {3.0f, 2.0f}, 30, 0, 0, 1, 0, kSheepStepTicks, kSheepRunStepTicks,
+     gaitWalk, 8, 2, {0.0f, 2.0f, 0.0f, 0.0f}, 1.0f, 0.0f, 0.0f,
+     {3.0f, 0.0f}, {1.0f, 1.0f}, 0, {{0.0f, 0.0f}, {0.0f, 0.0f}}, 0, {0.0f, 0.0f},
+     kSheepWoolColor, kSheepFaceColor, kSheepFaceColor, Color(0, 0, 0), Color(0, 0, 0)},
 };
 const float rabbitBirthOffsetPx = 5.0f;    // kit appears this far beside its parent
 
@@ -3762,6 +3829,40 @@ bool keepClear(const FloatRect& r) {
     return true;
 }
 
+// R66-F3: one fold per race (index = barbRace), in a fixed array, so nothing to swapRemove. placed = site chosen and
+// reserved (forgeClear() keeps buildings off it, inClearing() clears its trees and rocks); id is stable, given when it
+// stands. The shepherd is held by barb id (never an index) and re-resolved every tick. Never saved.
+enum foldPhase { foldPenned, foldFetch, foldOut, foldGraze, foldHome, foldPenning };
+struct sheepFold {
+    int id = -1;
+    bool placed = false, built = false;
+    Vector2f pos;                  // fence top-left
+    foldPhase phase = foldPenned;
+    int shepherdId = -1;
+    Vector2f graze, amble;         // pasture stand spot, and the shepherd's current spot round it (hitbox top-lefts)
+    int ambleTicks = 0;
+    int siteRetry = 0, pickRetry = 0;
+    bool siteLogged = false;       // the "no free spot" line is printed once
+};
+sheepFold folds[raceCount];
+int nextFoldId = 0;
+int findFoldById(int id) {   // index (= race) of the standing fold with this id, -1 = none
+    if (id < 0) return -1;
+    for (int r = 0; r < raceCount; r++) if (folds[r].built && folds[r].id == id) return r;
+    return -1;
+}
+// Fence, lamp post above and the gate stand spot below, padded by kFoldClearPx
+FloatRect foldZone(Vector2f pos) {
+    return FloatRect(pos - Vector2f(kFoldClearPx, kFoldClearPx + kFoldLampH),
+                     kFoldSize + Vector2f(2 * kFoldClearPx, 2 * kFoldClearPx + kFoldLampH + kFoldGateRoomPx));
+}
+// False if r touches any placed fold's zone
+bool foldClear(const FloatRect& r) {
+    for (auto& f : folds)
+        if (f.placed && r.findIntersection(foldZone(f.pos)).has_value()) return false;
+    return true;
+}
+
 // False if r comes within forgeClearPx of the forge footprint (reserved from the start, built or not).
 // R29-F1: also keeps the storehouse spots clear, so every placement that avoids the forge avoids them too.
 // INBOX2-F1: and every race's smokehouse spot. R31-F1: and every race's keep spot. R33-F2: and every placed gate tower.
@@ -3772,7 +3873,8 @@ bool forgeClear(const FloatRect& r) {
         && barracksClear(r)   // R47-F6
         && herbClear(r)       // R53-F2
         && loreHallClear(r)   // R59-F3
-        && wonderClear(r);    // R60-F3
+        && wonderClear(r)     // R60-F3
+        && foldClear(r);      // R66-F3
 }
 
 // R30-F1: race quarters
@@ -3833,6 +3935,8 @@ bool inClearing(Vector2f p) {
         FloatRect pad(a.position - Vector2f(kTownClearPadPx, kTownClearPadPx), a.size + Vector2f(2 * kTownClearPadPx, 2 * kTownClearPadPx));
         if (pad.findIntersection(FloatRect(p, Vector2f(treeFootprint, treeFootprint)))) return true;
     }
+    for (auto& f : folds)   // R66-F3: a placed fold's zone (tree-sized box, so no canopy overhangs the pen)
+        if (f.placed && foldZone(f.pos).findIntersection(FloatRect(p, Vector2f(treeFootprint, treeFootprint)))) return true;
     return false;
 }
 
@@ -4454,7 +4558,7 @@ enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
 // R53-F4: the one exclusive state a barb is in (work flags like chopping/building stay separate). Set only by
 // beginActivity(), cleared only by endActivity(), which also runs the activity's cleanup.
 enum barbActivity { actNone, actShelter, actExpedition, actRaidAttack, actRaidDefend, actTemper, actSmelt, actDrill, actWatch,
-                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, actHeal, actHost, actHollowHunt, actGather, actFound, actFisher, activityCount };   // R66-F2: actFisher = the jetty boat's fisher   // R66-F1: actFound = a founder on the trek to a daughter town   // R63-F5a: actGather = called to a gathering (gatherIdleAt)   // R62-F3b: actHollowHunt = a joint wyrm hunter   // R61-F2: actHost = a field host fighter. R60-F2: actHeal = an elf walking to cure a patient   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
+                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, actHeal, actHost, actHollowHunt, actGather, actFound, actFisher, actShepherd, activityCount };   // R66-F3: actShepherd = the fold's shepherd   // R66-F2: actFisher = the jetty boat's fisher   // R66-F1: actFound = a founder on the trek to a daughter town   // R63-F5a: actGather = called to a gathering (gatherIdleAt)   // R62-F3b: actHollowHunt = a joint wyrm hunter   // R61-F2: actHost = a field host fighter. R60-F2: actHeal = an elf walking to cure a patient   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
 struct activityDef {
     const char* name;
     bool ownsBarb;    // its tick owns the barb outright: every job selector skips it (barbAvailable() false)
@@ -4484,6 +4588,7 @@ const activityDef activityDefs[activityCount] = {
     {"gathering",     false, false, true},   // R63-F5a: low priority: any claim or draft ends it; gatherTick() walks it
     {"founding",      true,  false, false},  // R66-F1: townTick() owns the founder from launch to arrival or failure
     {"boat fishing",  true,  false, false},  // R66-F2: jettyTick() owns the fisher from the dawn pick to the landing
+    {"shepherding",   true,  false, false},  // R66-F3: foldTick() owns the shepherd from the pick to the penning
 };
 
 // R62-F3b: what a hunter was doing when the hunt took it. Written only by the muster, read by releaseHuntBarb(), wiped
@@ -5343,6 +5448,7 @@ void endActivity(barb& b) {
         case actProcession:  // R59-F1: the trip lives on the marriage entry; marriageTick() resets the walk
         case actFound:       // R66-F1: the trek lives on townTrek; endTownTrek() resets the walk
         case actFisher:      // R66-F2: the trip lives on the boat; jettyTick() re-resolves the fisher by id and frees the boat
+        case actShepherd:    // R66-F3: the day lives on the fold; foldTick() re-resolves the shepherd by id and frees the fold
         case actNone:
         case activityCount:
             break;
@@ -5411,9 +5517,16 @@ int fleeTimer = 0;      // ticks of flee left; only deerwander touches the flee 
 int fleeCooldown = 0;
 deerTrek migrate = trekNone;   // R56-F1: a deer field, so swapRemove(deers, i) carries it with the deer/deershape pair
 int fawnAge = 0;        // R64-F3: ticks until a fawn grows up; > 0 = fawn. Set only by addAnimal(), carried by swapRemove
+int foldId = -1;        // R66-F3: sheepFold.id of a fold sheep (stable id, never an index); -1 = wild. Read through tame()
+int flockSlot = 0;      // R66-F3: pen slot / place round the shepherd (0..kFlockMax-1)
+bool stray = false;     // R66-F3: past the tether, running back to the shepherd ("!" drawn over it)
 };
 
 int nextDeerId = 0;
+
+// R66-F3: the one tame test. Wolves' prey pick, the deer wander, the barbs' hunt and the wildfolk hunt skip a tame
+// animal through this and nothing else; foldTick() alone moves it.
+bool tame(const deer& d) { return d.foldId >= 0; }
 
 const speciesDef& speciesOf(const deer& d) { return speciesDefs[d.species]; }
 Color animalBodyColor(const deer& d) { return d.fawnAge > 0 ? kFawnBody : speciesOf(d).body; }   // R64-F3: unflashed fill
@@ -6050,7 +6163,7 @@ int treeAtWorkSpot(const vector<CircleShape>& tris, int x, int y) {
 }
 
 // R44-F2: no task stripe -> idle. Shared by barbColor() and the H beacons so both agree on who is jobless
-bool barbIdle(const barb& b) { return !b.deertargeting && !b.building && !atForgeTask(b) && !b.chopping && b.activity != actFisher; }   // R47-F7: or smelting; R66-F2: or boat fishing
+bool barbIdle(const barb& b) { return !b.deertargeting && !b.building && !atForgeTask(b) && !b.chopping && b.activity != actFisher && b.activity != actShepherd; }   // R47-F7: or smelting; R66-F2: or boat fishing; R66-F3: or shepherding
 
 // Priority when flags overlap: hunting > building > picking > harvesting > fishing > mining > chopping > idle
 Color barbColor(const barb& b) {
@@ -6060,6 +6173,7 @@ Color barbColor(const barb& b) {
     if (b.activity == actTemper) return barbMineColor;   // R41-F2: pick work at the forge; never overlaps chopping/building
     if (b.activity == actSmelt) return barbMineColor;    // R47-F7: stone work at the forge, same stripe
     if (b.activity == actFisher) return barbFishColor;   // R66-F2: the boat fisher wears the angler's stripe
+    if (b.activity == actShepherd) return kBarbShepherdColor;   // R66-F3
     if (b.chopping && b.target == targetBush) return barbPickColor;
     if (b.chopping && b.target == targetField) return barbHarvestColor;
     if (b.chopping && b.target == targetLake) return barbFishColor;
@@ -6096,6 +6210,12 @@ const char* barbTaskName(const barb& b) {
              : marriage.memberIds[0] == b.id ? "wedding procession: the bride" : "wedding procession: escort";
     if (b.activity == actFound) return "founding a new town";   // R66-F1
     if (b.activity == actFisher) return fisherTaskName(b.id);   // R66-F2
+    if (b.activity == actShepherd) {   // R66-F3: words from the fold's phase
+        const sheepFold& f = folds[clampRace(b.race)];
+        return f.phase == foldFetch ? "shepherding: to the fold" : f.phase == foldOut ? "shepherding: leading the flock out"
+             : f.phase == foldGraze ? "minding the flock" : f.phase == foldHome ? "shepherding: bringing the flock home"
+             : f.phase == foldPenning ? "penning the flock" : "shepherding";
+    }
     if (b.deertargeting) return b.hasSpear ? weaponOf(b).huntLabel : "hunting";   // R47-F8: "hunting (axe)" for dwarves
     if (b.building) return "building";
     if (b.activity == actTemper) return "tempering pick";   // R41-F2
@@ -6251,6 +6371,7 @@ void deerkilling(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares
 				ds.setFillColor(animalBodyColor(d));
 			}
 		}
+		if (tame(d)) { ++i; continue; }   // R66-F3: fold sheep are never hunted
 		bool removed = false;
 		bool farGraze = deerUnreachable(d, deerpos);   // R56-F1: once per deer, not per barb
 		for (int j = 0; j < (int)barbs.size(); ++j) {
@@ -6470,7 +6591,7 @@ void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs, const vector
 		if (w.phase == wolf::Hunting) {
 			prey = findNearest(pos, noSearchRadius, (int)deershape.size(),
 			                   [&](int k) { return deershape[k].getPosition(); },
-			                   [&](int k) { return deers[k].species != speciesDeer || (trail && deers[k].migrate == trekNone); });
+			                   [&](int k) { return tame(deers[k]) || deers[k].species != speciesDeer || (trail && deers[k].migrate == trekNone); });   // R66-F3: never a fold sheep
 			if (prey != -1) goal = deershape[prey].getPosition();
 		}
 		if (prey != -1 && w.shape.getGlobalBounds().findIntersection(deershape[prey].getGlobalBounds()).has_value()) {
@@ -6617,6 +6738,7 @@ void deerwander(world& wd, const vector<RectangleShape>& squares, const vector<b
     for (int i = 0; i < (int)deershape.size(); i++) {
         auto& ds = deershape[i];
         auto& d  = deers[i];
+        if (tame(d)) continue;   // R66-F3: foldTick() alone moves fold sheep (no wander, no flee)
         Vector2f pos = ds.getPosition();
         if (d.fleeTimer > 0) {
             if (--d.fleeTimer <= 0) endFlee(d);
@@ -21568,7 +21690,7 @@ void campTick(vector<barb>& barbs, const vector<RectangleShape>& squares, world&
         int prey = findNearest(campCentre(ci), kCampHuntRadius, (int)deershape.size(),
                                [&](int k) { return deershape[k].getPosition(); },
                                [&](int k) {
-                                   if (deers[k].species != speciesDeer) return true;
+                                   if (tame(deers[k]) || deers[k].species != speciesDeer) return true;   // R66-F3: never a fold sheep
                                    if (deerUnreachable(deers[k], deershape[k].getPosition())) return true;   // R56-F1
                                    for (auto& o : campHunters) if (o.deertargeting && o.targetDeerId == deers[k].id) return true;
                                    return false;
@@ -21966,6 +22088,410 @@ void buildjetties(vector<barb>& barbs, vector<RectangleShape>& squares, const ve
     jetties.push_back(j);
     printf("---JETTY BUILT--- %s jetty %d at (%.0f, %.0f), boat %d moored\n", raceDefs[r].name, j.id, j.foot.x, j.foot.y, j.boat.id);
     logRaceEvent(string(racePlurals[r]) + " build a jetty and moor a fishing boat", r);
+}
+
+// R66-F3: fold geometry. Gate stand = a hitbox of size sz standing just below the gate gap; gate spot = a sheep body of
+// size body centred in the gap on the bottom rail (outside the pen, so it is the one way in and out); pen = inside the rails.
+Vector2f foldGateStand(const sheepFold& f, Vector2f sz) {
+    return snapPx(f.pos + Vector2f(kFoldGateX + kFoldGateW / 2.0f - sz.x / 2.0f, kFoldSize.y + 2.0f));
+}
+Vector2f foldGateSpot(const sheepFold& f, Vector2f body) {
+    return snapPx(f.pos + Vector2f(kFoldGateX + kFoldGateW / 2.0f, kFoldSize.y - 0.5f) - body / 2.0f);
+}
+FloatRect foldPen(const sheepFold& f) { return FloatRect(f.pos + Vector2f(1.0f, 1.0f), kFoldSize - Vector2f(2.0f, 2.0f)); }
+Vector2f foldPenSpot(const sheepFold& f, int slot) { return f.pos + kFoldPenSlots[clamp(slot, 0, kFlockMax - 1)]; }
+bool foldLampLit() { return game_time >= kFoldHomeHour || game_time < nightEndHour; }   // from the walk home to dawn
+
+// R66-F3: the checks a fold site (fence top-left pos) must pass: on the map, out of the village clearing and every
+// quarter's house disc, off every reserved building, plot, mill, lean-to, site, the ruins, a town, road-tier trail,
+// house slab (standing or claimed), shrine and bush, dry, and with its gate walkable from race r's crate.
+bool foldSiteOk(int r, Vector2f pos, const vector<barb>& barbs, const vector<house>& houses, const fieldGrid& fields,
+                const vector<shrine>& shrines, const vector<CircleShape>& bushshapes) {
+    FloatRect zone = foldZone(pos);
+    Vector2f c = zone.position + zone.size / 2.0f;
+    float half = max(zone.size.x, zone.size.y) / 2.0f;
+    if (!layoutDiscOk(c, half)) return false;
+    for (int q = 0; q < raceCount; q++) {
+        Vector2f d = c - quarterCentre(q);
+        float cr = quarterClearRadiusFor(q) + half;
+        if (d.x * d.x + d.y * d.y < cr * cr) return false;
+    }
+    if (!forgeClear(zone) || !lakeClear(zone) || !fieldsClear(fields, zone) || !campClear(zone) || !poiClear(zone)
+        || !ruinsClear(zone) || !zoneOffRoads(zone)) return false;
+    for (auto& t : towns) if (zone.findIntersection(townArea(t.crate))) return false;
+    for (auto& h : houses) if (zone.findIntersection(FloatRect(Vector2f(h.x - 3.0f, h.y - 3.0f), houseSlabSize))) return false;
+    for (auto& o : barbs)
+        if (o.movingbspot && o.jobKind == jobNone
+            && zone.findIntersection(FloatRect(Vector2f(o.targetx - 3.0f, o.targety - 3.0f), houseSlabSize))) return false;
+    for (auto& s : shrines)
+        if (zone.findIntersection(FloatRect(Vector2f((float)s.x, (float)s.y - shrineCapH), shrineSlabSize + Vector2f(0.0f, shrineCapH)))) return false;
+    for (auto& bs : bushshapes) if (zone.findIntersection(bs.getGlobalBounds())) return false;
+    Vector2f gate = pos + Vector2f(kFoldGateX + kFoldGateW / 2.0f, kFoldSize.y + 2.0f);
+    return regionReachable(storehousePos[r] + storehouseStandOffset, gate);
+}
+
+// R66-F3: kFoldSiteTries random spots on a ring just past race r's house disc, within kFoldArcRad of straight out from
+// the village (so the flock grazes toward the wilds); first spot that passes wins
+bool findFoldSite(int r, const vector<barb>& barbs, const vector<house>& houses, const fieldGrid& fields,
+                  const vector<shrine>& shrines, const vector<CircleShape>& bushshapes, Vector2f& out) {
+    Vector2f qc = quarterCentre(r);
+    Vector2f o = qc - villageCenter;
+    float base = atan2(o.y, o.x);
+    float ring = quarterClearRadiusFor(r) + kFoldRingPx;
+    uniform_real_distribution<float> ang(-kFoldArcRad, kFoldArcRad), spread(0.0f, kFoldRingSpreadPx);
+    for (int t = 0; t < kFoldSiteTries; t++) {
+        float a = base + ang(gen), d = ring + spread(gen);
+        Vector2f pos = snapPx(qc + Vector2f(cos(a), sin(a)) * d - kFoldSize / 2.0f);
+        if (!foldSiteOk(r, pos, barbs, houses, fields, shrines, bushshapes)) continue;
+        out = pos;
+        return true;
+    }
+    return false;
+}
+
+// R66-F3: runs after buildjetties(). A race with a standing crate and kFoldMinHouses houses picks its fold site (retried
+// every kFoldSiteRetryTicks; reserved from then on) and sends one builder through buildOneOff (jobFold), paid at claim
+// with a house's wood kept back. The claim is not stored, so a lost builder frees it through releaseBarbWork()'s reset.
+// When the fence stands, kFlockMax sheep are penned in it (addAnimal(), one per pen slot, each with the fold's id).
+void buildfolds(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares, const vector<house>& houses,
+                const storehouse (&stores)[raceCount], const fieldGrid& fields, const vector<shrine>& shrines,
+                const vector<CircleShape>& bushshapes) {
+    for (int r = 0; r < raceCount; r++) {
+        sheepFold& f = folds[r];
+        if (f.built || !stores[r].built) continue;
+        int raceHouses = 0;
+        for (auto& h : houses) if (h.race == r) raceHouses++;
+        if (raceHouses < kFoldMinHouses) continue;
+        if (!f.placed) {
+            if (f.siteRetry > 0) { f.siteRetry--; continue; }
+            Vector2f p;
+            if (!findFoldSite(r, barbs, houses, fields, shrines, bushshapes, p)) {
+                f.siteRetry = kFoldSiteRetryTicks;
+                if (!f.siteLogged) printf("FOLD SITE - %s: no free spot past the quarter yet, retrying every %d ticks\n", raceDefs[r].name, kFoldSiteRetryTicks);
+                f.siteLogged = true;
+                continue;
+            }
+            f.placed = true;
+            f.pos = p;
+            printf("FOLD SITE - %s fold staked out at (%.0f, %.0f)\n", raceDefs[r].name, p.x, p.y);
+        }
+        bool claimed = false;
+        for (auto& b : barbs) if (b.jobKind == jobFold && b.race == r) claimed = true;
+        bool done = buildOneOff(barbs, squares, claimed, jobFold, foldGateStand(f, barbBodySize), "FOLD",
+            [&](const barb&) {
+                if (!canAfford(stock[r], kFoldWoodCost + houseWoodCost, 0)) return -1;
+                spend(stock[r], kFoldWoodCost, 0);
+                return 1;
+            }, r);
+        if (!done) continue;
+        f.built = true;
+        f.id = nextFoldId++;
+        f.phase = foldPenned;
+        f.shepherdId = -1;
+        f.pickRetry = 0;
+        for (int k = 0; k < kFlockMax; k++) {
+            deer d;
+            d.species = speciesSheep;
+            d.foldId = f.id;
+            d.flockSlot = k;
+            Vector2f s = foldPenSpot(f, k);
+            d.x = (int)s.x;
+            d.y = (int)s.y;
+            addAnimal(wd, d);
+        }
+        printf("---FOLD BUILT--- %s fold %d at (%.0f, %.0f), %d sheep penned\n", raceDefs[r].name, f.id, f.pos.x, f.pos.y, kFlockMax);
+        logRaceEvent(string(racePlurals[r]) + " fence a sheep fold and pen a flock of " + to_string(kFlockMax), r);
+    }
+}
+
+// R66-F3: the one way a shepherd's day ends (penned, lost, too late to go out): a shepherd still standing gets the walk
+// reset and its flag cleared, and the fold is free for tomorrow's pick
+void releaseShepherd(vector<barb>& barbs, sheepFold& f, int r, const char* why) {
+    int i = findBarbById(barbs, f.shepherdId);
+    if (i >= 0 && barbs[i].activity == actShepherd) {
+        expeditionReset(barbs[i]);
+        endActivity(barbs[i], actShepherd);
+    }
+    printf("SHEPHERD RELEASED - barb %d leaves the %s fold %d (%s)\n", f.shepherdId, racePlurals[clampRace(r)], f.id, why);
+    f.shepherdId = -1;
+}
+
+// R66-F3: a pasture stand spot (hitbox top-left for size sz) kFoldGrazeMinPx..kFoldGrazeMaxPx from the gate stand,
+// within kFoldGrazeArcRad of straight out from the crate, dry, on the map, out of the village clearing and walkable
+bool pickGrazeSpot(const sheepFold& f, int r, Vector2f sz, Vector2f& out) {
+    Vector2f gate = foldGateStand(f, sz);
+    Vector2f o = gate - quarterCentre(r);
+    float base = atan2(o.y, o.x);
+    uniform_real_distribution<float> ang(-kFoldGrazeArcRad, kFoldGrazeArcRad), dist(kFoldGrazeMinPx, kFoldGrazeMaxPx);
+    for (int t = 0; t < kFoldGrazeTries; t++) {
+        float a = base + ang(gen);
+        Vector2f p = snapPx(gate + Vector2f(cos(a), sin(a)) * dist(gen));
+        Vector2f c = p + sz / 2.0f;
+        FloatRect box(c - Vector2f(kFoldGrazeClearPx, kFoldGrazeClearPx), Vector2f(2 * kFoldGrazeClearPx, 2 * kFoldGrazeClearPx));
+        if (!layoutDiscOk(c, kFoldGrazeClearPx) || !lakeClear(box) || !lakeClear(FloatRect(p, sz), &gate)) continue;
+        if (!regionReachable(gate, p)) continue;
+        out = p;
+        return true;
+    }
+    return false;
+}
+
+// R66-F3: runs right after deerkilling(). Each standing fold's shepherd is re-resolved by id (a missing, dead, released
+// or re-raced one frees the fold, and the flock walks home alone) and taken through the day: by day a penned flock
+// takes the nearest free grown barb of its race, who walks to the gate, leads the flock to a pasture and minds it there;
+// from kFoldHomeHour (or a bell) it leads the flock home and waits at the gate. Then the one sheep pass (backward over the
+// deer pair, so a sheep whose fold is gone is swapRemoved from both vectors at the same index): every sheep heads for the
+// one leader target (its place round the shepherd, or its pen slot with no shepherd leading), through the gate gap when
+// crossing the rails; at pasture it nibbles round its place. Past kSheepTetherDistSq from the shepherd a sheep turns
+// stray ("!") and runs back until inside kSheepRegroupDistSq. One distance per sheep to its leader; no neighbour search.
+// Once every sheep of a homing flock stands in its slot the flock is penned and the shepherd released.
+void foldTick(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares) {
+    int lead[raceCount], flock[raceCount] = {}, penned[raceCount] = {};
+    bool offHours = game_time < kFoldOutHour || game_time >= kFoldHomeHour;
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (int r = 0; r < raceCount; r++) {
+        lead[r] = -1;
+        sheepFold& f = folds[r];
+        if (!f.built) continue;
+        int si = -1;
+        if (f.shepherdId >= 0) {
+            si = findBarbById(barbs, f.shepherdId);
+            if (si < 0 || si >= n || barbs[si].activity != actShepherd || barbs[si].race != r || barbs[si].health <= 0) {
+                releaseShepherd(barbs, f, r, "the shepherd is lost");
+                si = -1;
+            }
+        }
+        if (si < 0 && f.phase != foldPenned && f.phase != foldPenning)
+            f.phase = f.phase == foldFetch ? foldPenned : foldPenning;   // out with no shepherd: the flock walks home alone
+        bool goHome = offHours || raceBell[r] > 0;
+        Vector2f fc = f.pos + kFoldSize / 2.0f;
+        switch (f.phase) {
+            case foldPenned: {
+                if (goHome || --f.pickRetry > 0) break;
+                f.pickRetry = kFoldPickRetryTicks;
+                int i = findNearest(fc, worldSize, n, [&](int k) { return squares[k].getPosition(); },
+                                    [&](int k) {
+                                        const barb& b = barbs[k];
+                                        return !(barbAvailable(b) && expeditionEligible(b, r) && lifeStage(b) == stageAdult
+                                                 && townOf(b.homeHouse) < 0);
+                                    });
+                if (i < 0) break;   // quiet: tried again in kFoldPickRetryTicks
+                barb& b = barbs[i];
+                expeditionReset(b);
+                beginActivity(b, actShepherd);
+                b.order = needNone;
+                b.orderTicks = 0;
+                f.shepherdId = b.id;
+                f.phase = foldFetch;
+                printf("SHEPHERD - %s (%s) walks to fold %d\n", b.name, racePlurals[r], f.id);
+                break;
+            }
+            case foldFetch: {
+                if (goHome) { releaseShepherd(barbs, f, r, "too late to go out"); f.phase = foldPenned; break; }
+                Vector2f sz = squares[si].getSize();
+                if (!expeditionWalk(barbs[si], squares[si], foldGateStand(f, sz))) break;
+                if (!pickGrazeSpot(f, r, sz, f.graze)) f.graze = foldGateStand(f, sz);   // no pasture: they graze at the gate
+                f.amble = f.graze;
+                f.ambleTicks = kShepherdAmbleTicks;
+                f.phase = foldOut;
+                printf("FLOCK OUT - %s leads the %s flock out to (%.0f, %.0f)\n", barbs[si].name, racePlurals[r], f.graze.x, f.graze.y);
+                break;
+            }
+            case foldOut:
+                if (goHome) { f.phase = foldHome; break; }
+                if (expeditionWalk(barbs[si], squares[si], f.graze)) f.phase = foldGraze;
+                break;
+            case foldGraze: {
+                if (goHome) {
+                    f.phase = foldHome;
+                    printf("FLOCK HOME - %s brings the %s flock home%s\n", barbs[si].name, racePlurals[r], raceBell[r] > 0 ? " (the bell rings)" : "");
+                    break;
+                }
+                RectangleShape& sq = squares[si];
+                if (--f.ambleTicks <= 0) {
+                    f.ambleTicks = kShepherdAmbleTicks;
+                    uniform_real_distribution<float> j(-kShepherdAmblePx, kShepherdAmblePx);
+                    Vector2f a = snapPx(f.graze + Vector2f(j(gen), j(gen)));
+                    Vector2f from = sq.getPosition();
+                    if (lakeClear(FloatRect(a, sq.getSize()), &from) && regionReachable(from, a)) f.amble = a;
+                }
+                expeditionWalk(barbs[si], sq, f.amble);
+                break;
+            }
+            case foldHome:
+                if (expeditionWalk(barbs[si], squares[si], foldGateStand(f, squares[si].getSize()))) f.phase = foldPenning;
+                break;
+            case foldPenning:   // the shepherd waits at the gate (or the flock walks home alone); the sheep pass ends it
+                break;
+        }
+        if (si >= 0 && (f.phase == foldOut || f.phase == foldGraze || f.phase == foldHome)) lead[r] = si;
+    }
+
+    vector<deer>& deers = wd.deers;
+    vector<RectangleShape>& deershape = wd.deershape;
+    int removed = 0;
+    for (int i = (int)deers.size() - 1; i >= 0; i--) {
+        deer& d = deers[i];
+        if (!tame(d)) continue;
+        int r = findFoldById(d.foldId);
+        if (r < 0) {   // its fold is gone: reverse index, so the swapped-in sheep was already visited
+            printf("SHEEP LOST - sheep %d's fold %d is gone\n", d.id, d.foldId);
+            swapRemove(deers, i);
+            swapRemove(deershape, i);
+            removed++;
+            continue;
+        }
+        sheepFold& f = folds[r];
+        RectangleShape& ds = deershape[i];
+        const speciesDef& sp = speciesOf(d);
+        Vector2f pos = ds.getPosition(), body = ds.getSize(), half = body / 2.0f;
+        int slot = clamp(d.flockSlot, 0, kFlockMax - 1);
+        flock[r]++;
+        Vector2f real;
+        if (lead[r] >= 0) {
+            const RectangleShape& lq = squares[lead[r]];
+            Vector2f lc = lq.getPosition() + lq.getSize() / 2.0f;
+            Vector2f place = lc + kFlockOffsets[slot] - half;
+            Vector2f dv = pos + half - lc;
+            float distSq = dv.x * dv.x + dv.y * dv.y;
+            if (!d.stray && distSq > kSheepTetherDistSq) {
+                d.stray = true;
+                printf("SHEEP STRAYS - %s sheep %d, running back\n", racePlurals[r], d.id);
+            } else if (d.stray && distSq < kSheepRegroupDistSq) {
+                d.stray = false;
+                d.moving = false;
+            }
+            if (d.stray || f.phase != foldGraze) {
+                real = place;
+            } else {
+                if (!d.moving && uniform_int_distribution<int>(0, kSheepGrazeOneIn - 1)(gen) == 0) {
+                    Vector2f t;
+                    if (uniform_int_distribution<int>(0, kSheepStrayOneIn - 1)(gen) == 0) {   // a long wander off
+                        float a = uniform_real_distribution<float>(0.0f, 6.2831853f)(gen);
+                        t = pos + Vector2f(cos(a), sin(a)) * kSheepStrayLegPx;
+                    } else {
+                        uniform_real_distribution<float> j(-kSheepGrazeSpreadPx, kSheepGrazeSpreadPx);
+                        t = place + Vector2f(j(gen), j(gen));
+                    }
+                    t.x = clamp(t.x, deerFleeEdgeMargin, worldSize - body.x - deerFleeEdgeMargin);
+                    t.y = clamp(t.y, hudBarHeight + deerFleeEdgeMargin, worldSize - body.y - sp.legPx - deerFleeEdgeMargin);
+                    if (lakeClear(FloatRect(t, body + Vector2f(0.0f, sp.legPx)), &pos)) {
+                        d.targetx = (int)t.x;
+                        d.targety = (int)t.y;
+                        d.moving = true;
+                    }
+                }
+                real = d.moving ? Vector2f((float)d.targetx, (float)d.targety) : pos;
+            }
+        } else {
+            d.stray = false;
+            real = foldPenSpot(f, slot);
+        }
+        FloatRect pen = foldPen(f);
+        Vector2f gate = foldGateSpot(f, body);
+        Vector2f goal = real;
+        Vector2f gd = gate - pos;
+        if (pen.contains(pos + half) != pen.contains(real + half) && gd.x * gd.x + gd.y * gd.y >= 1.0f) goal = gate;   // the gap
+        d.targetx = (int)real.x;   // drawDeer faces the sheep toward where it is headed
+        d.targety = (int)real.y;
+        Vector2f diff = goal - pos;
+        if (diff.x * diff.x + diff.y * diff.y < 1.0f) {
+            ds.setPosition(goal);
+            d.stepTimer = 0;
+            if (goal == real) {
+                d.moving = false;
+                if (lead[r] < 0) penned[r]++;   // standing in its pen slot
+            }
+        } else {
+            d.moving = true;
+            if (++d.stepTimer >= (d.stray ? sp.fleeStepInterval : sp.stepInterval)) {
+                d.stepTimer = 0;
+                ds.move(pathStep(pos, goal));   // fords only, like the deer
+            }
+        }
+    }
+    if (removed > 0) validateDeerTargets(barbs, deers);
+
+    for (int r = 0; r < raceCount; r++) {
+        sheepFold& f = folds[r];
+        if (!f.built || f.phase != foldPenning || penned[r] < flock[r]) continue;
+        printf("FLOCK PENNED - the %s fold %d holds its %d sheep for the night\n", racePlurals[r], f.id, flock[r]);
+        if (f.shepherdId >= 0) releaseShepherd(barbs, f, r, "flock penned");
+        f.phase = foldPenned;
+        f.pickRetry = 0;
+    }
+}
+
+// R66-F3: world layer with the buildings, under the sheep and the barbs. Trampled translucent floor, woven rails with
+// darker posts, the 4px gate gap in the bottom rail (barred while the flock is in) and the lamp post at the top-right
+// corner with its dull head (drawFoldOverlay() lights it). A staked-out site not yet fenced shows its four corner posts.
+void drawFolds(RenderWindow& window) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    const float w = kFoldSize.x, h = kFoldSize.y;
+    for (auto& f : folds) {
+        if (!f.placed) continue;
+        Vector2f o = snapPx(f.pos);
+        if (!f.built) {
+            for (Vector2f c : {Vector2f(0.0f, 0.0f), Vector2f(w - 1.0f, 0.0f), Vector2f(0.0f, h - 1.0f), Vector2f(w - 1.0f, h - 1.0f)})
+                pushQuad(va, o + c, Vector2f(1.0f, 1.0f), kFoldPostColor);
+            continue;
+        }
+        pushQuad(va, o + Vector2f(1.0f, 1.0f), Vector2f(w - 2.0f, h - 2.0f), kFoldGroundColor);
+        pushQuad(va, o, Vector2f(w, 1.0f), kFoldWattleColor);                                  // top rail
+        pushQuad(va, o + Vector2f(0.0f, 1.0f), Vector2f(1.0f, h - 1.0f), kFoldWattleColor);    // left rail
+        pushQuad(va, o + Vector2f(w - 1.0f, 1.0f), Vector2f(1.0f, h - 1.0f), kFoldWattleColor);// right rail
+        pushQuad(va, o + Vector2f(1.0f, h - 1.0f), Vector2f(kFoldGateX - 1.0f, 1.0f), kFoldWattleColor);   // bottom rail, gap left out
+        pushQuad(va, o + Vector2f(kFoldGateX + kFoldGateW, h - 1.0f), Vector2f(w - 1.0f - kFoldGateX - kFoldGateW, 1.0f), kFoldWattleColor);
+        if (f.phase == foldPenned || f.phase == foldFetch)   // barred: the flock is in
+            pushQuad(va, o + Vector2f(kFoldGateX, h - 1.0f), Vector2f(kFoldGateW, 1.0f), kFoldGateColor);
+        for (float x : {0.0f, 6.0f, 11.0f, w - 1.0f}) {   // posts along the top and bottom rails (6 and 11 flank the gate)
+            pushQuad(va, o + Vector2f(x, 0.0f), Vector2f(1.0f, 1.0f), kFoldPostColor);
+            pushQuad(va, o + Vector2f(x, h - 1.0f), Vector2f(1.0f, 1.0f), kFoldPostColor);
+        }
+        pushQuad(va, o + Vector2f(0.0f, floor(h / 2.0f)), Vector2f(1.0f, 1.0f), kFoldPostColor);
+        pushQuad(va, o + Vector2f(w - 1.0f, floor(h / 2.0f)), Vector2f(1.0f, 1.0f), kFoldPostColor);
+        pushQuad(va, o + Vector2f(w - 1.0f, 1.0f - kFoldLampH), Vector2f(1.0f, kFoldLampH - 1.0f), kFoldPostColor);   // lamp post
+        pushQuad(va, o + Vector2f(w - 1.0f, -kFoldLampH), Vector2f(1.0f, 1.0f), lanternUnlitColor);                   // lamp head
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R66-F3: after the day/night overlay. Each standing fold's lamp, from the walk home to dawn: a soft stacked additive glow
+// and the lit head. Then a 1px "!" (3px bar, gap, dot) over every stray sheep, 2px above its back.
+void drawFoldOverlay(RenderWindow& window, const View& worldView, const vector<deer>& deers, const vector<RectangleShape>& deershape) {
+    window.setView(worldView);
+    bool lit = foldLampLit();
+    for (auto& f : folds) {
+        if (!f.built || !lit) continue;
+        Vector2f head = snapPx(f.pos) + Vector2f(kFoldSize.x - 1.0f, -kFoldLampH);
+        CircleShape c;
+        c.setPosition(head + Vector2f(0.5f, 0.5f));
+        Color col = kFoldLampGlowColor;
+        col.a = kFoldLampGlowAlpha;
+        c.setFillColor(col);
+        c.setPointCount(32);
+        for (int k = 1; k <= kFoldLampGlowLayers; k++) {
+            float rad = kFoldLampGlowPx * k / kFoldLampGlowLayers;
+            c.setRadius(rad);
+            c.setOrigin({rad, rad});
+            window.draw(c, BlendAdd);
+        }
+        RectangleShape lamp({1.0f, 1.0f});
+        lamp.setPosition(head);
+        lamp.setFillColor(lanternLitColor);
+        window.draw(lamp);
+    }
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (int i = 0; i < (int)deers.size() && i < (int)deershape.size(); i++) {
+        if (!tame(deers[i]) || !deers[i].stray) continue;
+        Vector2f o = snapPx(deershape[i].getPosition());
+        float x = o.x + floor(deershape[i].getSize().x / 2.0f);
+        pushQuad(va, Vector2f(x, o.y - 6.0f), Vector2f(1.0f, 3.0f), kSheepStrayMarkColor);
+        pushQuad(va, Vector2f(x, o.y - 2.0f), Vector2f(1.0f, 1.0f), kSheepStrayMarkColor);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
 }
 
 // R47-F6: runs after buildkeeps(). Each race whose keep stands builds one barracks at its fixed spot left of the crate,
@@ -22821,6 +23347,7 @@ int main() {
                 buildcamps(barbs, squares, houses, stores);   // R45-F1b: lean-tos at the ruins
                 buildbridges(barbs, squares, houses, stores);   // R62-F2b: timber bridges over each race's ford
                 buildjetties(barbs, squares, houses, stores);   // R66-F2: the coastal race's jetty and boat
+                buildfolds(wd, barbs, squares, houses, stores, fields, shrines, bushshapes);   // R66-F3: each race's sheep fold and flock
                 buildfield(barbs, squares, houses, shrines, stores, fields);
                 buildmills(barbs, squares, fields);   // FARM-F2
                 buildkeeps(barbs, squares, stores);   // R31-F1: Town era
@@ -22848,6 +23375,7 @@ int main() {
                 herdTick(wd);   // R56-F1: season-edge trek flags, before the deer move
                 deerwander(wd, squares, barbs);
                 deerkilling(wd, barbs, squares, smoke);
+                foldTick(wd, barbs, squares);   // R66-F3: shepherds' day, flock follow/graze/tether and penning (after the hunt, before the wolves)
                 wolfPackDayTick(wd);   // R64-F3: once a day, before the wolves: pack size from the cached prey ratio
                 wolfTick(wolves, wd, barbs, squares, tris, houseshapes);   // R63-F6: + spring den, pups, den clearing
                 prowlerTick(prowlers, barbs, squares, houses, houseshapes, fire);   // R48-F1: bites land before starveDeathTick()
@@ -22993,6 +23521,7 @@ int main() {
 	drawPois(window, camRect, frameCount);   // R47-F4: huts and wells, with the buildings
 	drawWildCamp(window, camRect, frameCount, isNightHour(game_time));   // R55-F1: hide tents, hearth smoke, pennant
 	drawDens(window, camRect);   // R63-F6: wolf den mound + fading scuffs, with the buildings, under the pups and barbs
+	drawFolds(window);   // R66-F3: fence, gate and lamp post, with the buildings, under the sheep and barbs
 	drawStall(window, activeTrader);
 	drawForge(window, dwarfForge, frameCount, forgeBonusPending(barbs, dwarfForge), forgeSmelting(barbs));   // R47-F7: smoke wisp
 	if (forgeEmberFrames > 0 && !paused) forgeEmberFrames--;
@@ -23100,6 +23629,7 @@ int main() {
         drawBridgeFires(window, worldView, frameCount);   // R62-F2c: flames on a torched bridge deck, above the overlay
         drawWyrmOverlay(window, worldView);   // R61-F1: ember eye + hp bar
         drawSeaRaidOverlay(window, worldView, frameCount);   // R65-F1: raider helms + hp bars, burning hull
+        drawFoldOverlay(window, worldView, deers, deershape);   // R66-F3: fold lamp glow (walk home to dawn) + "!" over stray sheep
         for (auto& r : seaRaiders) if (r.flashFrames > 0 && !paused) r.flashFrames--;   // the hit flash lasts 2 drawn frames
         drawHoardGlint(window, worldView, frameCount);   // R62-F3b: gold glint over the Hollow (hunt out, or a fresh kill)
         if (wyrm.flashFrames > 0 && !paused) wyrm.flashFrames--;   // the hit flash lasts 2 drawn frames
