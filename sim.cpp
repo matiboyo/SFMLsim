@@ -2985,10 +2985,19 @@ const Color kSellswordTickerTint(236, 226, 194);// pale gold-white hire and rele
 // = a quiet fail (printf only) and that race never scans again. With a site, kTownFounders commoners walk there (one
 // trek at a time, activity actFound, the expedition walk); on arrival a second crate and kTownHouses houses rise at
 // once, the founders move into them and the flag clears. townOf(house id) is the one lookup: deposits, house builds
-// and one-off build claims go through it. Phase 1: one town per race, no growth, not saved.
+// and one-off build claims go through it. Phase 1: one town per race, not saved.
+// R69-F1 Town Growth, phase 1: every kTownGrowEveryTicks townGrow() tithes kTownGrainOutflow food from the mother's
+// larder into Town::growth, only while the larder stays above kTownFoodFloor + its head count. Each kTownGrowthPerStep
+// grain raises one thing beside the pennant: a house (via townAddHouse(), up to kTownMaxHouses), after the first grown
+// house a small green plot. Growth never waits on the supply cart (R69-F1b); the cart only carries the same tithe later.
 const int kTownFounders = 4;                    // founders per trek; all one race
 const int kMaxTownsPerRace = 1;
-const int kTownHouses = 2;                      // houses raised with the crate (never more in phase 1)
+const int kTownHouses = 2;                      // houses raised with the crate
+const int kTownMaxHouses = 4;                   // R69-F1: founding houses + the grown ones (kTownGrowHouseOffset), never more
+const int kTownGrowEveryTicks = 600;            // R69-F1: one tithe roll this often (~10s at 1x)
+const int kTownGrainOutflow = 1;                // R69-F1: food moved from the mother's larder per tithe
+const int kTownFoodFloor = 20;                  // R69-F1: the mother keeps at least this + one food per head after a tithe
+const int kTownGrowthPerStep = 8;               // R69-F1: tithed grain per growth step (a house or the plot): ~80s at best
 const int kTownCrowdBarbs = 16;                 // race head count that counts as crowded (eraTownBarbs is 12)
 const int kTownWoodCost = storehouseWoodCost + kTownHouses * houseWoodCost;   // the cart: paid at launch, refunded on a fail
 const int kTownWoodReserve = houseWoodCost;     // the mother quarter keeps at least a house's wood after paying
@@ -2999,6 +3008,12 @@ const float kTownClearPadPx = 2.0f;             // a tree/rock box this close to
 const Vector2f kTownAreaLo(-20.0f, -12.0f);     // site footprint (houses + slabs + pennant) relative to the crate top-left
 const Vector2f kTownAreaSize(48.0f, 28.0f);
 const Vector2f kTownHouseOffset[kTownHouses] = {{-16.0f, 3.0f}, {storehouseSize.x + 8.0f, 3.0f}};   // house top-lefts
+// R69-F1: grown house top-lefts, the row above the founding pair, either side of the pennant (slabs at y -12..-2, inside
+// kTownAreaLo so inClearing() keeps trees off them); the roof tops sit 1px above the pennant's finial
+const Vector2f kTownGrowHouseOffset[kTownMaxHouses - kTownHouses] = {{-16.0f, -9.0f}, {storehouseSize.x + 8.0f, -9.0f}};
+const Vector2f kTownPlotOffset(-8.0f, -8.0f);   // R69-F1: 7x5 green plot between the left grown house's slab and the pole
+const Vector2f kTownPlotSize(7.0f, 5.0f);
+const Color kTownPlotRowColor(64, 136, 46);   // two 5x1 sprout rows on fieldSoilColor (fieldRestedColor's green)
 const float kTownFounderGapPx = 4.0f;           // founders stand in a row under the crate on arrival
 const int kTownTrekMaxTicks = 36000;            // a trek still walking after this is abandoned quietly
 const int kTownDustEveryTicks = 20;             // each walking founder kicks up a puff this often
@@ -3970,8 +3985,10 @@ struct Town {
     int id = -1;
     int race = -1;
     Vector2f crate;        // crate top-left (same size and stand offset as a quarter crate)
-    vector<int> houses;    // house.id of each house raised with it
+    vector<int> houses;    // house.id of each house raised with it; only townAddHouse() appends (R69-F1)
     int flashFrames = 0;   // deposit flash, per drawn frame (like storehouse::flashFrames)
+    int growth = 0;        // R69-F1: tithed grain toward the next growth step (0..kTownGrowthPerStep)
+    bool plot = false;     // R69-F1: the green plot beside the pennant has appeared
 };
 vector<Town> towns;
 int nextTownId = 0;
@@ -10148,7 +10165,7 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
         if (!b.movingbspot && !b.moving) {
             if (b.race < 0 || b.race >= raceCount) continue;
             if (!canclaim || !canAfford(stockOf(b), houseWoodCost, 0)) continue;   // RACE-F1: the builder's race pays
-            int tw = townOf(b.homeHouse);   // R66-F1: a town household builds for its town; phase 1 towns never grow
+            int tw = townOf(b.homeHouse);   // R66-F1: a town household builds for its town; R69-F1: towns grow only via townGrow()
             if (tw >= 0 && (int)towns[tw].houses.size() >= kTownHouses) continue;
             Vector2f qc = tw >= 0 ? towns[tw].crate + storehouseSize / 2.0f : quarterCentre(b.race);
             int tx = 0, ty = 0;
@@ -11363,6 +11380,12 @@ void drawStorehouses(RenderWindow& window, const storehouse (&stores)[raceCount]
         drawParts(va, storeShadowParts, o, Color::White);
         drawParts(va, storeBodyParts, o, lerpColor(storehouseColors[r], Color::White, t));
         drawParts(va, storeTrimParts, o, Color::White);
+        if (tw.plot) {   // R69-F1: 7x5 tilled soil, two 5x1 green sprout rows inset 1px
+            Vector2f q = o + kTownPlotOffset;
+            pushQuad(va, q, kTownPlotSize, fieldSoilColor);
+            pushQuad(va, q + Vector2f(1.0f, 1.0f), Vector2f(kTownPlotSize.x - 2.0f, 1.0f), kTownPlotRowColor);
+            pushQuad(va, q + Vector2f(1.0f, 3.0f), Vector2f(kTownPlotSize.x - 2.0f, 1.0f), kTownPlotRowColor);
+        }
         Color flag = lensRaceColors[r];
         Vector2f p = o + Vector2f(kTownPennantX, kTownPennantTop);   // pole top
         pushQuad(va, p, Vector2f(1.0f, 1.0f), kTownPennantTipColor);                        // finial
@@ -16125,11 +16148,62 @@ void townDawn(vector<barb>& barbs, vector<RectangleShape>& squares, const vector
     }
 }
 
+// R69-F1: the one way a town gains a house: addHouse() grows houses and houseshapes together at the same index, and the
+// new id joins t.houses. Returns the new house's index into houses.
+int townAddHouse(Town& t, vector<house>& houses, vector<RectangleShape>& houseshapes, Vector2f topLeft) {
+    Vector2f hp = snapPx(topLeft);
+    int hi = addHouse(houses, houseshapes, (int)hp.x, (int)hp.y, false, (barbRace)clampRace(t.race));   // R54-F2
+    t.houses.push_back(houses[hi].id);
+    return hi;
+}
+
+// R69-F1: every kTownGrowEveryTicks each town takes kTownGrainOutflow food from its race's larder, only while the larder
+// stays at or above kTownFoodFloor + the race's head count afterwards (so the mother is never starved). Each
+// kTownGrowthPerStep tithed grain raises the next thing beside the pennant: a grown house, the plot once the first grown
+// house stands, then the last house. A slot whose slab meets another house is skipped. Independent of any trek or cart.
+void townGrow(const vector<barb>& barbs, vector<house>& houses, vector<RectangleShape>& houseshapes) {
+    static int growTicks = 0;
+    if (towns.empty() || ++growTicks < kTownGrowEveryTicks) return;
+    growTicks = 0;
+    int pop[raceCount] = {};
+    for (auto& b : barbs) pop[clampRace(b.race)]++;
+    for (auto& t : towns) {
+        int r = clampRace(t.race);
+        int slot = -1;   // first grown-house slot whose slab is clear (a standing house blocks its own slot)
+        for (int s = 0; slot < 0 && (int)t.houses.size() < kTownMaxHouses && s < kTownMaxHouses - kTownHouses; s++) {
+            Vector2f hp = snapPx(t.crate + kTownGrowHouseOffset[s]);
+            FloatRect slab(Vector2f(hp.x - 3.0f, hp.y - 3.0f), houseSlabSize);
+            bool clear = true;
+            for (auto& h : houses)
+                if (slab.findIntersection(FloatRect(Vector2f(h.x - 3.0f, h.y - 3.0f), houseSlabSize))) { clear = false; break; }
+            if (clear) slot = s;
+        }
+        bool plotNext = !t.plot && ((int)t.houses.size() > kTownHouses || slot < 0);
+        if (!plotNext && slot < 0) continue;   // fully grown: no more tithe
+        if (stock[r].food - kTownGrainOutflow < kTownFoodFloor + pop[r]) continue;   // the mother's floor
+        stock[r].food -= kTownGrainOutflow;
+        t.growth += kTownGrainOutflow;
+        if (t.growth < kTownGrowthPerStep) continue;
+        t.growth = 0;
+        if (plotNext) {
+            t.plot = true;
+            printf("---TOWN GROWS--- %s New Town %d tills a plot beside the pennant (food left %d)\n", raceDefs[r].name, t.id, stock[r].food);
+            logRaceEvent(string("The ") + racePlurals[r] + "' new town tills a plot", r);
+            continue;
+        }
+        townAddHouse(t, houses, houseshapes, t.crate + kTownGrowHouseOffset[slot]);
+        printf("---TOWN GROWS--- %s New Town %d raises house %d of %d (food left %d)\n", raceDefs[r].name, t.id,
+               (int)t.houses.size(), kTownMaxHouses, stock[r].food);
+        logRaceEvent(string("The ") + racePlurals[r] + "' new town raises a house", r);
+    }
+}
+
 // R66-F1: after expeditionTick(). Re-resolves every founder by id; a missing, dead, released or re-raced founder (or a
 // trek past kTownTrekMaxTicks, or a site spoiled on arrival) fails quietly with the wood refunded. Founders walk with
 // the expedition walk and leave a dust trail; once all stand at the site the crate and houses rise, the founders move
-// in, their flag clears, and the one ticker line goes out.
+// in, their flag clears, and the one ticker line goes out. R69-F1: townGrow() runs first, every tick, trek or not.
 void townTick(vector<barb>& barbs, vector<RectangleShape>& squares, vector<house>& houses, vector<RectangleShape>& houseshapes) {
+    townGrow(barbs, houses, houseshapes);
     if (!trek.active) return;
     int r = clampRace(trek.race);
     int idx[kTownFounders];
@@ -16166,10 +16240,7 @@ void townTick(vector<barb>& barbs, vector<RectangleShape>& squares, vector<house
     t.id = nextTownId++;
     t.race = r;
     t.crate = snapPx(trek.site);
-    for (int h = 0; h < kTownHouses; h++) {
-        Vector2f hp = snapPx(t.crate + kTownHouseOffset[h]);
-        t.houses.push_back(houses[addHouse(houses, houseshapes, (int)hp.x, (int)hp.y, false, (barbRace)r)].id);   // R54-F2
-    }
+    for (int h = 0; h < kTownHouses; h++) townAddHouse(t, houses, houseshapes, t.crate + kTownHouseOffset[h]);   // R69-F1
     for (int k = 0; k < kTownFounders; k++) barbs[idx[k]].homeHouse = t.houses[k * kTownHouses / kTownFounders];   // two to a house
     towns.push_back(t);
     endTownTrek(barbs, idx);   // the flag clears on arrival
