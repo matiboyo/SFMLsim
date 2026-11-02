@@ -336,8 +336,9 @@ const char* const kChroniclePath = "chronicle.sav";
 const char* const kChronicleTmpPath = "chronicle.sav.tmp";
 const int32_t kChronicleMagic = 0x4C524843;         // "CHRL" little-endian
 const int32_t kChronicleEndMark = 0x444E4543;       // "CEND": trailer, so a truncated file is rejected
-const int32_t kChronicleVersion = 6;                // R65-F4: v6 adds the "VASL" block; the one v6 bump other new fields share
-const int32_t kChronicleVersionAlly = 5;            // R59-F1: v5 adds the "ALLY" block (alliances and their brides); still loads, no vassals
+const int32_t kChronicleVersion = 7;                // R69-F4: v7 adds the "PLOT", "TOWN", "FOLD" and "JTTY" blocks and widens BARB with the cloak
+const int32_t kChronicleVersionVassal = 6;          // R65-F4: v6 adds the "VASL" block; still loads, with no towns, folds, jetties or cloaks
+const int32_t kChronicleVersionAlly = 5;           // R59-F1: v5 adds the "ALLY" block (alliances and their brides); still loads, no vassals
 const int32_t kChronicleVersionDynasty = 4;        // R58-F2: v4 widens each BARB entry with parents and dynasty; still loads
 const int32_t kChronicleVersionBlocks = 3;          // R55-F4: v3 adds tagged blocks (named barbs first) after the houses; still loads
 const int32_t kChronicleVersionEras = 2;            // R54-F4: v2 adds the per-race era array after the relations; still loads
@@ -363,7 +364,20 @@ const int kChronicleMaxBlocks = 32;              // blocks per file; more is rej
 const int kChronicleMaxBlockWords = 1 << 20;        // int32 words in one block; more is rejected
 const int kChronicleMaxBarbs = 2000;                // a load with more barbs than this is rejected; a save writes at most this many
 const int kChronicleBarbWordsV3 = 8;                // v3, per barb: name, race, birthRace, trait, leader, hunger, age, home
-const int kChronicleBarbWords = 11;                 // R58-F2 (v4): + parentA, parentB (file barb indices, -1 = none), dynasty
+const int kChronicleBarbWordsV4 = 11;               // R58-F2 (v4..v6): + parentA, parentB (file barb indices, -1 = none), dynasty
+const int kChronicleBarbWords = 13;                 // R69-F4 (v7): + cloak (0/1), cloakAge (days, 0..kCloakWearDays - 1)
+// R69-F4 (v7) blocks. Each is read whole into memory and parsed there; a block whose counts or size don't add up is
+// skipped (nothing of it restored) rather than rejecting the file, and a bad entry inside a good block drops only that
+// entry. Restored in the order PLOT, TOWN, FOLD, JTTY by chronicleRestoreSites(), each entry checked whole before any
+// vector is touched. The merchant cog is never saved: a load leaves it absent (see merchantCog in chronicleRestore()).
+const int32_t kChronicleBlockPlot = 0x544F4C50;     // "PLOT": raceCount, fieldsPerRace, then per race per plot {crop, lastCrop}
+const int32_t kChronicleBlockTown = 0x4E574F54;     // "TOWN": count, then per town {race, crate dx, dy, growth, plot, n, n file house indices}
+const int32_t kChronicleBlockFold = 0x444C4F46;     // "FOLD": count, then per built fold {race, dx, dy, wool, loom, shearYear, n, n x {slot, shorn, shornDay}}
+const int32_t kChronicleBlockJetty = 0x5954544A;    // "JTTY": count, then per jetty {race, holed, holedTicks}
+const int kChronicleTownWords = 6;                  // words before a town's house list
+const int kChronicleFoldWords = 7;                  // words before a fold's sheep list
+const int kChronicleSheepWords = 3;
+const int kChronicleJettyWords = 3;
 const int kChronicleMaxHungerMult = 4;              // hunger saved clamped to hungerThreshold * this; a larger value is rejected
 const int kChronicleReturnNames = 2;                // barbs named on the restore line ("Hild, Orm and 6 more return")
 const int kChronicleMaxDay = 1000000;               // game_day bound on load
@@ -3967,7 +3981,8 @@ bool keepClear(const FloatRect& r) {
 
 // R66-F3: one fold per race (index = barbRace), in a fixed array, so nothing to swapRemove. placed = site chosen and
 // reserved (forgeClear() keeps buildings off it, inClearing() clears its trees and rocks); id is stable, given when it
-// stands. The shepherd is held by barb id (never an index) and re-resolved every tick. Never saved.
+// stands. The shepherd is held by barb id (never an index) and re-resolved every tick. R69-F4: a built fold, its wool,
+// loom and flock are saved in the v7 "FOLD" block (the day's phase, shepherd and weave are not: it comes back penned).
 enum foldPhase { foldPenned, foldFetch, foldOut, foldGraze, foldHome, foldPenning };
 struct sheepFold {
     int id = -1;
@@ -4042,7 +4057,8 @@ float houseSpreadFarFor(int r) { return houseSpreadFarAt(quarterStepOf(r)); }
 float quarterReachFor(int r) { return quarterReachAt(quarterStepOf(r)); }
 
 // R66-F1: a daughter town. Only townTick() (on the trek's arrival) adds one; none is ever removed in phase 1. houses holds house.id values
-// (stable ids, never indices). Not saved: after a load its houses come back as ordinary quarter houses.
+// (stable ids, never indices). R69-F4: saved in the v7 "TOWN" block; a town that can't stand on the new map comes back
+// as ordinary quarter houses.
 struct Town {
     int id = -1;
     int race = -1;
@@ -4874,7 +4890,7 @@ struct barb {
     int gatherX = -1, gatherY = -1; // R63-F5a: slot top-left while activity == actGather; set only by gatherIdleAt(),
     int gatherTicks = 0;         //           ticks left before gatherTick() releases it; all three reset by endActivity()
     const char* gatherLabel = ""; // R63-F5a: tooltip words for the gathering (static string from the caller)
-    bool cloak = false;          // R69-F2: wears a wool cloak; given only by woolTick() (a finished weave), cleared when it wears out
+    bool cloak = false;          // R69-F2: wears a wool cloak; given only by woolTick() (a finished weave) or a v7 chronicle load, cleared when it wears out
     int cloakAge = 0;            // R69-F2: days worn (0..kCloakWearDays); counted by woolTick(), 0 whenever cloak is false
 };
 // R57-F1: age and stage from bornHour on the live clock (same hour count as chronicleNowHour())
@@ -5707,7 +5723,7 @@ int fawnAge = 0;        // R64-F3: ticks until a fawn grows up; > 0 = fawn. Set 
 int foldId = -1;        // R66-F3: sheepFold.id of a fold sheep (stable id, never an index); -1 = wild. Read through tame()
 int flockSlot = 0;      // R66-F3: pen slot / place round the shepherd (0..kFlockMax-1)
 bool stray = false;     // R66-F3: past the tether, running back to the shepherd ("!" drawn over it)
-bool shorn = false;     // R69-F2: fleece taken this spring (drawn tan); set and cleared only by woolTick()
+bool shorn = false;     // R69-F2: fleece taken this spring (drawn tan); set and cleared only by woolTick() (R69-F4: and a chronicle load)
 int shornDay = 0;       // R69-F2: game_day of the shearing; the fleece is back kShornDays later
 };
 
@@ -10367,7 +10383,13 @@ void buildhouse(vector<barb>& barbs,vector<RectangleShape>& squares, vector<hous
 struct chronicleHouse { int race, dx, dy; bool foundation; };
 // R55-F4 (v3 "BARB" block): one named barb. name = barbNames index, -1 = Sasuke; home = index into the file's house list, -1 = none
 struct chronicleBarb { int name = -1, race = 0, birthRace = 0, trait = 0, leader = 0, hunger = 0, ageHours = 0, home = -1;
-                       int parentA = -1, parentB = -1, dynasty = -1; };   // R58-F2 (v4): file barb indices; all -1 from a v3 file
+                       int parentA = -1, parentB = -1, dynasty = -1;   // R58-F2 (v4): file barb indices; all -1 from a v3 file
+                       int cloak = 0, cloakAge = 0; };                 // R69-F4 (v7): 0 from an older file (no cloak)
+// R69-F4 (v7): the structure blocks, as read (counts checked; entries judged again by chronicleRestoreSites())
+struct chronicleTown { int race = 0, dx = 0, dy = 0, growth = 0, plot = 0; vector<int> houses; };   // houses: file house indices
+struct chronicleSheep { int slot = 0, shorn = 0, shornDay = 0; };
+struct chronicleFold { int race = 0, dx = 0, dy = 0, wool = 0, loom = 0, shearYear = -1; vector<chronicleSheep> sheep; };
+struct chronicleJetty { int race = 0, holed = 0, holedTicks = 0; };
 struct chronicleData {
     int day = 0, hour = 0;
     raceStock stocks[raceCount];
@@ -10392,6 +10414,14 @@ struct chronicleData {
     int vassal[raceCount][kChronicleVassalWords] = {};   // raw words: judged by chronicleRestoreVassals(), which drops a bad entry
     bool haveYear = false;                         // R65-F3: a "YEAR" block of the expected size was read
     uint32_t yearSeed = 0;                         // any value is valid
+    bool havePlot = false;                         // R69-F4: a valid "PLOT" block was read (absent before v7)
+    int plotCrop[raceCount][fieldsPerRace] = {};   // 0..cropKindCount-1
+    int plotLastCrop[raceCount][fieldsPerRace] = {};
+    bool haveTown = false, haveFold = false, haveJetty = false;   // R69-F4: valid blocks read (absent before v7)
+    vector<chronicleTown> towns;
+    vector<chronicleFold> folds;
+    vector<chronicleJetty> jetties;
+    vector<char> townHouse;                        // R69-F4: per file house, 1 = listed by a town (placed by chronicleRestoreSites())
 };
 
 int chronicleNameIndex(const barb& b) {   // R55-F4: -1 for Sasuke; names only ever come from barbNames or shinobiName
@@ -10434,7 +10464,8 @@ bool chronicleSaveBarbs(FILE* f, const vector<barb>& barbs, const vector<house>&
           && chronPut(f, clamp(b.hunger, 0, hungerCap)) && chronPut(f, clamp(now - b.bornHour, 0, kChronicleMaxDay * 24))
           && chronPut(f, home)
           && chronPut(f, fileIndex(b.parentAId)) && chronPut(f, fileIndex(b.parentBId))   // R58-F2 (v4)
-          && chronPut(f, b.dynastyIdx >= 0 && b.dynastyIdx < kDynastyCount ? b.dynastyIdx : -1);
+          && chronPut(f, b.dynastyIdx >= 0 && b.dynastyIdx < kDynastyCount ? b.dynastyIdx : -1)
+          && chronPut(f, b.cloak ? 1 : 0) && chronPut(f, b.cloak ? clamp(b.cloakAge, 0, kCloakWearDays - 1) : 0);   // R69-F4 (v7)
     }
     return ok;
 }
@@ -10518,7 +10549,92 @@ bool chronicleSaveWonder(FILE* f) {
     return ok;
 }
 
-bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
+// R69-F4: one tagged block from words already built in memory (so its size word is always exact)
+bool chronPutBlock(FILE* f, int32_t tag, const vector<int32_t>& w) {
+    bool ok = chronPut(f, tag) && chronPut(f, (int32_t)w.size());
+    for (size_t k = 0; ok && k < w.size(); k++) ok = chronPut(f, w[k]);
+    return ok;
+}
+
+// R69-F4: the "PLOT" block: every race's plot rotation (crop, lastCrop), placed or not
+bool chronicleSavePlot(FILE* f, const fieldGrid& fields) {
+    vector<int32_t> w{raceCount, fieldsPerRace};
+    for (int r = 0; r < raceCount; r++)
+        for (int k = 0; k < fieldsPerRace; k++) {
+            w.push_back(clamp((int)fields[r][k].crop, 0, cropKindCount - 1));
+            w.push_back(clamp((int)fields[r][k].lastCrop, 0, cropKindCount - 1));
+        }
+    return chronPutBlock(f, kChronicleBlockPlot, w);
+}
+
+// R69-F4: the "TOWN" block. Crates are offsets from the race's crate, like houses; each town house is its index in the
+// file's house list (a house past the written ones is left out). Towns with no written house are left out.
+bool chronicleSaveTown(FILE* f, const vector<house>& houses, int housesWritten) {
+    vector<int32_t> w{0};
+    int n = 0;
+    for (auto& t : towns) {
+        int r = clampRace(t.race);
+        vector<int32_t> hs;
+        for (int id : t.houses)
+            for (int k = 0; k < housesWritten; k++) if (houses[k].id == id) { hs.push_back(k); break; }
+        if (hs.empty() || (int)hs.size() > kTownMaxHouses) continue;
+        Vector2i c = chronicleCrate(r);
+        Vector2f tc = snapPx(t.crate);
+        w.insert(w.end(), {r, (int32_t)tc.x - c.x, (int32_t)tc.y - c.y, clamp(t.growth, 0, kTownGrowthPerStep), t.plot ? 1 : 0,
+                           (int32_t)hs.size()});
+        w.insert(w.end(), hs.begin(), hs.end());
+        n++;
+    }
+    w[0] = n;
+    return chronPutBlock(f, kChronicleBlockTown, w);
+}
+
+// R69-F4: the "FOLD" block: every built fold (a staked-out site is not saved; it is picked again) with its sheep. A bale
+// in a weaver's hands is counted back into the store, since the weave itself is never saved.
+bool chronicleSaveFold(FILE* f, const vector<deer>& deers) {
+    vector<int32_t> w{0};
+    int n = 0, year = game_day / yearDays;
+    for (int r = 0; r < raceCount; r++) {
+        const sheepFold& fd = folds[r];
+        if (!fd.built) continue;
+        Vector2i c = chronicleCrate(r);
+        Vector2f p = snapPx(fd.pos);
+        vector<int32_t> sh;
+        bool slotUsed[kFlockMax] = {};
+        for (auto& d : deers) {
+            if (!tame(d) || d.foldId != fd.id || d.flockSlot < 0 || d.flockSlot >= kFlockMax || slotUsed[d.flockSlot]) continue;
+            slotUsed[d.flockSlot] = true;
+            sh.insert(sh.end(), {d.flockSlot, d.shorn ? 1 : 0, d.shorn ? clamp(d.shornDay, 0, game_day) : 0});
+        }
+        w.insert(w.end(), {r, (int32_t)p.x - c.x, (int32_t)p.y - c.y,
+                           clamp(fd.wool + (fd.weaveStage == 1 ? 1 : 0), 0, kWoolStoreMax), fd.loomBuilt ? 1 : 0,
+                           clamp(fd.shearYear, -1, year), (int32_t)(sh.size() / kChronicleSheepWords)});
+        w.insert(w.end(), sh.begin(), sh.end());
+        n++;
+    }
+    w[0] = n;
+    return chronPutBlock(f, kChronicleBlockFold, w);
+}
+
+// R69-F4: the "JTTY" block. The site comes from this run's coast scan, so only the race and the boat's state are kept;
+// a boat out fishing is saved afloat (the trip is never saved).
+bool chronicleSaveJetty(FILE* f) {
+    vector<int32_t> w{0};
+    int n = 0;
+    bool raceSeen[raceCount] = {};
+    for (auto& j : jetties) {
+        int r = clampRace(j.race);
+        if (raceSeen[r]) continue;
+        raceSeen[r] = true;
+        bool holed = j.boat.state == boatHoled;
+        w.insert(w.end(), {r, holed ? 1 : 0, holed ? clamp(j.boat.holedTicks, 0, kBoatRebuildTicks) : 0});
+        n++;
+    }
+    w[0] = n;
+    return chronPutBlock(f, kChronicleBlockJetty, w);
+}
+
+bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses, const fieldGrid& fields, const vector<deer>& deers) {
     FILE* f = fopen(kChronicleTmpPath, "wb");
     if (!f) { printf("CHRONICLE - save failed: cannot open %s\n", kChronicleTmpPath); return false; }
     bool ok = chronPut(f, kChronicleMagic) && chronPut(f, kChronicleVersion) && chronPut(f, raceCount)
@@ -10545,6 +10661,10 @@ bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
     ok = ok && chronicleSaveVassal(f);                    // R65-F4 (v6)
     ok = ok && chronicleSaveYear(f);                      // R65-F3 (v6)
     ok = ok && chronicleSaveWonder(f);                    // R60-F3: likewise
+    ok = ok && chronicleSavePlot(f, fields);              // R69-F4 (v7): restored in this order
+    ok = ok && chronicleSaveTown(f, houses, n);
+    ok = ok && chronicleSaveFold(f, deers);
+    ok = ok && chronicleSaveJetty(f);
     ok = ok && chronPut(f, kChronicleEndMark);
     if (fclose(f) != 0) ok = false;
     if (!ok) {
@@ -10570,7 +10690,8 @@ bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses) {
 // R58-F2: a v4 entry adds parentA, parentB and dynasty; a v3 entry has none, so those stay -1 (no parents, no house).
 bool chronicleReadBarbs(FILE* f, int words, int version, chronicleData& d, const char*& why) {
     int n = 0;
-    const int perBarb = version >= kChronicleVersionDynasty ? kChronicleBarbWords : kChronicleBarbWordsV3;   // R59-F1: v5 too
+    const int perBarb = version >= kChronicleVersion ? kChronicleBarbWords                                   // R69-F4: v7
+                      : version >= kChronicleVersionDynasty ? kChronicleBarbWordsV4 : kChronicleBarbWordsV3;   // R59-F1: v5, v6 too
     if (words < 1 || !chronGetIn(f, 0, kChronicleMaxBarbs, n)) { why = "barb count over the cap"; return false; }
     if (words != 1 + n * perBarb) { why = "barb block size differs"; return false; }
     const int hungerCap = hungerThreshold * kChronicleMaxHungerMult;
@@ -10582,9 +10703,11 @@ bool chronicleReadBarbs(FILE* f, int words, int version, chronicleData& d, const
                && chronGetIn(f, 0, raceCount - 1, c.birthRace) && chronGetIn(f, 0, traitCount - 1, c.trait)
                && chronGetIn(f, 0, 1, c.leader) && chronGetIn(f, 0, hungerCap, c.hunger)
                && chronGetIn(f, 0, kChronicleMaxDay * 24, c.ageHours) && chronGetIn(f, -1, (int)d.houses.size() - 1, c.home);
-        if (ok && perBarb == kChronicleBarbWords)   // R58-F2 (v4)
+        if (ok && perBarb >= kChronicleBarbWordsV4)   // R58-F2 (v4)
             ok = chronGetIn(f, -1, n - 1, c.parentA) && chronGetIn(f, -1, n - 1, c.parentB)
               && chronGetIn(f, -1, kDynastyCount - 1, c.dynasty);
+        if (ok && perBarb >= kChronicleBarbWords)     // R69-F4 (v7): a cloak's age only with the cloak
+            ok = chronGetIn(f, 0, 1, c.cloak) && chronGetIn(f, 0, c.cloak ? kCloakWearDays - 1 : 0, c.cloakAge);
         if (!ok) { why = "barb out of range"; return false; }
         if (c.parentA == i) c.parentA = -1;   // nobody is their own parent
         if (c.parentB == i) c.parentB = -1;
@@ -10710,6 +10833,143 @@ bool chronicleReadYear(FILE* f, int words, chronicleData& d, const char*& why) {
     return true;
 }
 
+// R69-F4: a v7 block's words, read whole. Only a short file fails here (rejecting the file); the parse runs in memory.
+bool chronicleReadWords(FILE* f, int words, vector<int32_t>& w, const char*& why) {
+    w.assign(words, 0);
+    for (int k = 0; k < words; k++) if (!chronGet(f, w[k])) { why = "truncated"; return false; }
+    return true;
+}
+// R69-F4: in-memory cursor over a block's words: get() fails past the end or outside lo..hi; done() = every word used
+struct chronCursor {
+    const vector<int32_t>& w;
+    size_t at = 0;
+    bool get(int lo, int hi, int& out) {
+        if (at >= w.size() || w[at] < lo || w[at] > hi) return false;
+        out = w[at++];
+        return true;
+    }
+    bool done() const { return at == w.size(); }
+};
+
+// R69-F4: "PLOT" into d. The race and plot counts must match this build's and every crop be a known one, else the block
+// is skipped (every plot keeps the default rotation).
+bool chronicleReadPlot(FILE* f, int words, chronicleData& d, const char*& why) {
+    vector<int32_t> w;
+    if (!chronicleReadWords(f, words, w, why)) return false;
+    chronCursor c{w};
+    int races = 0, plots = 0;
+    bool ok = c.get(raceCount, raceCount, races) && c.get(fieldsPerRace, fieldsPerRace, plots);
+    for (int r = 0; ok && r < raceCount; r++)
+        for (int k = 0; ok && k < fieldsPerRace; k++)
+            ok = c.get(0, cropKindCount - 1, d.plotCrop[r][k]) && c.get(0, cropKindCount - 1, d.plotLastCrop[r][k]);
+    if (!ok || !c.done()) { printf("CHRONICLE - plot block invalid: no crop rotation restored\n"); return true; }
+    d.havePlot = true;
+    return true;
+}
+
+// R69-F4: "TOWN" into d. Counts and ranges are checked here (a block that doesn't parse exactly is skipped); a town
+// whose houses are not its own race's, repeat a house another town listed, or more than one town per race allows, is
+// dropped (its houses come back as quarter houses). Sites and slots are judged by chronicleRestoreSites().
+bool chronicleReadTown(FILE* f, int words, chronicleData& d, const char*& why) {
+    vector<int32_t> w;
+    if (!chronicleReadWords(f, words, w, why)) return false;
+    chronCursor c{w};
+    const int offMax = (int)worldSize, nh = (int)d.houses.size();
+    int n = 0;
+    bool ok = c.get(0, raceCount * kMaxTownsPerRace, n);
+    vector<chronicleTown> got;
+    for (int i = 0; ok && i < n; i++) {
+        chronicleTown t;
+        int cnt = 0;
+        ok = c.get(0, raceCount - 1, t.race) && c.get(-offMax, offMax, t.dx) && c.get(-offMax, offMax, t.dy)
+          && c.get(0, kTownGrowthPerStep, t.growth) && c.get(0, 1, t.plot) && c.get(1, kTownMaxHouses, cnt);
+        for (int k = 0; ok && k < cnt; k++) {
+            int hi = 0;
+            ok = c.get(0, nh - 1, hi);
+            t.houses.push_back(hi);
+        }
+        if (ok) got.push_back(t);
+    }
+    if (!ok || !c.done()) { printf("CHRONICLE - town block invalid: no town restored\n"); return true; }
+    vector<char> used(nh, 0);
+    int perRace[raceCount] = {};
+    for (auto& t : got) {
+        bool good = perRace[t.race] < kMaxTownsPerRace;
+        for (int k = 0; good && k < (int)t.houses.size(); k++) {
+            int hi = t.houses[k];
+            good = !used[hi] && d.houses[hi].race == t.race;
+            for (int j = 0; good && j < k; j++) good = t.houses[j] != hi;
+        }
+        if (!good) { printf("CHRONICLE - a saved %s town is invalid: dropped\n", raceDefs[t.race].name); continue; }
+        perRace[t.race]++;
+        for (int hi : t.houses) used[hi] = 1;
+        d.towns.push_back(t);
+    }
+    d.townHouse = used;
+    d.haveTown = true;
+    return true;
+}
+
+// R69-F4: "FOLD" into d. Same rule: an exact parse or the block is skipped; a second fold of one race, or a sheep slot
+// listed twice, drops that fold. shearYear and shornDay are bounded by the file's own clock (d.day).
+bool chronicleReadFold(FILE* f, int words, chronicleData& d, const char*& why) {
+    vector<int32_t> w;
+    if (!chronicleReadWords(f, words, w, why)) return false;
+    chronCursor c{w};
+    const int offMax = (int)worldSize;
+    int n = 0;
+    bool ok = c.get(0, raceCount, n);
+    vector<chronicleFold> got;
+    for (int i = 0; ok && i < n; i++) {
+        chronicleFold fd;
+        int cnt = 0;
+        ok = c.get(0, raceCount - 1, fd.race) && c.get(-offMax, offMax, fd.dx) && c.get(-offMax, offMax, fd.dy)
+          && c.get(0, kWoolStoreMax, fd.wool) && c.get(0, 1, fd.loom) && c.get(-1, d.day / yearDays, fd.shearYear)
+          && c.get(0, kFlockMax, cnt);
+        for (int k = 0; ok && k < cnt; k++) {
+            chronicleSheep s;
+            ok = c.get(0, kFlockMax - 1, s.slot) && c.get(0, 1, s.shorn) && c.get(0, s.shorn ? d.day : 0, s.shornDay);
+            fd.sheep.push_back(s);
+        }
+        if (ok) got.push_back(fd);
+    }
+    if (!ok || !c.done()) { printf("CHRONICLE - fold block invalid: no fold restored\n"); return true; }
+    bool raceHas[raceCount] = {};
+    for (auto& fd : got) {
+        bool slot[kFlockMax] = {}, good = !raceHas[fd.race];
+        for (auto& s : fd.sheep) { good = good && !slot[s.slot]; slot[s.slot] = true; }
+        if (!good) { printf("CHRONICLE - a saved %s fold is invalid: dropped\n", raceDefs[fd.race].name); continue; }
+        raceHas[fd.race] = true;
+        d.folds.push_back(fd);
+    }
+    d.haveFold = true;
+    return true;
+}
+
+// R69-F4: "JTTY" into d. An exact parse or the block is skipped; a second jetty of one race is dropped.
+bool chronicleReadJetty(FILE* f, int words, chronicleData& d, const char*& why) {
+    vector<int32_t> w;
+    if (!chronicleReadWords(f, words, w, why)) return false;
+    chronCursor c{w};
+    int n = 0;
+    bool ok = c.get(0, raceCount, n);
+    vector<chronicleJetty> got;
+    for (int i = 0; ok && i < n; i++) {
+        chronicleJetty j;
+        ok = c.get(0, raceCount - 1, j.race) && c.get(0, 1, j.holed) && c.get(0, j.holed ? kBoatRebuildTicks : 0, j.holedTicks);
+        if (ok) got.push_back(j);
+    }
+    if (!ok || !c.done()) { printf("CHRONICLE - jetty block invalid: no jetty restored\n"); return true; }
+    bool raceHas[raceCount] = {};
+    for (auto& j : got) {
+        if (raceHas[j.race]) { printf("CHRONICLE - a second saved %s jetty: dropped\n", raceDefs[j.race].name); continue; }
+        raceHas[j.race] = true;
+        d.jetties.push_back(j);
+    }
+    d.haveJetty = true;
+    return true;
+}
+
 // Reads and bounds-checks the whole file into out; nothing global is touched here. why = the rejection reason.
 bool chronicleRead(chronicleData& out, const char*& why) {
     why = nullptr;
@@ -10722,7 +10982,7 @@ bool chronicleRead(chronicleData& out, const char*& why) {
     const int offMax = (int)worldSize;
     do {
         if (!chronGet(f, v) || v != kChronicleMagic) { why = "not a chronicle file"; break; }
-        if (!chronGet(f, v) || (v != kChronicleVersion && v != kChronicleVersionAlly && v != kChronicleVersionDynasty&& v != kChronicleVersionBlocks
+        if (!chronGet(f, v) || (v != kChronicleVersion && v != kChronicleVersionVassal && v != kChronicleVersionAlly && v != kChronicleVersionDynasty&& v != kChronicleVersionBlocks
                                 && v != kChronicleVersionEras && v != kChronicleVersionNoEras)) {
             why = "unknown version"; break;
         }
@@ -10758,6 +11018,7 @@ bool chronicleRead(chronicleData& out, const char*& why) {
         if (!ok) { why = "house out of range"; break; }
         if (version >= 3) {   // R55-F4: tagged blocks up to the end mark (v1/v2 go straight to the end mark)
             bool haveBarbs = false;
+            bool seenPlot = false, seenTown = false, seenFold = false, seenJetty = false;   // R69-F4: a block may be skipped yet seen
             int blocks = 0;
             while (!why) {
                 if (!chronGet(f, v)) { why = "truncated"; break; }
@@ -10791,6 +11052,22 @@ bool chronicleRead(chronicleData& out, const char*& why) {
                 } else if (tag == kChronicleBlockYear) {   // R65-F3
                     if (d.haveYear) { why = "two year blocks"; break; }
                     if (!chronicleReadYear(f, words, d, why)) break;
+                } else if (tag == kChronicleBlockPlot) {   // R69-F4 (v7)
+                    if (seenPlot) { why = "two plot blocks"; break; }
+                    seenPlot = true;
+                    if (!chronicleReadPlot(f, words, d, why)) break;
+                } else if (tag == kChronicleBlockTown) {
+                    if (seenTown) { why = "two town blocks"; break; }
+                    seenTown = true;
+                    if (!chronicleReadTown(f, words, d, why)) break;
+                } else if (tag == kChronicleBlockFold) {
+                    if (seenFold) { why = "two fold blocks"; break; }
+                    seenFold = true;
+                    if (!chronicleReadFold(f, words, d, why)) break;
+                } else if (tag == kChronicleBlockJetty) {
+                    if (seenJetty) { why = "two jetty blocks"; break; }
+                    seenJetty = true;
+                    if (!chronicleReadJetty(f, words, d, why)) break;
                 } else {   // a block from a later feature: skipped word by word, so a short file still fails
                     for (int k = 0; k < words && !why; k++) if (!chronGet(f, v)) why = "truncated";
                 }
@@ -10815,6 +11092,31 @@ bool chronicleSpotOk(const vector<barb>& barbs, const vector<house>& houses, con
     float cr = quarterClearRadiusFor(r);
     if (d.x * d.x + d.y * d.y > cr * cr) return homesteadSpotOk(barbs, houses, r, qc, tx, ty, trees, rocks, bushshapes);
     return true;
+}
+
+// R69-F4: file house hi as a quarter house through addHouse(), at its old offset from the crate or (the new map put
+// something there) the same disc roll buildhouse() uses. Sets d.houseNewId[hi]. 0 = placed, 1 = moved, -1 = dropped.
+int chronicleRestoreHouse(chronicleData& d, int hi, const vector<barb>& barbs, vector<house>& houses, vector<RectangleShape>& houseshapes,
+                          const fieldGrid& fields, const vector<tree>& trees, const vector<rock>& rocks, const vector<CircleShape>& bushshapes) {
+    const chronicleHouse& ch = d.houses[hi];
+    Vector2f qc = quarterCentre(ch.race);
+    Vector2i c = chronicleCrate(ch.race);
+    int tx = c.x + ch.dx, ty = c.y + ch.dy;
+    bool ok = chronicleSpotOk(barbs, houses, fields, ch.race, qc, tx, ty, trees, rocks, bushshapes), moved = false;
+    if (!ok) {
+        int qr = (int)quarterRadiusFor(ch.race);
+        uniform_int_distribution<int> spot(-qr, qr);
+        for (int k = 0; k < kChronicleHouseTries && !ok; k++) {
+            int dx = spot(gen), dy = spot(gen);
+            if (dx * dx + dy * dy > qr * qr) continue;
+            tx = (int)qc.x + dx; ty = (int)qc.y + dy;
+            ok = chronicleSpotOk(barbs, houses, fields, ch.race, qc, tx, ty, trees, rocks, bushshapes);
+        }
+        moved = ok;
+    }
+    if (!ok) return -1;
+    d.houseNewId[hi] = houses[addHouse(houses, houseshapes, tx, ty, ch.foundation, (barbRace)ch.race)].id;   // R55-F4
+    return moved ? 1 : 0;
 }
 
 // Startup restore. Runs once the world, trees and houseshapes exist; the file is fully read and checked before any global
@@ -10868,25 +11170,10 @@ bool chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
     for (int r = 0; r < raceCount; r++) wonder[r] = d.haveWonder ? clamp(d.wonderStage[r], 0, wonderStageCount(r)) : 0;
     int placed = 0, moved = 0, dropped = 0;
     for (int hi = 0; hi < (int)d.houses.size(); hi++) {
-        const chronicleHouse& ch = d.houses[hi];
-        Vector2f qc = quarterCentre(ch.race);
-        Vector2i c = chronicleCrate(ch.race);
-        int tx = c.x + ch.dx, ty = c.y + ch.dy;
-        bool ok = chronicleSpotOk(barbs, houses, fields, ch.race, qc, tx, ty, trees, rocks, bushshapes);
-        if (!ok) {   // the new map put something there: the same disc roll buildhouse() uses for a quarter house
-            int qr = (int)quarterRadiusFor(ch.race);
-            uniform_int_distribution<int> spot(-qr, qr);
-            for (int k = 0; k < kChronicleHouseTries && !ok; k++) {
-                int dx = spot(gen), dy = spot(gen);
-                if (dx * dx + dy * dy > qr * qr) continue;
-                tx = (int)qc.x + dx; ty = (int)qc.y + dy;
-                ok = chronicleSpotOk(barbs, houses, fields, ch.race, qc, tx, ty, trees, rocks, bushshapes);
-            }
-            if (ok) moved++;
-        }
-        if (!ok) { dropped++; continue; }
-        d.houseNewId[hi] = houses[addHouse(houses, houseshapes, tx, ty, ch.foundation, (barbRace)ch.race)].id;   // R55-F4
-        placed++;
+        if (hi < (int)d.townHouse.size() && d.townHouse[hi]) continue;   // R69-F4: chronicleRestoreSites() raises it with its town
+        int r = chronicleRestoreHouse(d, hi, barbs, houses, houseshapes, fields, trees, rocks, bushshapes);
+        if (r < 0) dropped++;
+        else { placed++; if (r > 0) moved++; }
     }
     int year = game_day / yearDays + 1;
     const char* seasonName = seasonDefs[seasonOf(game_day)].name;
@@ -10899,8 +11186,59 @@ bool chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
 }
 
 // R54-F2: the brief, dim dawn line; starts part-way through its life so it leaves the ticker early
-void chronicleDawn(const vector<barb>& barbs, const vector<house>& houses) {
-    if (!chronicleSave(barbs, houses)) { logEvent("Chronicle could not be saved", kChronicleSaveTint); return; }
+// R69-F4: the round-trip test, run after every dawn save: the file just written is read back through chronicleRead()
+// (the loader's own checks) and the v7 state is compared with the live world: cloaks and their ages, every plot's
+// rotation, each town's growth, plot flag and houses, each fold's wool, loom, shearing year, flock and shorn sheep, and
+// each jetty's holed boat. printf only: "ok", or the first thing that differs.
+void chronicleRoundTrip(const vector<barb>& barbs, const fieldGrid& fields, const vector<deer>& deers) {
+    chronicleData d;
+    const char* why = nullptr;
+    string bad;
+    if (!chronicleRead(d, why)) bad = string("read back failed (") + (why ? why : "no file") + ")";
+    int k = 0, cloaks = 0;
+    for (auto& b : barbs) {
+        if (!bad.empty() || b.health <= 0) continue;
+        if (k >= kChronicleMaxBarbs) break;
+        if (k >= (int)d.barbs.size()) { bad = "barb count"; break; }
+        const chronicleBarb& c = d.barbs[k++];
+        if (c.cloak != (b.cloak ? 1 : 0) || (b.cloak && c.cloakAge != min(b.cloakAge, kCloakWearDays - 1))) bad = string("cloak of ") + b.name;
+        cloaks += b.cloak ? 1 : 0;
+    }
+    for (int r = 0; bad.empty() && r < raceCount; r++)
+        for (int p = 0; bad.empty() && p < fieldsPerRace; p++)
+            if (!d.havePlot || d.plotCrop[r][p] != fields[r][p].crop || d.plotLastCrop[r][p] != fields[r][p].lastCrop)
+                bad = "crop rotation of " + string(racePlurals[r]) + " plot " + to_string(p + 1);
+    if (bad.empty() && (!d.haveTown || d.towns.size() != towns.size())) bad = "town count";
+    for (int t = 0; bad.empty() && t < (int)towns.size(); t++) {
+        const chronicleTown& c = d.towns[t];
+        if (c.race != towns[t].race || c.growth != towns[t].growth || c.plot != (towns[t].plot ? 1 : 0) || c.houses.size() != towns[t].houses.size())
+            bad = "town " + to_string(towns[t].id);
+    }
+    int built = 0, shorn = 0;
+    for (auto& f : folds) built += f.built ? 1 : 0;
+    if (bad.empty() && (!d.haveFold || (int)d.folds.size() != built)) bad = "fold count";
+    for (auto& c : d.folds) {
+        if (!bad.empty()) break;
+        const sheepFold& f = folds[clampRace(c.race)];
+        int flock = 0, fShorn = 0, cShorn = 0;
+        for (auto& dd : deers) if (tame(dd) && dd.foldId == f.id) { flock++; fShorn += dd.shorn ? 1 : 0; }
+        for (auto& s : c.sheep) cShorn += s.shorn;
+        shorn += cShorn;
+        if (!f.built || c.wool != min(kWoolStoreMax, f.wool + (f.weaveStage == 1 ? 1 : 0)) || c.loom != (f.loomBuilt ? 1 : 0)
+            || c.shearYear != f.shearYear || (int)c.sheep.size() != flock || cShorn != fShorn)
+            bad = "fold of the " + string(racePlurals[clampRace(c.race)]);
+    }
+    if (bad.empty() && (!d.haveJetty || d.jetties.size() != jetties.size())) bad = "jetty count";
+    for (int j = 0; bad.empty() && j < (int)jetties.size(); j++)
+        if (d.jetties[j].race != jetties[j].race || d.jetties[j].holed != (jetties[j].boat.state == boatHoled ? 1 : 0)) bad = "jetty " + to_string(jetties[j].id);
+    if (!bad.empty()) { printf("CHRONICLE ROUND-TRIP - MISMATCH: %s\n", bad.c_str()); return; }
+    printf("CHRONICLE ROUND-TRIP - ok: %d cloaks, %d towns, %d folds (%d shorn sheep), %d jetties, %d plots' rotation\n",
+           cloaks, (int)d.towns.size(), (int)d.folds.size(), shorn, (int)d.jetties.size(), raceCount * fieldsPerRace);
+}
+
+void chronicleDawn(const vector<barb>& barbs, const vector<house>& houses, const fieldGrid& fields, const vector<deer>& deers) {
+    if (!chronicleSave(barbs, houses, fields, deers)) { logEvent("Chronicle could not be saved", kChronicleSaveTint); return; }
+    chronicleRoundTrip(barbs, fields, deers);   // R69-F4
     pushEvent("Chronicle saved, day " + to_string(game_day + 1), kChronicleSaveTint, true);
     if (!events.empty()) events.back().age = max(events.back().age, eventFadeTicks - kChronicleSaveLineTicks);
 }
@@ -12338,6 +12676,8 @@ void makeBarb(Vector2i pos, vector<barb>& barbs, vector<RectangleShape>& squares
         b.trait = (barbTrait)clamp(saved->trait, 0, traitCount - 1);
         b.hunger = max(0, saved->hunger);
         b.bornHour -= max(0, saved->ageHours);
+        b.cloak = saved->cloak != 0;   // R69-F4 (v7): the shoulder pixel's fade follows cloakAge, so it reads as before
+        b.cloakAge = b.cloak ? clamp(saved->cloakAge, 0, kCloakWearDays - 1) : 0;
         if (saved->name < 0 || saved->name >= barbNameCount) {
             b.shinobi = true;
             b.name = shinobiName;
@@ -23323,6 +23663,151 @@ void woolTick(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares) {
     }
 }
 
+// R69-F4: right after chronicleRestore() and before chronicleRestoreBarbs(), so town houses are in d.houseNewId before
+// the returners look up their homes. Restores, in this order, the plot rotation, the towns, the folds and the jetty.
+// Each entry is checked whole (site, every house slot and slab, every sheep) before anything is added, so a failed one
+// leaves nothing behind: a town that can't stand sends its houses back through chronicleRestoreHouse() as quarter houses
+// (the v6 behaviour), a fold whose old site and a fresh site both fail is left for buildfolds() to raise again, and a
+// jetty whose race is not this map's coastal race is dropped. Restored folds are penned with their saved flock
+// (shorn flags and days kept); a restored jetty takes this map's scanned site with its boat afloat or holed as saved.
+// A v6-or-older file has no blocks here: nothing changes and no line is posted.
+void chronicleRestoreSites(chronicleData& d, world& wd, vector<house>& houses, vector<RectangleShape>& houseshapes, fieldGrid& fields,
+                           const vector<shrine>& shrines, const vector<tree>& trees, const vector<rock>& rocks,
+                           const vector<CircleShape>& bushshapes) {
+    const vector<barb>& barbs = wd.barbs;
+    for (int r = 0; r < raceCount && d.havePlot; r++)   // PLOT: rotation only; the plots are sited and sown again in play
+        for (int k = 0; k < fieldsPerRace; k++) {
+            fields[r][k].crop = (cropKind)clamp(d.plotCrop[r][k], 0, cropKindCount - 1);
+            fields[r][k].lastCrop = (cropKind)clamp(d.plotLastCrop[r][k], 0, cropKindCount - 1);
+        }
+
+    int townsBack = 0, townsLost = 0;   // TOWN
+    for (auto& ct : d.towns) {
+        int r = clampRace(ct.race);
+        Vector2i c = chronicleCrate(r);
+        Vector2f crate((float)(c.x + ct.dx), (float)(c.y + ct.dy));
+        bool ok = townsOfRace(r) < kMaxTownsPerRace && townSiteOk(r, crate, houses, nullptr, nullptr, &bushshapes);
+        bool slotUsed[kTownMaxHouses] = {};
+        vector<Vector2f> spots;   // every house top-left, checked before the first is raised
+        for (int k = 0; ok && k < (int)ct.houses.size(); k++) {
+            const chronicleHouse& ch = d.houses[ct.houses[k]];
+            int ox = ch.dx - ct.dx, oy = ch.dy - ct.dy;   // both offsets are from the same race crate
+            int s = -1;
+            for (int q = 0; q < kTownMaxHouses && s < 0; q++) {
+                Vector2f o = snapPx(q < kTownHouses ? kTownHouseOffset[q] : kTownGrowHouseOffset[q - kTownHouses]);
+                if ((int)o.x == ox && (int)o.y == oy) s = q;
+            }
+            ok = s >= 0 && !slotUsed[s];
+            if (!ok) break;
+            slotUsed[s] = true;
+            Vector2f hp = crate + Vector2f((float)ox, (float)oy);
+            FloatRect slab(hp - Vector2f(3.0f, 3.0f), houseSlabSize);
+            for (auto& h : houses)
+                if (slab.findIntersection(FloatRect(Vector2f(h.x - 3.0f, h.y - 3.0f), houseSlabSize))) { ok = false; break; }
+            spots.push_back(hp);
+        }
+        if (!ok) {
+            int back = 0;
+            for (int hi : ct.houses) if (chronicleRestoreHouse(d, hi, barbs, houses, houseshapes, fields, trees, rocks, bushshapes) >= 0) back++;
+            printf("CHRONICLE - the %s town at (%.0f, %.0f) cannot stand on this map: %d of its %d houses rejoin the quarter\n",
+                   racePlurals[r], crate.x, crate.y, back, (int)ct.houses.size());
+            townsLost++;
+            continue;
+        }
+        Town t;
+        t.id = nextTownId++;
+        t.race = r;
+        t.crate = crate;
+        t.growth = ct.growth;
+        t.plot = ct.plot != 0;
+        for (int k = 0; k < (int)spots.size(); k++)
+            d.houseNewId[ct.houses[k]] = houses[townAddHouse(t, houses, houseshapes, spots[k])].id;
+        towns.push_back(t);
+        townsBack++;
+        printf("CHRONICLE - %s New Town %d back at (%.0f, %.0f): %d houses, growth %d/%d%s\n", raceDefs[r].name, t.id, crate.x, crate.y,
+               (int)t.houses.size(), t.growth, kTownGrowthPerStep, t.plot ? ", plot tilled" : "");
+    }
+
+    int foldsBack = 0, foldsMoved = 0, foldsLost = 0;   // FOLD
+    for (auto& cf : d.folds) {
+        int r = clampRace(cf.race);
+        if (folds[r].placed) { foldsLost++; continue; }
+        Vector2i c = chronicleCrate(r);
+        Vector2f pos((float)(c.x + cf.dx), (float)(c.y + cf.dy));
+        bool ok = foldSiteOk(r, pos, barbs, houses, fields, shrines, bushshapes), moved = false;
+        if (!ok && findFoldSite(r, barbs, houses, fields, shrines, bushshapes, pos)) { ok = moved = true; foldsMoved++; }
+        if (!ok) {
+            printf("CHRONICLE - no site for the %s fold on this map: it will be fenced again\n", racePlurals[r]);
+            foldsLost++;
+            continue;
+        }
+        sheepFold f;
+        f.placed = f.built = true;
+        f.id = nextFoldId++;
+        f.pos = snapPx(pos);
+        f.phase = foldPenned;
+        f.wool = cf.wool;
+        f.loomBuilt = cf.loom != 0;
+        f.shearYear = cf.shearYear;
+        vector<deer> flock;   // built whole, then added through addAnimal() (deers and deershape together)
+        for (auto& s : cf.sheep) {
+            deer sh;
+            sh.species = speciesSheep;
+            sh.foldId = f.id;
+            sh.flockSlot = s.slot;
+            Vector2f p = foldPenSpot(f, s.slot);
+            sh.x = (int)p.x;
+            sh.y = (int)p.y;
+            sh.shorn = s.shorn != 0 && game_day - s.shornDay < kShornDays;   // a fleece already due back is not drawn tan
+            sh.shornDay = sh.shorn ? s.shornDay : 0;
+            flock.push_back(sh);
+        }
+        folds[r] = f;
+        for (auto& sh : flock) addAnimal(wd, sh);
+        foldsBack++;
+        printf("CHRONICLE - %s fold %d back at (%.0f, %.0f)%s: %d sheep, %d bales%s\n", raceDefs[r].name, f.id, f.pos.x, f.pos.y,
+               moved ? " (moved)" : "",
+               (int)flock.size(), f.wool, f.loomBuilt ? ", loom standing" : "");
+    }
+
+    int jettiesBack = 0, jettiesLost = 0;   // JTTY
+    if (!d.jetties.empty()) scanJettySite();
+    for (auto& cj : d.jetties) {
+        int r = clampRace(cj.race);
+        bool have = false;
+        for (auto& j : jetties) if (j.race == r) have = true;
+        if (have || !jettySite.found || jettySite.race != r) {
+            printf("CHRONICLE - the %s jetty has no strand of theirs on this map: dropped\n", racePlurals[r]);
+            jettiesLost++;
+            continue;
+        }
+        jetty j;
+        j.id = nextJettyId++;
+        j.race = r;
+        j.deck = jettySite.deck;
+        j.deckSize = jettySite.deckSize;
+        j.moor = jettySite.moor;
+        j.seaward = jettySite.seaward;
+        j.foot = jettySite.foot;
+        j.boat.id = nextBoatId++;
+        j.boat.jettyId = j.id;
+        j.boat.state = cj.holed ? boatHoled : boatAfloat;
+        j.boat.holedTicks = cj.holed ? cj.holedTicks : 0;
+        jetties.push_back(j);
+        jettiesBack++;
+        printf("CHRONICLE - %s jetty %d back at (%.0f, %.0f), boat %d %s\n", raceDefs[r].name, j.id, j.foot.x, j.foot.y, j.boat.id,
+               cj.holed ? "holed" : "afloat");
+    }
+
+    if (!d.havePlot && !d.haveTown && !d.haveFold && !d.haveJetty) return;   // v6 or older: nothing to report
+    printf("CHRONICLE - sites: %d towns (%d lost), %d folds (%d moved, %d lost), %d jetties (%d lost), crop rotation %s\n",
+           townsBack, townsLost, foldsBack, foldsMoved, foldsLost, jettiesBack, jettiesLost, d.havePlot ? "kept" : "reset");
+    if (townsBack + foldsBack + jettiesBack == 0) return;
+    auto count = [](int n, const char* one, const char* many) { return to_string(n) + " " + (n == 1 ? one : many); };
+    logEvent("Chronicle rebuilds " + count(townsBack, "town", "towns") + ", " + count(foldsBack, "fold", "folds") + ", "
+             + count(jettiesBack, "jetty", "jetties"), kChronicleRestoreTint);
+}
+
 // R66-F3: world layer with the buildings, under the sheep and the barbs. Trampled translucent floor, woven rails with
 // darker posts, the 4px gate gap in the bottom rail (barred while the flock is in) and the lamp post at the top-right
 // corner with its dull head (drawFoldOverlay() lights it). A staked-out site not yet fenced shows its four corner posts.
@@ -24181,6 +24666,7 @@ int main() {
     {
         chronicleData chron;
         if (chronicleRestore(barbs, houses, houseshapes, fields, trees, rocks, bushshapes, chron)) {
+            chronicleRestoreSites(chron, wd, houses, houseshapes, fields, shrines, trees, rocks, bushshapes);   // R69-F4: town houses before the homes resolve
             chronicleRestoreBarbs(chron, barbs, squares, birthRings);   // R55-F4: after the houses, so home ids resolve
             chronicleRestoreWar(chron, barbs);   // R60-F1: after the alliances and returners, so the checks see them
             chronicleRestoreVassals(chron, barbs);   // R65-F4: last, once the barbs exist, so both race ids resolve
@@ -24369,7 +24855,7 @@ int main() {
                     int hourWas = game_time;
                     clockk();
                     if (game_time != hourWas && game_time == nightEndHour) {
-                        chronicleDawn(barbs, houses);   // R54-F2: dawn autosave; R55-F4: with the named barbs
+                        chronicleDawn(barbs, houses, fields, deers);   // R54-F2: dawn autosave; R55-F4: with the named barbs; R69-F4: sites
                         exileDawn(barbs, houses, stores);   // R54-F3: the dawn emigration check
                         marriageDawn(barbs, squares, houses, stores);   // R59-F1: a leader's child may set out to wed
                         townDawn(barbs, squares, houses, trees, rocks, bushshapes, stores);   // R66-F1: a crowded race may send founders
