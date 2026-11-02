@@ -1414,6 +1414,23 @@ const Color kSheepShornColor(194, 168, 122);         // tan short fleece: warm a
 const Color kWoolBaleColor(214, 204, 172);           // a shade under the fleece, so a carried bale reads off the barb body
 const Color kLoomWarpColor(214, 204, 172, 110);      // translucent warp threads on an idle loom
 const Color kCloakColor(108, 126, 150);              // muted grey-blue: the cloth on the loom and the shoulder pixel
+// R69-F2b Lambs and Stray-Only Wolves, phase 2: once per spring day a penned fold below kFlockMax with a grown ewe may
+// bear one lamb (kLambChance) in its lowest free pen slot: a 2x1 whiter body that grows to a 3x2 sheep in place after
+// kLambGrowTicks. A hunting wolf may take a fold sheep only while it is a stray (out past the tether), only while its
+// flock still holds more than kWolfFlockFloor and at most once per fold every kWolfSheepGapDays; a penned or grazing
+// sheep is never prey. Every phase-2 flock change goes through flockAddRemove(): a lamb in through addAnimal(), taken
+// sheep out by a descending-index sweep after the wolf loop (deers[i] and deershape[i] together). lambAge, the fold's
+// lambDay and lastWolfDay are not saved: a chronicle load brings lambs back as grown sheep.
+const season kLambSeason = seasonSpring;
+const float kLambChance = 0.6f;                      // per fold per spring day (~1 lamb a fold a spring)
+const int kLambGrowTicks = 2 * 24 * ticksPerGameHour;   // two game days from lamb to sheep
+const Vector2f kLambBodySize(2.0f, 1.0f);            // logic hitbox and drawn body
+const Vector2f kLambHeadPos(2.0f, 0.0f);             // 1x1 dark face just in front of the body (facing right)
+const float kLambLegX[2] = {0.0f, 1.0f};             // back, front
+const Color kLambWoolColor(246, 242, 228);           // a shade whiter than the ewes' cream
+const int kWolfFlockFloor = 3;                       // wolves leave a flock this small alone (lambs regrow it)
+const int kWolfSheepGapDays = 2;                     // at most one sheep a fold to wolves in this many days
+const Color kWolfSheepTickerTint(178, 180, 196);     // the wolf-pack ticker grey
 // R54-F1 Caravans and Coin, phase 1: a race with a spare stock sends one two-barb caravan (held by barb id, owned by
 // caravanTick()) along the route planner to a rival crate that is not cold. There the pair swaps one lot each of a
 // surplus kind, the relation warms, and a pair at or above kRelFriendlyMinRelation becomes "friendly" for
@@ -4019,6 +4036,8 @@ struct sheepFold {
     bool loomBuilt = false;        // R69-F2: the loom beside the fence stands (before that, jobLoom is its build)
     int weaveStage = 0;            // R69-F2: 0 = weaver (a barb of this race holding jobLoom) heads for the gate; 1 = carries a bale to the loom
     float weaveFrac = 0.0f;        // R69-F2: cloth on the loom, 0..1 (draw only; set by woolTick())
+    int lambDay = -1;              // R69-F2b: game_day of the last lamb roll (one a day); not saved
+    int lastWolfDay = -1;          // R69-F2b: game_day a wolf last took one of this flock; not saved
 };
 sheepFold folds[raceCount];
 int nextFoldId = 0;
@@ -5742,6 +5761,8 @@ int flockSlot = 0;      // R66-F3: pen slot / place round the shepherd (0..kFloc
 bool stray = false;     // R66-F3: past the tether, running back to the shepherd ("!" drawn over it)
 bool shorn = false;     // R69-F2: fleece taken this spring (drawn tan); set and cleared only by woolTick() (R69-F4: and a chronicle load)
 int shornDay = 0;       // R69-F2: game_day of the shearing; the fleece is back kShornDays later
+int lambAge = 0;        // R69-F2b: ticks until a lamb grows up; > 0 = lamb. Set only through flockAddRemove(); not saved
+bool wolfTaken = false; // R69-F2b: a wolf took this stray; set by wolfTick(), swept by flockAddRemove() after the wolf loop
 };
 
 int nextDeerId = 0;
@@ -5751,7 +5772,7 @@ int nextDeerId = 0;
 bool tame(const deer& d) { return d.foldId >= 0; }
 
 const speciesDef& speciesOf(const deer& d) { return speciesDefs[d.species]; }
-Color animalBodyColor(const deer& d) { return d.fawnAge > 0 ? kFawnBody : d.shorn ? kSheepShornColor : speciesOf(d).body; }   // R64-F3: unflashed fill; R69-F2: tan once shorn
+Color animalBodyColor(const deer& d) { return d.fawnAge > 0 ? kFawnBody : d.lambAge > 0 ? kLambWoolColor : d.shorn ? kSheepShornColor : speciesOf(d).body; }   // R64-F3: unflashed fill; R69-F2: tan once shorn; R69-F2b: lamb
 
 int countSpecies(const vector<deer>& deers, animalSpecies s) {
 	int n = 0;
@@ -6753,6 +6774,7 @@ int clearDen(vector<wolf>& wolves, int id) {
 }
 
 bool placeDenSite(Vector2f& out, const vector<CircleShape>& tris, const vector<RectangleShape>& houseshapes);   // after placePoi()
+int flockAddRemove(world& wd, vector<barb>& barbs, const deer* lamb);   // R69-F2b: after addAnimal()
 
 // Wolves enter from an edge, chase the nearest deer and kill it on contact (no food). After one kill,
 // or once deer are scarce (<= wolfMinDeer), they walk back out, so they can never wipe the deer out.
@@ -6817,6 +6839,17 @@ void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs, const vector
 		}
 	}
 	bool trail = kWolvesTrail && herdOnTrek(deers);   // R56-F1: while the herd treks, wolves follow it (off by default)
+	int flockLeft[raceCount] = {};   // R69-F2b: fold sheep still standing per race (taken ones drop out as they are marked)
+	for (auto& d : deers) {
+		int r = tame(d) ? findFoldById(d.foldId) : -1;
+		if (r >= 0 && !d.wolfTaken) flockLeft[r]++;
+	}
+	auto strayPrey = [&](const deer& d) {   // R69-F2b: a fold sheep is prey only as a stray, above the floor, past the gap
+		int r = findFoldById(d.foldId);
+		return r >= 0 && d.stray && !d.wolfTaken && flockLeft[r] > kWolfFlockFloor
+		    && (folds[r].lastWolfDay < 0 || game_day - folds[r].lastWolfDay >= kWolfSheepGapDays);
+	};
+	int sheepTaken = 0;
 	for (int i = 0; i < (int)wolves.size(); ) {
 		wolf& w = wolves[i];
 		Vector2f pos = w.shape.getPosition();
@@ -6827,8 +6860,26 @@ void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs, const vector
 		if (w.phase == wolf::Hunting) {
 			prey = findNearest(pos, noSearchRadius, (int)deershape.size(),
 			                   [&](int k) { return deershape[k].getPosition(); },
-			                   [&](int k) { return tame(deers[k]) || deers[k].species != speciesDeer || (trail && deers[k].migrate == trekNone); });   // R66-F3: never a fold sheep
+			                   [&](int k) {
+			                       if (tame(deers[k])) return !strayPrey(deers[k]);   // R69-F2b: a fold sheep only as a stray
+			                       return deers[k].species != speciesDeer || (trail && deers[k].migrate == trekNone);
+			                   });
 			if (prey != -1) goal = deershape[prey].getPosition();
+		}
+		if (prey != -1 && tame(deers[prey]) && w.shape.getGlobalBounds().findIntersection(deershape[prey].getGlobalBounds()).has_value()) {
+			// R69-F2b: marked only; flockAddRemove() sweeps it out after this loop, so no index moves while wolves iterate
+			deer& s = deers[prey];
+			int r = findFoldById(s.foldId);
+			s.wolfTaken = true;
+			flockLeft[r]--;
+			folds[r].lastWolfDay = game_day;
+			sheepTaken++;
+			w.phase = wolf::Leaving;
+			printf("WOLF TOOK A STRAY - %s sheep %d%s from fold %d, %d left\n", racePlurals[r], s.id, s.lambAge > 0 ? " (lamb)" : "",
+			       folds[r].id, flockLeft[r]);
+			logRaceEvent(string("A wolf takes a stray ") + (s.lambAge > 0 ? "lamb" : "sheep") + " from the " + racePlurals[r] + " flock", r);
+			++i;
+			continue;
 		}
 		if (prey != -1 && w.shape.getGlobalBounds().findIntersection(deershape[prey].getGlobalBounds()).has_value()) {
 			swapRemove(deers, prey);
@@ -6853,6 +6904,7 @@ void wolfTick(vector<wolf>& wolves, world& wd, vector<barb>& barbs, const vector
 		}
 		++i;
 	}
+	if (sheepTaken > 0) flockAddRemove(wd, barbs, nullptr);   // R69-F2b: the descending sweep, after the wolf loop
 	// R63-F6: a hunter (on a deer chase) or a watchman reaching a den clears it. Reverse: clearDen() swap-removes dens.
 	for (int di = (int)dens.size() - 1; di >= 0; di--) {
 		Vector2f dc = denCentre(dens[di]);
@@ -6886,9 +6938,34 @@ void addAnimal(world& wd, deer d, bool fawn = false) {
 	deers.push_back(d);
 	RectangleShape ds;
 	ds.setPosition(Vector2f(d.x, d.y));
-	ds.setSize(d.fawnAge > 0 ? kFawnBodySize : sp.bodySize);
+	ds.setSize(d.fawnAge > 0 ? kFawnBodySize : d.lambAge > 0 ? kLambBodySize : sp.bodySize);   // R69-F2b: lamb
 	ds.setFillColor(animalBodyColor(d));
 	deershape.push_back(ds);
+}
+
+// R69-F2b: the one phase-2 flock helper. Sweeps every wolf-taken sheep out by descending index (deers[i] and deershape[i]
+// together, so the swapped-in animal was already visited), then adds the lamb, if any, through addAnimal() (both vectors
+// at the same index, lambAge kept, never carrying a stale taken mark). Returns the sheep swept out.
+int flockAddRemove(world& wd, vector<barb>& barbs, const deer* lamb) {
+	vector<deer>& deers = wd.deers;
+	vector<RectangleShape>& deershape = wd.deershape;
+	int swept = 0;
+	for (int i = min((int)deers.size(), (int)deershape.size()) - 1; i >= 0; i--) {
+		if (!deers[i].wolfTaken) continue;
+		swapRemove(deers, i);
+		swapRemove(deershape, i);
+		swept++;
+	}
+	if (swept > 0) validateDeerTargets(barbs, deers);
+	if (lamb) {
+		deer d = *lamb;
+		d.species = speciesSheep;
+		d.wolfTaken = false;
+		d.stray = false;
+		d.lambAge = kLambGrowTicks;
+		addAnimal(wd, d);
+	}
+	return swept;
 }
 
 // Each species walks in from a side edge under its own cap; species with a breed rate also multiply in place.
@@ -8634,6 +8711,7 @@ void drawDeer(RenderWindow& window, const vector<deer>& deers, const vector<Rect
         bool left = d.moving ? d.targetx < ds.getPosition().x : d.id % 2 == 1;
         Color body = ds.getFillColor();                  // keeps the red hit flash from deerkilling
         bool fawn = d.fawnAge > 0;                       // R64-F3: own small geometry, no antler
+        bool lamb = d.lambAge > 0;                       // R69-F2b: 2x1 body, legs and face pulled in to fit
         bool flashing = body != animalBodyColor(d);
 
         int legPhase = ((frame + d.id * 4) / sp.legFrames) % 2;
@@ -8648,7 +8726,7 @@ void drawDeer(RenderWindow& window, const vector<deer>& deers, const vector<Rect
             if (sp.gait == gaitWalk && d.moving && (k % 2) == legPhase) len = fawn ? kFawnLegLiftedPx : sp.legLiftedPx; // diagonal pairs (0+2, 1+3) alternate
             if (sp.gait == gaitHop && k == 0) len += rise;  // back leg stays on the ground pushing off; front leg tucks
             r.setSize(Vector2f(1.0f, len));
-            r.setPosition(at(Vector2f(fawn ? kFawnLegX[k] : sp.legX[k], bh), 1.0f));
+            r.setPosition(at(Vector2f(fawn ? kFawnLegX[k] : lamb ? kLambLegX[k % 2] : sp.legX[k], bh), 1.0f));
             window.draw(r);
         }
         r.setSize(Vector2f(1.0f, 1.0f));
@@ -8663,7 +8741,7 @@ void drawDeer(RenderWindow& window, const vector<deer>& deers, const vector<Rect
         window.draw(r);
         Vector2f headSize = fawn ? kFawnHeadSize : sp.headSize;
         r.setSize(headSize);
-        r.setPosition(at(fawn ? kFawnHeadPos : sp.headPos, headSize.x));
+        r.setPosition(at(fawn ? kFawnHeadPos : lamb ? kLambHeadPos : sp.headPos, headSize.x));
         r.setFillColor(flashing ? body : (fawn ? kFawnHead : sp.head));
         window.draw(r);
         r.setSize(Vector2f(1.0f, 1.0f));
@@ -8978,7 +9056,7 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         if (near(w.shape)) return hoverHit{w.denId >= 0 ? (w.phase == wolf::Hunting ? "Wolf pup: hunting" : "Wolf pup: at the den")   // R63-F6
                                                         : (w.phase == wolf::Hunting ? "Wolf: hunting" : "Wolf: leaving"), w.shape, nullopt};
     for (int i = 0; i < (int)deershape.size() && i < (int)deers.size(); i++)
-        if (near(deershape[i])) return hoverHit{string(deers[i].fawnAge > 0 ? "Fawn" : speciesOf(deers[i]).name) + " " + to_string(deers[i].health) + "hp", deershape[i], nullopt};
+        if (near(deershape[i])) return hoverHit{string(deers[i].fawnAge > 0 ? "Fawn" : deers[i].lambAge > 0 ? "Lamb" : speciesOf(deers[i]).name) + " " + to_string(deers[i].health) + "hp", deershape[i], nullopt};
     for (int i = 0; i < (int)octs.size() && i < (int)rocks.size(); i++)
         if (near(octs[i])) return hoverHit{rocks[i].dying ? "Rock: being mined" : "Rock", nullopt, rockDrawShape(octs[i])};
     for (int i = 0; i < (int)bushshapes.size() && i < (int)bushes.size(); i++)
@@ -23704,7 +23782,7 @@ void woolTick(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares) {
             int shorn = 0, bales = 0;
             for (int i = 0; i < (int)deers.size() && i < (int)deershape.size(); i++) {
                 deer& d = deers[i];
-                if (!tame(d) || d.foldId != f.id) continue;
+                if (!tame(d) || d.foldId != f.id || d.lambAge > 0) continue;   // R69-F2b: lambs keep their fleece
                 d.shorn = true;
                 d.shornDay = game_day;
                 deershape[i].setFillColor(animalBodyColor(d));
@@ -23795,6 +23873,53 @@ void woolTick(world& wd, vector<barb>& barbs, vector<RectangleShape>& squares) {
         const char* weaver = wi >= 0 && wi < n ? barbs[wi].name : "a weaver";
         printf("CLOAK WOVEN - %s weaves a wool cloak for %s (%s, %d bales left)\n", weaver, barbs[to].name, racePlurals[r], f.wool);
         logRaceEvent(string(weaver) + " weaves a wool cloak for " + barbs[to].name, r);
+    }
+}
+
+// R69-F2b: runs right after woolTick(). Lambs age (in place, deers[i]/deershape[i] together; nothing added or removed
+// here) and grow to the 3x2 sheep body at 0. Then per standing fold, once a spring day while the flock is penned: below
+// kFlockMax with at least one grown sheep, kLambChance of one lamb in the lowest free pen slot, added through
+// flockAddRemove() only.
+void lambTick(world& wd, vector<barb>& barbs) {
+    vector<deer>& deers = wd.deers;
+    vector<RectangleShape>& deershape = wd.deershape;
+    for (int i = 0; i < (int)deers.size() && i < (int)deershape.size(); i++) {
+        deer& d = deers[i];
+        if (d.lambAge <= 0 || --d.lambAge > 0) continue;
+        deershape[i].setSize(speciesOf(d).bodySize);   // grown in place, same index (top-left kept, like a fawn)
+        if (!d.invincible) deershape[i].setFillColor(animalBodyColor(d));
+        printf("LAMB GROWN - sheep %d of fold %d\n", d.id, d.foldId);
+    }
+    if (seasonOf(game_day) != kLambSeason) return;
+    for (int r = 0; r < raceCount; r++) {
+        sheepFold& f = folds[r];
+        if (!f.built || f.phase != foldPenned || f.lambDay == game_day) continue;
+        f.lambDay = game_day;
+        bool used[kFlockMax] = {};
+        int n = 0, grown = 0;
+        for (auto& d : deers) {
+            if (!tame(d) || d.foldId != f.id) continue;
+            n++;
+            if (d.lambAge <= 0) grown++;
+            used[clamp(d.flockSlot, 0, kFlockMax - 1)] = true;
+        }
+        if (n >= kFlockMax || grown < 1) continue;
+        if (uniform_real_distribution<float>(0.0f, 1.0f)(gen) >= kLambChance) {
+            printf("LAMBING - no lamb at the %s fold %d today (%d sheep)\n", racePlurals[r], f.id, n);
+            continue;
+        }
+        int slot = -1;
+        for (int k = 0; k < kFlockMax && slot < 0; k++) if (!used[k]) slot = k;
+        if (slot < 0) continue;   // every slot taken by a repeated slot number: wait for a loss
+        deer lamb;
+        lamb.foldId = f.id;
+        lamb.flockSlot = slot;
+        Vector2f s = foldPenSpot(f, slot);
+        lamb.x = (int)s.x;
+        lamb.y = (int)s.y;
+        flockAddRemove(wd, barbs, &lamb);
+        printf("LAMB BORN - %s fold %d, slot %d: %d sheep now\n", racePlurals[r], f.id, slot, n + 1);
+        logRaceEvent(string("A lamb is born in the ") + racePlurals[r] + " fold (" + to_string(n + 1) + " sheep)", r);
     }
 }
 
@@ -24963,6 +25088,7 @@ int main() {
                 deerkilling(wd, barbs, squares, smoke);
                 foldTick(wd, barbs, squares);   // R66-F3: shepherds' day, flock follow/graze/tether and penning (after the hunt, before the wolves)
                 woolTick(wd, barbs, squares);   // R69-F2: spring shearing, the loom, weaving cloaks; cloak and fleece days
+                lambTick(wd, barbs);   // R69-F2b: lambs grow; a spring lamb in a penned fold below kFlockMax
                 wolfPackDayTick(wd);   // R64-F3: once a day, before the wolves: pack size from the cached prey ratio
                 wolfTick(wolves, wd, barbs, squares, tris, houseshapes);   // R63-F6: + spring den, pups, den clearing
                 prowlerTick(prowlers, barbs, squares, houses, houseshapes, fire);   // R48-F1: bites land before starveDeathTick()
