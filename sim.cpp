@@ -3158,6 +3158,36 @@ const int kTownCartDustEveryTicks = 40;         // a rolling cart drops one fain
 const int kTownCartDustMax = 8;
 const int kTownCartDustFrames = 90;             // drawn frames a dot lives, fading out
 const uint8_t kTownCartDustAlpha = 60;          // fainter than the trek's dust (kTownDustAlpha 110)
+// R70-F2 Harbour Toll Grain Run, phase 1: while the merchant cog is docked, each inland race (not the jetty's) sends small
+// ox-carts from its crate, straight to the strand at the jetty foot, with grain above kCogSurplusFloor + its head count
+// and wool bales above kHarbourWoolKeep. At most kHarbourCartsPerRace of a race's carts and kHarbourMaxCarts in all are
+// out at once, and a race sends kHarbourRunsPerRace runs a visit at most. A cart unloads for kHarbourUnloadTicks, the
+// cog mints its price into the cart race's purse, and the jetty race keeps kHarbourTollPct of it through transferCoin():
+// a gold "+Nc" pip rises over the cart and the visit's toll tally shows over the cog, fading as it sails away. When the
+// cog casts off (or its jetty goes), cogTick() turns every cart still bound for the jetty or unloading for home, and its
+// load goes back to the larder and fold there. Carts and tally are not saved (a load starts with none; no dawn save
+// falls inside a visit). The first-toll bonus is phase 2.
+const int kHarbourTollPct = 20;                 // the jetty race's share of each cart's sale, in percent (at least 1c)
+const int kHarbourMaxCarts = 3;                 // carts out at once, all races
+const int kHarbourCartsPerRace = 2;             // one race's carts out at once
+const int kHarbourRunsPerRace = 3;              // runs a race sends per cog visit
+const int kHarbourCartLots = 2;                 // grain lots (kTradeLot food each) a cart carries at most
+const int kHarbourCartBales = 2;                // wool bales a cart carries at most
+const int kHarbourWoolKeep = 1;                 // bales left in the fold for the loom
+const int kHarbourWoolPrice = 3;                // coin the cog pays per bale (a grain lot is kPriceNormal)
+const int kHarbourFirstLaunchTicks = 600;       // after docking before the first cart rolls (the cog's own pip has risen)
+const int kHarbourLaunchGapTicks = 1800;        // between one race's launches (~30s at 1x)
+const int kHarbourUnloadTicks = 360;            // standing at the jetty foot while the load goes aboard
+const float kHarbourTripSlack = 2.0f;           // a run starts only if the cog stays this many straight-line trips longer
+const Vector2f kHarbourCartSize(3.0f, 1.0f);    // smaller than the 2x2 supply cart: a low ox-cart bed, load pips on top
+const float kHarbourStandGapPx = 3.0f;          // first stand spot this far landward of the jetty foot (clear of the fisher)
+const Vector2f kHarbourCrateOffset(0.0f, storehouseSize.y + 2.0f);   // under the crate's left, clear of the supply cart's stand
+const Color kHarbourCartColor(150, 126, 94, 220);   // weathered cart-wood tan, a little translucent
+const int kHarbourPipFrames = 240;              // toll "+Nc" pip life in drawn frames (~4s at 60fps)
+const float kHarbourPipRisePx = 10.0f;
+const unsigned int kHarbourPipFontSize = 12;
+const unsigned int kHarbourTallyFontSize = 11;
+const Color kHarbourTallyColor(206, 190, 136);  // pale brass, the cog ticker line's tint
 
 // Expeditions (R45-F2, phase 1): one party at a time of expPartySize same-race barbs walks from its crate to its race's
 // lean-to, delves at the ruin stones, and walks home with a relic (or nothing). Rations are paid from the race's food.
@@ -18522,6 +18552,214 @@ int cogTrade(const vector<barb>& barbs, const jetty& j) {
     return coin;
 }
 
+// R70-F2: an inland race's harbour cart, bound for the docked cog. Not a barb: no job, route or tree search.
+enum class harbourCartState { toDock, unloading, home };   // scoped, so the short names never clash
+struct harbourCart {
+    int race = -1;
+    int jettyId = -1;          // stable id of the jetty it hauls to
+    harbourCartState state = harbourCartState::toDock;
+    Vector2f pos;              // top-left, world px (drawn snapped)
+    int slot = 0;              // stand spot at the jetty foot, 0..kHarbourMaxCarts-1
+    int grain = 0, wool = 0;   // food and bales aboard; a cancelled run carries them home again
+    int timer = 0;             // unloading ticks left
+    int stepTicks = 0;         // ticks since the last 1px step
+};
+struct harbourRun {
+    vector<harbourCart> carts;   // capped at kHarbourMaxCarts
+    int runs[raceCount] = {};          // runs sent this visit
+    int launchTicks[raceCount] = {};   // ticks before the race may send its next run
+    int tally = 0;               // toll the jetty race kept this visit (shown over the cog)
+    int pipCoin = 0, pipFrames = 0;
+    Vector2f pipAt;              // world anchor of the "+Nc" pip (over the unloading cart)
+};
+harbourRun harbour;
+
+Vector2f harbourStandPos(const jetty& j, int slot) {
+    float back = kHarbourStandGapPx + slot * (kHarbourCartSize.x + 1.0f);
+    return snapPx(j.foot - j.seaward * back - kHarbourCartSize / 2.0f);
+}
+Vector2f harbourCratePos(int r) { return snapPx(storehousePos[clampRace(r)] + kHarbourCrateOffset); }
+
+// R70-F2: every cart still bound for the jetty or unloading turns for home with its load (put back on arrival).
+// Called by cogTick() when the cog casts off or loses its jetty; harbourTick() also calls it as a backstop.
+void harbourCancelCarts(const char* why) {
+    for (auto& c : harbour.carts) {
+        if (c.state == harbourCartState::home) continue;
+        c.state = harbourCartState::home;
+        c.stepTicks = c.timer = 0;
+        printf("HARBOUR CART - the %s cart turns home (%s), carrying %d grain and %d wool back\n", racePlurals[clampRace(c.race)], why,
+               c.grain, c.wool);
+    }
+}
+
+// R70-F2: one 1px step toward goal at a barb's pace (slowed in rain and on water, sped by worn road), like the supply
+// cart. True = standing at goal.
+bool harbourCartStep(harbourCart& c, Vector2f goal) {
+    int lim = stepLimit();
+    if (riverPlaced) {
+        int cell = riverCellAt(c.pos);
+        riverCell rc = riverWet[cell];
+        if (seaBlocked(cell) || (rc != riverCell::dry && rc != riverCell::bridge)) lim *= kFordWadeMult;
+    }
+    int tc = trailCell(c.pos);
+    if (tc >= 0 && lim == stepLimit()) lim = max(1, lim - trailSpeedBonus[trailTier[tc]]);
+    if (++c.stepTicks < lim) return false;
+    c.stepTicks = 0;
+    Vector2f d = goal - c.pos;
+    float len = hypot(d.x, d.y);
+    c.pos = len <= 1.0f ? goal : c.pos + d / len;
+    return c.pos == goal;
+}
+
+// R70-F2: the cog buys the cart's load; the cart race is paid and hands kHarbourTollPct to the jetty race. Purses stay
+// in [0, kChronicleMaxPurse].
+void harbourSell(harbourCart& c, int jr) {
+    int r = clampRace(c.race);
+    int coin = (c.grain / kTradeLot) * kPriceNormal + c.wool * kHarbourWoolPrice;
+    int paid = clamp(coin, 0, kChronicleMaxPurse - clamp(purse[r], 0, kChronicleMaxPurse));
+    purse[r] = clamp(purse[r] + paid, 0, kChronicleMaxPurse);
+    if (paid > 0) goldFound = true;
+    int toll = paid > 0 ? max(1, paid * kHarbourTollPct / 100) : 0;
+    toll = min(toll, kChronicleMaxPurse - clamp(purse[jr], 0, kChronicleMaxPurse));
+    if (toll > 0 && !transferCoin(r, jr, toll)) toll = 0;
+    printf("---HARBOUR TOLL--- the %s sell %d grain and %d wool to the cog for %dc; the %s keep %dc toll (purses %d / %d)\n",
+           racePlurals[r], c.grain, c.wool, paid, racePlurals[jr], toll, purse[r], purse[jr]);
+    c.grain = c.wool = 0;
+    if (toll <= 0) return;
+    harbour.tally += toll;
+    harbour.pipCoin = toll;
+    harbour.pipFrames = kHarbourPipFrames;
+    harbour.pipAt = c.pos + Vector2f(kHarbourCartSize.x / 2.0f, -1.0f);
+}
+
+// R70-F2: after cogTick() in jettyTick(). While the cog is docked, launches runs from the inland races' crates (goods
+// taken from the larder and fold at launch, so concurrent runs respect the floors), then moves every cart: to its stand
+// at the jetty foot, unloading, and home, where any load left aboard goes back and the cart is dropped.
+void harbourTick(const vector<barb>& barbs) {
+    const cog& mc = merchantCog;
+    int k = findJettyById(mc.jettyId);
+    bool open = mc.state == cogState::docked && k >= 0;
+    if (!open) harbourCancelCarts("the cog is gone");
+    if (open) {
+        const jetty& j = jetties[k];
+        int jr = clampRace(j.race);
+        int pop[raceCount] = {};
+        for (auto& b : barbs) pop[clampRace(b.race)]++;
+        for (int r = 0; r < raceCount; r++) {
+            if (r == jr || harbour.runs[r] >= kHarbourRunsPerRace || (int)harbour.carts.size() >= kHarbourMaxCarts) continue;
+            if (harbour.launchTicks[r] > 0) { harbour.launchTicks[r]--; continue; }
+            int mine = 0;
+            bool taken[kHarbourMaxCarts] = {};
+            for (auto& c : harbour.carts) {
+                if (c.race == r) mine++;
+                if (c.state != harbourCartState::home && c.slot >= 0 && c.slot < kHarbourMaxCarts) taken[c.slot] = true;
+            }
+            if (mine >= kHarbourCartsPerRace) continue;
+            int slot = 0;
+            while (slot < kHarbourMaxCarts - 1 && taken[slot]) slot++;
+            Vector2f from = harbourCratePos(r), to = harbourStandPos(j, slot);
+            float dist = hypot(to.x - from.x, to.y - from.y);
+            if (mc.timer < (int)(dist * stepLimit() * kHarbourTripSlack) + kHarbourUnloadTicks) continue;   // too late to make it
+            harbour.launchTicks[r] = kHarbourLaunchGapTicks;
+            raceStock& s = stockOfRace(r);
+            int lots = min(kHarbourCartLots, max(0, s.food - (kCogSurplusFloor + pop[r])) / kTradeLot);
+            int bales = folds[r].built ? min(kHarbourCartBales, max(0, folds[r].wool - kHarbourWoolKeep)) : 0;
+            if (lots <= 0 && bales <= 0) continue;
+            harbourCart c;
+            c.race = r;
+            c.jettyId = j.id;
+            c.pos = from;
+            c.slot = slot;
+            c.grain = lots * kTradeLot;
+            c.wool = bales;
+            s.food = max(0, s.food - c.grain);
+            folds[r].wool -= bales;
+            harbour.carts.push_back(c);
+            harbour.runs[r]++;
+            printf("HARBOUR CART - the %s send a cart to the %s jetty with %d grain and %d wool (run %d of %d)\n", racePlurals[r],
+                   racePlurals[jr], c.grain, c.wool, harbour.runs[r], kHarbourRunsPerRace);
+        }
+    }
+    for (int i = (int)harbour.carts.size() - 1; i >= 0; i--) {
+        harbourCart& c = harbour.carts[i];
+        int r = clampRace(c.race);
+        int ck = findJettyById(c.jettyId);
+        if (c.state != harbourCartState::home && ck < 0) { c.state = harbourCartState::home; c.stepTicks = 0; }
+        switch (c.state) {
+            case harbourCartState::toDock:
+                if (harbourCartStep(c, harbourStandPos(jetties[ck], c.slot))) {
+                    c.state = harbourCartState::unloading;
+                    c.timer = kHarbourUnloadTicks;
+                }
+                break;
+            case harbourCartState::unloading:
+                if (--c.timer > 0) break;
+                harbourSell(c, clampRace(jetties[ck].race));
+                c.state = harbourCartState::home;
+                c.stepTicks = 0;
+                break;
+            case harbourCartState::home:
+                if (!harbourCartStep(c, harbourCratePos(r))) break;
+                if (c.grain > 0 || c.wool > 0) {
+                    stockOfRace(r).food += c.grain;
+                    if (folds[r].built) folds[r].wool = min(kWoolStoreMax, folds[r].wool + c.wool);
+                    printf("HARBOUR CART - the %s cart is home: %d grain and %d wool back in store\n", racePlurals[r], c.grain, c.wool);
+                }
+                swapRemove(harbour.carts, i);
+                break;
+        }
+    }
+}
+
+// R70-F2: the harbour carts on the ground under the barbs (after the supply carts): a 3x1 cart-wood bed with 1px load
+// pips on top while laden (grain right, wool bale left).
+void drawHarbourCarts(RenderWindow& window) {
+    if (harbour.carts.empty()) return;
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (auto& c : harbour.carts) {
+        Vector2f p = snapPx(c.pos);
+        pushQuad(va, p, kHarbourCartSize, kHarbourCartColor);
+        if (c.grain > 0) pushQuad(va, p + Vector2f(kHarbourCartSize.x - 1.0f, -1.0f), Vector2f(1.0f, 1.0f), kTownCartGrainColor);
+        if (c.wool > 0) pushQuad(va, p + Vector2f(0.0f, -1.0f), Vector2f(1.0f, 1.0f), kWoolBaleColor);
+    }
+    window.draw(va);
+}
+
+// R70-F2: screen space, beside drawCogPip(): the gold dark-rimmed toll "+Nc" pip rising over the cart that paid it, and
+// the visit's toll tally ("toll Nc") just over the cog's masthead, faded with the cog as it sails away. Each is placed
+// from its own text bounds and skipped when it would leave the window or reach the HUD strip. Pip aged in drawn frames.
+void drawHarbourToll(RenderWindow& window, const Font& font, const View& worldView, bool paused) {
+    Vector2u wsz = window.getSize();
+    auto place = [&](Text& t, Vector2f anchor, float lift, Color fill, float a) {
+        Vector2f s = window.mapPixelToCoords(window.mapCoordsToPixel(anchor, worldView), window.getDefaultView());
+        Color rim = kCogPipOutlineColor;
+        fill.a = (uint8_t)(255.0f * a);
+        rim.a = (uint8_t)(220.0f * a);
+        t.setFillColor(fill);
+        t.setOutlineColor(rim);
+        t.setOutlineThickness(1.0f);
+        FloatRect lb = t.getLocalBounds();
+        Vector2f pos(round(s.x - lb.size.x / 2.0f), round(s.y - 2.0f - lift - lb.size.y));
+        if (pos.x < 0.0f || pos.x + lb.size.x > (float)wsz.x || pos.y < hudBarHeight || pos.y + lb.size.y > (float)wsz.y) return;
+        t.setPosition(pos - lb.position);
+        window.draw(t);
+    };
+    const cog& mc = merchantCog;
+    if (harbour.tally > 0 && mc.state != cogState::absent && mc.pipFrames <= 0) {   // the cog's own pip has the spot first
+        Text t(font, "toll " + to_string(harbour.tally) + "c", kHarbourTallyFontSize);
+        Vector2f anchor = cogPos(mc) + Vector2f(floor(kCogSize.x / 2.0f) + 0.5f, -kCogMastPx - 1.0f);
+        place(t, anchor, 0.0f, kHarbourTallyColor, mc.state == cogState::leaving ? cogAlpha(mc) : 1.0f);
+    }
+    if (harbour.pipFrames > 0) {
+        float life = 1.0f - (float)harbour.pipFrames / kHarbourPipFrames;
+        float a = life < 0.6f ? 1.0f : clamp((1.0f - life) / 0.4f, 0.0f, 1.0f);
+        Text t(font, "+" + to_string(harbour.pipCoin) + "c", kHarbourPipFontSize);
+        place(t, harbour.pipAt, kHarbourPipRisePx * life, kCogPipColor, a);
+        if (!paused) harbour.pipFrames--;
+    }
+}
+
 // R69-F3: called at the top of jettyTick(). Absent: the first summer dawn of a year with a jetty (and no longship about)
 // brings the cog in, with one ticker line. Arriving: sails in and fades up; on docking cogTrade() runs once and a "+Nc"
 // pip rises. Docked for kCogDockTicks (the sail furls, then is let down), then it sails out and is absent again. A jetty
@@ -18544,6 +18782,8 @@ void cogTick(const vector<barb>& barbs) {
         c.seaward = j.seaward;
         c.faceLeft = j.seaward.x > 0.0f;   // prow toward the strand
         c.pipCoin = c.pipFrames = 0;
+        for (int q = 0; q < raceCount; q++) { harbour.runs[q] = 0; harbour.launchTicks[q] = kHarbourFirstLaunchTicks; }   // R70-F2
+        harbour.tally = 0;
         int r = clampRace(j.race);
         printf("---MERCHANT COG--- sails in to the %s jetty %d, docking at (%.0f, %.0f)\n", racePlurals[r], j.id, c.dock.x, c.dock.y);
         logEvent(string("A merchant cog sails in to the ") + racePlurals[r] + "' jetty", kCogTickerTint);
@@ -18552,6 +18792,7 @@ void cogTick(const vector<barb>& barbs) {
     int k = findJettyById(c.jettyId);
     if (k < 0) {
         printf("MERCHANT COG - its jetty %d is gone; it sails away\n", c.jettyId);
+        harbourCancelCarts("the jetty is gone");   // R70-F2
         int year = c.visitYear;
         c = cog{};
         c.visitYear = year;
@@ -18570,6 +18811,7 @@ void cogTick(const vector<barb>& barbs) {
             c.state = cogState::leaving;
             c.timer = kCogSailTicks;
             printf("MERCHANT COG - casts off from jetty %d\n", c.jettyId);
+            harbourCancelCarts("the cog casts off");   // R70-F2
             break;
         case cogState::leaving: {
             printf("MERCHANT COG - gone over the horizon until next summer\n");
@@ -18588,6 +18830,7 @@ void cogTick(const vector<barb>& barbs) {
 // through the trip: walk to the jetty, along the deck, row out, cast, row home, along the deck and land the catch.
 void jettyTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
     cogTick(barbs);   // R69-F3: the summer merchant cog's visit and its one trade
+    harbourTick(barbs);   // R70-F2: the inland races' harbour carts and the jetty race's toll
     for (auto& j : jetties) {
         fishingBoat& bt = j.boat;
         int r = clampRace(j.race);
@@ -25503,6 +25746,7 @@ int main() {
         drawFootprints(window, camRect);   // R63-F1: faint snow prints, directly under the barbs
         drawTownDust(window, paused);   // R66-F1: the founders' dust trail, under the barbs
         drawTownCarts(window, paused);   // R69-F1b: supply carts and their wheel dust, on the ground under the barbs
+        drawHarbourCarts(window);   // R70-F2: harbour carts, same layer
         drawBarbs(window, barbs, squares, frameCount, zoom);
         drawTitlePips(window, camRect, zoom);   // R56-F3: pale 1px pip over titled barbs, capped
         for (auto& b : barbs) if (b.raidFlash > 0 && !paused) b.raidFlash--;   // R52-F1: the hit flash lasts 2 drawn frames
@@ -25656,6 +25900,7 @@ int main() {
                 }
             drawTownLabels(window, hudFont, worldView);   // R66-F1: over the world and overlays, under every HUD panel
             drawCogPip(window, hudFont, worldView, paused);   // R69-F3: the cog's "+Nc", same layer as the town labels
+            drawHarbourToll(window, hudFont, worldView, paused);   // R70-F2: toll "+Nc" pip and the visit's toll tally
             hudRect = drawHud(window, hudFont, hv);
             tickerRect = drawEvents(window, hudFont);
             drawMinimap(window, minimapVerts, worldView, barbs, squares, houses, houseshapes, stores);   // UIO-F1: after the HUD, under tooltips
