@@ -381,7 +381,7 @@ const int kChronicleFoldWords = 7;                  // words before a fold's she
 const int kChronicleSheepWordsV7 = 3;               // v7: slot, shorn, shornDay
 const int kChronicleSheepWords = 4;                 // R70-F4 (v8): + lambAge (ticks, 0 = grown, 0..kLambGrowTicks)
 // R70-F4 (v8) "COG ": {state, timer, visitYear, jetty race (-1 none), raceCount, then per race one word reserved for
-// R70-F2 (the harbour toll's first-toll flag; written 0 until F2 fills it)}. "CAMP" was reserved inside v8 for R70-F3's
+// R70-F2 (the harbour toll's first-toll flag, 0/1: harbourFirstTollPaid)}. "CAMP" was reserved inside v8 for R70-F3's
 // brigand camps, which now fill it with no further version bump: {count (0..kBrigandCampCap), then per camp {race,
 // site dx, dy from the race's crate, founder name index (-1 none), rest ticks, robbed tally}}.
 const int32_t kChronicleBlockCog = 0x20474F43;      // "COG "
@@ -3208,7 +3208,7 @@ const uint8_t kTownCartDustAlpha = 60;          // fainter than the trek's dust 
 // a gold "+Nc" pip rises over the cart and the visit's toll tally shows over the cog, fading as it sails away. When the
 // cog casts off (or its jetty goes), cogTick() turns every cart still bound for the jetty or unloading for home, and its
 // load goes back to the larder and fold there. Carts and tally are not saved (a load starts with none; no dawn save
-// falls inside a visit). The first-toll bonus is phase 2.
+// falls inside a visit). Phase 2 adds the first-toll bonus below.
 const int kHarbourTollPct = 20;                 // the jetty race's share of each cart's sale, in percent (at least 1c)
 const int kHarbourMaxCarts = 3;                 // carts out at once, all races
 const int kHarbourCartsPerRace = 2;             // one race's carts out at once
@@ -3230,6 +3230,11 @@ const float kHarbourPipRisePx = 10.0f;
 const unsigned int kHarbourPipFontSize = 12;
 const unsigned int kHarbourTallyFontSize = 11;
 const Color kHarbourTallyColor(206, 190, 136);  // pale brass, the cog ticker line's tint
+// R70-F2 phase 2: the first time a race's cart pays the harbour toll, the cog's master adds kHarbourFirstTollBonus coin
+// (minted, like the sale) to that race's purse for opening the route. Shown as one ticker line only (no second pip).
+// The per-race flag is saved in the v8 "COG " block's per-race words; a file without the block clears it.
+const int kHarbourFirstTollBonus = 4;
+bool harbourFirstTollPaid[raceCount] = {};
 
 // Expeditions (R45-F2, phase 1): one party at a time of expPartySize same-race barbs walks from its crate to its race's
 // lean-to, delves at the ruin stones, and walks home with a relic (or nothing). Rations are paid from the race's food.
@@ -10660,7 +10665,7 @@ struct chronicleData {
     int version = 0;                               // R70-F4: the file's version word
     bool haveCog = false;                          // R70-F4: a valid "COG " block was read (absent before v8)
     int cogPhase = 0, cogTimer = 0, cogYear = -1, cogRace = -1;   // checked ranges; the jetty is looked up by race on restore
-    int tollReserved[raceCount] = {};              // R70-F2's reserved words, read and kept for it (0 until F2 writes them)
+    int tollReserved[raceCount] = {};              // R70-F2: per race first-toll flag (0/1), into harbourFirstTollPaid on load
     bool haveCamp = false;                         // R70-F3: a valid "CAMP" block was read (absent before v8 and in early v8 files)
     vector<chronicleCamp> camps;                   // at most kBrigandCampCap; sites judged again by chronicleRestoreCamps()
 };
@@ -10887,7 +10892,7 @@ bool chronicleSaveCog(FILE* f) {
     bool away = c.state == cogState::absent || race < 0;
     int timerMax = c.state == cogState::docked ? kCogDockTicks : kCogSailTicks;
     vector<int32_t> w{away ? 0 : (int32_t)c.state, away ? 0 : clamp(c.timer, 1, timerMax), max(c.visitYear, -1), away ? -1 : race, raceCount};
-    for (int r = 0; r < raceCount; r++) w.push_back(0);   // R70-F2 reserved: first-toll flag per race
+    for (int r = 0; r < raceCount; r++) w.push_back(harbourFirstTollPaid[r] ? 1 : 0);   // R70-F2: first-toll flag per race
     return chronPutBlock(f, kChronicleBlockCog, w);
 }
 
@@ -11484,6 +11489,7 @@ bool chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
     for (int r = 0; r < raceCount; r++) { allyOf[r] = -1; allyBrideId[r] = -1; marriageCooldown[r] = 0; }   // R59-F1: chronicleRestoreBarbs() re-binds
     marriage = marriageTrip{};
     merchantCog = cog{};   // R69-F3: cleared here; R70-F4: chronicleRestoreSites() puts a saved (v8) cog back after the jetty
+    for (int r = 0; r < raceCount; r++) harbourFirstTollPaid[r] = d.haveCog && d.tollReserved[r] != 0;   // R70-F2: v7 / no block: cleared
     releaseSellswords("the chronicle is restored");   // R65-F2: hunters are never saved; free them before the wars go
     for (auto& w : wars) w = warState{};   // R60-F1: chronicleRestoreWar() re-declares a valid saved war
     for (auto& row : warCooldown) for (auto& c : row) c = 0;
@@ -11584,6 +11590,8 @@ void chronicleRoundTrip(const vector<barb>& barbs, const vector<house>& houses, 
                         || d.cogRace != (away ? -1 : cogRace)
                         || (!away && d.cogTimer != clamp(mc.timer, 1, mc.state == cogState::docked ? kCogDockTicks : kCogSailTicks))))
         bad = "merchant cog";
+    for (int r = 0; bad.empty() && r < raceCount; r++)   // R70-F2: the first-toll flags in the cog block's per-race words
+        if ((d.tollReserved[r] != 0) != harbourFirstTollPaid[r]) bad = "first-toll flag of the " + string(racePlurals[r]);
     // R70-F3: the brigand camps, entry by entry as chronicleSaveCamp() writes them
     if (bad.empty() && (!d.haveCamp || d.camps.size() != brigands.size())) bad = "brigand camp count";
     for (size_t k = 0; bad.empty() && k < d.camps.size(); k++) {
@@ -18752,6 +18760,15 @@ void harbourSell(harbourCart& c, int jr) {
            racePlurals[r], c.grain, c.wool, paid, racePlurals[jr], toll, purse[r], purse[jr]);
     c.grain = c.wool = 0;
     if (toll <= 0) return;
+    if (!harbourFirstTollPaid[r]) {   // R70-F2 phase 2: one-time bonus for the race's first tolled cargo; ticker line only
+        harbourFirstTollPaid[r] = true;
+        int bonus = min(kHarbourFirstTollBonus, kChronicleMaxPurse - clamp(purse[r], 0, kChronicleMaxPurse));
+        purse[r] = clamp(purse[r] + bonus, 0, kChronicleMaxPurse);
+        printf("---HARBOUR TOLL--- first toll from the %s: the cog's master adds a %dc bonus (purse %d)\n", racePlurals[r], bonus, purse[r]);
+        if (bonus > 0)
+            logEvent("The cog's master pays the " + string(racePlurals[r]) + " a " + to_string(bonus) + "c bonus for their first harbour cargo",
+                     kCogTickerTint);
+    }
     harbour.tally += toll;
     harbour.pipCoin = toll;
     harbour.pipFrames = kHarbourPipFrames;
