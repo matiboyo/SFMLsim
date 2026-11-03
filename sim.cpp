@@ -373,7 +373,7 @@ const int kChronicleBarbWords = 13;                 // R69-F4 (v7): + cloak (0/1
 // vector is touched. R70-F4 (v8): the merchant cog is saved in "COG " and put back by chronicleRestoreSites() after the
 // jetty; a v7-or-older file (or a cog whose jetty did not come back) leaves it departed for its saved year.
 const int32_t kChronicleBlockPlot = 0x544F4C50;     // "PLOT": raceCount, fieldsPerRace, then per race per plot {crop, lastCrop}
-const int32_t kChronicleBlockTown = 0x4E574F54;     // "TOWN": count, then per town {race, crate dx, dy, growth, plot, n, n file house indices}
+const int32_t kChronicleBlockTown = 0x4E574F54;     // "TOWN": count, then per town {race, crate dx, dy, growth, plot, n, n file house indices}; R71-F4 v8 tail {ver, n, n x {free, sacks}}
 const int32_t kChronicleBlockFold = 0x444C4F46;     // "FOLD": count, then per built fold {race, dx, dy, wool, loom, shearYear, n, n x {slot, shorn, shornDay}}
 const int32_t kChronicleBlockJetty = 0x5954544A;    // "JTTY": count, then per jetty {race, holed, holedTicks}
 const int kChronicleTownWords = 6;                  // words before a town's house list
@@ -3225,6 +3225,19 @@ const int kTownCartDustEveryTicks = 40;         // a rolling cart drops one fain
 const int kTownCartDustMax = 8;
 const int kTownCartDustFrames = 90;             // drawn frames a dot lives, fading out
 const uint8_t kTownCartDustAlpha = 60;          // fainter than the trek's dust (kTownDustAlpha 110)
+// R71-F4 Free Towns, phase 1: a daughter town left unfed (its cart standing at a mother larder held at its floor for
+// kTownNeglectTicks in a row) or sacked a second time breaks free: Town::free is set, the race stays the founder's
+// (never -1), the pennant and label go grey, one ticker line, and townGrow()/townCartTick() stop the tithe (its cart's
+// load goes home). Won back by a raid through flipTown() (clears free) or bought back by its race through transferCoin()
+// once kTownFreeBuyBackTicks have passed. Parent-visit flash and freeRegard/shield pip are later phases.
+const int kTownNeglectTicks = 6 * ticksPerGameHour;    // a starved cart stands this long in a row -> the town breaks free
+const int kTownFreeSacks = 2;                          // the sack that would be this one frees the town instead of flipping it
+const int kTownBuyBackCost = 10;                       // coin the founding race pays (to kCoinWildfolk) to win it back
+const int kTownBuyBackPurseKeep = 4;                   // ...keeping at least this much in its purse
+const int kTownFreeBuyBackTicks = 6 * ticksPerGameHour;   // a free town won't be bought back sooner than this (not saved)
+const int kTownFreeSaveVersion = 1;                    // TOWN block tail: {version, n, n x {free, sacks}} (absent = not free)
+const Color kTownFreePennantColor(172, 174, 170);      // unsaturated grey: apart from amber, steel blue, teal and lilac
+const Color kTownFreeTickerTint(176, 176, 170);        // ash grey ticker line
 // R70-F2 Harbour Toll Grain Run, phase 1: while the merchant cog is docked, each inland race (not the jetty's) sends small
 // ox-carts from its crate, straight to the strand at the jetty foot, with grain above kCogSurplusFloor + its head count
 // and wool bales above kHarbourWoolKeep. At most kHarbourCartsPerRace of a race's carts and kHarbourMaxCarts in all are
@@ -4229,6 +4242,10 @@ struct Town {
     bool plot = false;     // R69-F1: the green plot beside the pennant has appeared
     int flipCooldown = 0;  // R70-F1: sim ticks before a raid may target it again (set by flipTown(), not saved)
     int flipFlash = 0;     // R70-F1: drawn frames left of the pennant blink after a flip
+    bool free = false;     // R71-F4: broke from its race (race keeps the founder's); no tithe. Saved in the TOWN tail
+    int neglect = 0;       // R71-F4: ticks in a row its cart stood at a mother larder held at its floor (not saved)
+    int sacks = 0;         // R71-F4: times sacked since founded, freed or bought back (saved in the TOWN tail)
+    int freeTicks = 0;     // R71-F4: sim ticks since it broke free (not saved; gates the buy-back)
 };
 vector<Town> towns;
 int nextTownId = 0;
@@ -9333,9 +9350,10 @@ optional<hoverHit> pickHover(Vector2f p, float radius, const vector<barb>& barbs
         if (!near(crate)) continue;
         int r = clampRace(towns[i].race), folk = 0;
         for (auto& b : barbs) if (townOf(b.homeHouse) == i) folk++;
-        hoverHit h{string(raceDefs[r].name) + " New Town: daughter town of the " + racePlurals[r] + "\n"
+        hoverHit h{string(raceDefs[r].name) + (towns[i].free ? " Free Town: broke from the " : " New Town: daughter town of the ")   // R71-F4
+                   + racePlurals[r] + "\n"
                    + to_string(towns[i].houses.size()) + " houses, " + to_string(folk) + " townsfolk", crate, nullopt};
-        h.tint = lensRaceColors[r];
+        h.tint = towns[i].free ? kTownFreePennantColor : lensRaceColors[r];
         return h;
     }
     {   // POL-F1: the campfire shows its shared fire wood plus any race still hauling there
@@ -10666,7 +10684,7 @@ struct chronicleBarb { int name = -1, race = 0, birthRace = 0, trait = 0, leader
                        int parentA = -1, parentB = -1, dynasty = -1;   // R58-F2 (v4): file barb indices; all -1 from a v3 file
                        int cloak = 0, cloakAge = 0; };                 // R69-F4 (v7): 0 from an older file (no cloak)
 // R69-F4 (v7): the structure blocks, as read (counts checked; entries judged again by chronicleRestoreSites())
-struct chronicleTown { int race = 0, dx = 0, dy = 0, growth = 0, plot = 0; vector<int> houses; };   // houses: file house indices
+struct chronicleTown { int race = 0, dx = 0, dy = 0, growth = 0, plot = 0, free = 0, sacks = 0; vector<int> houses; };   // houses: file house indices; free/sacks: R71-F4 tail (0 without it)
 struct chronicleSheep { int slot = 0, shorn = 0, shornDay = 0, lambAge = 0; };   // lambAge: R70-F4 (v8), 0 from a v7 file
 struct chronicleFold { int race = 0, dx = 0, dy = 0, wool = 0, loom = 0, shearYear = -1; vector<chronicleSheep> sheep; };
 struct chronicleJetty { int race = 0, holed = 0, holedTicks = 0; };
@@ -10858,8 +10876,10 @@ bool chronicleSavePlot(FILE* f, const fieldGrid& fields) {
 
 // R69-F4: the "TOWN" block. Crates are offsets from the race's crate, like houses; each town house is its index in the
 // file's house list (a house past the written ones is left out). Towns with no written house are left out.
-bool chronicleSaveTown(FILE* f, const vector<house>& houses, int housesWritten) {
-    vector<int32_t> w{0};
+// R71-F4: a v8 write adds the versioned tail {kTownFreeSaveVersion, n, n x {free, sacks}} in the towns' written order;
+// a v7 write (and any older file) has none, and every town loads not free.
+bool chronicleSaveTown(FILE* f, const vector<house>& houses, int housesWritten, int version) {
+    vector<int32_t> w{0}, tail;
     int n = 0;
     for (auto& t : towns) {
         int r = clampRace(t.race);
@@ -10872,9 +10892,14 @@ bool chronicleSaveTown(FILE* f, const vector<house>& houses, int housesWritten) 
         w.insert(w.end(), {r, (int32_t)tc.x - c.x, (int32_t)tc.y - c.y, clamp(t.growth, 0, kTownGrowthPerStep), t.plot ? 1 : 0,
                            (int32_t)hs.size()});
         w.insert(w.end(), hs.begin(), hs.end());
+        tail.insert(tail.end(), {t.free ? 1 : 0, clamp(t.sacks, 0, kTownFreeSacks)});
         n++;
     }
     w[0] = n;
+    if (version >= kChronicleVersion) {   // R71-F4
+        w.insert(w.end(), {kTownFreeSaveVersion, n});
+        w.insert(w.end(), tail.begin(), tail.end());
+    }
     return chronPutBlock(f, kChronicleBlockTown, w);
 }
 
@@ -10991,7 +11016,7 @@ bool chronicleWrite(const char* path, int version, const vector<barb>& barbs, co
     ok = ok && chronicleSaveYear(f);                      // R65-F3 (v6)
     ok = ok && chronicleSaveWonder(f);                    // R60-F3: likewise
     ok = ok && chronicleSavePlot(f, fields);              // R69-F4 (v7): restored in this order
-    ok = ok && chronicleSaveTown(f, houses, n);
+    ok = ok && chronicleSaveTown(f, houses, n, version);
     ok = ok && chronicleSaveFold(f, deers, version);
     ok = ok && chronicleSaveJetty(f);
     if (version >= kChronicleVersion) ok = ok && chronicleSaveCog(f);   // R70-F4 (v8)
@@ -11226,6 +11251,11 @@ bool chronicleReadTown(FILE* f, int words, chronicleData& d, const char*& why) {
             t.houses.push_back(hi);
         }
         if (ok) got.push_back(t);
+    }
+    if (ok && !c.done()) {   // R71-F4: the free tail (a v7 or early v8 block ends above: no town is free)
+        int ver = 0, tn = 0;
+        ok = c.get(kTownFreeSaveVersion, kTownFreeSaveVersion, ver) && c.get(n, n, tn);
+        for (int i = 0; ok && i < n; i++) ok = c.get(0, 1, got[i].free) && c.get(0, kTownFreeSacks, got[i].sacks);
     }
     if (!ok || !c.done()) { printf("CHRONICLE - town block invalid: no town restored\n"); return true; }
     vector<char> used(nh, 0);
@@ -11611,7 +11641,8 @@ void chronicleRoundTrip(const vector<barb>& barbs, const vector<house>& houses, 
     if (bad.empty() && (!d.haveTown || d.towns.size() != towns.size())) bad = "town count";
     for (int t = 0; bad.empty() && t < (int)towns.size(); t++) {
         const chronicleTown& c = d.towns[t];
-        if (c.race != towns[t].race || c.growth != towns[t].growth || c.plot != (towns[t].plot ? 1 : 0) || c.houses.size() != towns[t].houses.size())
+        if (c.race != towns[t].race || c.growth != towns[t].growth || c.plot != (towns[t].plot ? 1 : 0) || c.houses.size() != towns[t].houses.size()
+            || c.free != (towns[t].free ? 1 : 0) || c.sacks != min(towns[t].sacks, kTownFreeSacks))   // R71-F4
             bad = "town " + to_string(towns[t].id);
     }
     int built = 0, shorn = 0, lambs = 0;
@@ -11668,6 +11699,7 @@ void chronicleRoundTrip(const vector<barb>& barbs, const vector<house>& houses, 
         else if (d7.barbs.size() != d.barbs.size() || d7.houses.size() != d.houses.size() || d7.towns.size() != d.towns.size()
                  || d7.folds.size() != d.folds.size() || d7.jetties.size() != d.jetties.size() || !d7.havePlot)
             bad = "v7 counts";
+        for (auto& t : d7.towns) if (bad.empty() && (t.free != 0 || t.sacks != 0)) bad = "v7 town free";   // R71-F4: no tail
         for (size_t k = 0; bad.empty() && k < d7.folds.size(); k++) {
             if (d7.folds[k].sheep.size() != d.folds[k].sheep.size()) { bad = "v7 flock size"; break; }
             for (auto& s : d7.folds[k].sheep) if (s.lambAge != 0) { bad = "v7 lamb age"; break; }
@@ -12277,7 +12309,7 @@ void drawStorehouses(RenderWindow& window, const storehouse (&stores)[raceCount]
             pushQuad(va, q + Vector2f(1.0f, 1.0f), Vector2f(kTownPlotSize.x - 2.0f, 1.0f), kTownPlotRowColor);
             pushQuad(va, q + Vector2f(1.0f, 3.0f), Vector2f(kTownPlotSize.x - 2.0f, 1.0f), kTownPlotRowColor);
         }
-        Color flag = lensRaceColors[r];
+        Color flag = tw.free ? kTownFreePennantColor : lensRaceColors[r];   // R71-F4: a free town flies grey
         if (blinkPale) flag = lerpColor(flag, kTownFlipFlashColor, 0.4f + 0.6f * flip);   // R70-F1: the new flag blinks in
         Vector2f p = o + Vector2f(kTownPennantX, kTownPennantTop);   // pole top
         pushQuad(va, p, Vector2f(1.0f, 1.0f), kTownPennantTipColor);                        // finial
@@ -17069,6 +17101,7 @@ void townGrow(const vector<barb>& barbs, vector<house>& houses, vector<Rectangle
     int pop[raceCount] = {};
     for (auto& b : barbs) pop[clampRace(b.race)]++;
     for (auto& t : towns) {
+        if (t.free) continue;   // R71-F4: a free town takes no tithe from the mother
         int r = clampRace(t.race);
         int slot = -1;   // first grown-house slot whose slab is clear (a standing house blocks its own slot)
         for (int s = 0; slot < 0 && (int)t.houses.size() < kTownMaxHouses && s < kTownMaxHouses - kTownHouses; s++) {
@@ -17115,12 +17148,45 @@ struct townCart {
 vector<townCart> townCarts;
 vector<hostDust> townCartDusts;   // faint wheel dust; capped at kTownCartDustMax, aged in drawn frames
 
+// R71-F4: the one way a town breaks free. The race is left as it is; its cart is dropped (load home) by the next
+// townCartTick(). One ticker line.
+void freeTown(Town& t, const char* why) {
+    if (t.free) return;
+    int r = clampRace(t.race);
+    t.free = true;
+    t.neglect = t.sacks = t.freeTicks = 0;
+    t.growth = 0;
+    t.flipCooldown = kTownFlipCooldownTicks;   // not raided again at once
+    t.flashFrames = storehouseFlashFrames;
+    string line = string("The ") + racePlurals[r] + "' new town breaks free (" + why + ")";
+    printf("---TOWN FREE--- %s (town %d at (%.0f, %.0f))\n", line.c_str(), t.id, t.crate.x, t.crate.y);
+    logEvent(line, kTownFreeTickerTint);
+}
+
+// R71-F4: the one way a free town is bought back: its race pays kTownBuyBackCost to the townsfolk (kCoinWildfolk) through
+// transferCoin() once kTownFreeBuyBackTicks have passed, keeping kTownBuyBackPurseKeep. Free cleared on payment only.
+void townBuyBackTick() {
+    for (auto& t : towns) {
+        if (!t.free) continue;
+        if (t.freeTicks < kTownFreeBuyBackTicks) { t.freeTicks++; continue; }
+        int r = clampRace(t.race);
+        if (purse[r] - kTownBuyBackCost < kTownBuyBackPurseKeep || !transferCoin(r, kCoinWildfolk, kTownBuyBackCost)) continue;
+        t.free = false;
+        t.neglect = t.sacks = t.freeTicks = 0;
+        t.flashFrames = storehouseFlashFrames;
+        string line = string("The ") + racePlurals[r] + " buy back their free town for " + to_string(kTownBuyBackCost) + "c";
+        printf("---TOWN BOUGHT BACK--- %s (town %d, purse %d)\n", line.c_str(), t.id, purse[r]);
+        logEvent(line, kTownFreeTickerTint);
+    }
+}
+
 // R69-F1b: one tick of every town's cart, after townGrow() and independent of it. A town without a cart gets one at
 // its mother crate; a cart whose town is gone hands its load back and is dropped.
 void townCartTick(const vector<barb>& barbs) {
     int pop[raceCount] = {};
     if (!towns.empty()) for (auto& b : barbs) pop[clampRace(b.race)]++;
     for (auto& t : towns) {
+        if (t.free) continue;   // R71-F4: no cart, no tithe
         bool have = false;
         for (auto& c : townCarts) if (c.townId == t.id) { have = true; break; }
         if (have) continue;
@@ -17134,7 +17200,7 @@ void townCartTick(const vector<barb>& barbs) {
         townCart& c = townCarts[i];
         int ti = -1;
         for (int k = 0; k < (int)towns.size() && ti < 0; k++) if (towns[k].id == c.townId) ti = k;
-        if (ti < 0) {
+        if (ti < 0 || towns[ti].free) {   // R71-F4: a free town's cart is dropped the same way
             stock[clampRace(c.race)].food += c.load;   // the load goes back to the mother's larder
             swapRemove(townCarts, i);
             continue;
@@ -17145,7 +17211,13 @@ void townCartTick(const vector<barb>& barbs) {
         if (!c.rolling) {
             if (++c.waitTicks < kTownCartWaitTicks) continue;
             if (!c.outbound) {   // at the mother crate: load the tithe, or keep standing while the larder is at its floor
-                if (!townTitheOk(r, pop[r])) { c.waitTicks = 0; continue; }
+                if (!townTitheOk(r, pop[r])) {
+                    c.waitTicks = 0;
+                    t.neglect += kTownCartWaitTicks;   // R71-F4: one more wait unfed
+                    if (t.neglect >= kTownNeglectTicks) freeTown(t, "left unfed");   // the cart goes next tick
+                    continue;
+                }
+                t.neglect = 0;   // R71-F4
                 stock[r].food -= kTownGrainOutflow;
                 c.load = kTownGrainOutflow;
             }
@@ -17220,6 +17292,7 @@ void townTick(vector<barb>& barbs, vector<RectangleShape>& squares, vector<house
     for (auto& t : towns) if (t.flipCooldown > 0) t.flipCooldown--;   // R70-F1
     townGrow(barbs, houses, houseshapes);
     townCartTick(barbs);   // R69-F1b: the supply carts, independent of growth
+    townBuyBackTick();     // R71-F4: a free town's race may pay to win it back
     if (!trek.active) return;
     int r = clampRace(trek.race);
     int idx[kTownFounders];
@@ -17291,8 +17364,9 @@ void drawTownLabels(RenderWindow& window, const Font& font, const View& worldVie
         int r = clampRace(tw.race);
         Vector2f anchor = snapPx(tw.crate) + Vector2f(kTownPennantX + 4.0f, kTownPennantTop);   // pennant top, centred
         Vector2f s = window.mapPixelToCoords(window.mapCoordsToPixel(anchor, worldView), window.getDefaultView());
-        Text t(font, string(raceDefs[r].name) + " New Town", kTownLabelFontSize);
-        t.setFillColor(lensRaceColors[r]);
+        Color ink = tw.free ? kTownFreePennantColor : lensRaceColors[r];   // R71-F4: grey text and rim on a free town
+        Text t(font, string(raceDefs[r].name) + (tw.free ? " Free Town" : " New Town"), kTownLabelFontSize);
+        t.setFillColor(ink);
         FloatRect lb = t.getLocalBounds();
         Vector2f size = lb.size + 2.0f * kTownLabelPad;
         Vector2f pos(round(s.x - size.x / 2.0f), round(s.y - kTownLabelGapPx - size.y));
@@ -17300,7 +17374,7 @@ void drawTownLabels(RenderWindow& window, const Font& font, const View& worldVie
         RectangleShape panel(size);
         panel.setPosition(pos);
         panel.setFillColor(kTownLabelPanelColor);
-        Color rim = lensRaceColors[r];
+        Color rim = ink;
         rim.a = kTownLabelRimAlpha;
         panel.setOutlineColor(rim);
         panel.setOutlineThickness(1.0f);
@@ -17383,12 +17457,17 @@ void flipTown(int ti, int to) {
         swapRemove(townCarts, i);
         carts++;
     }
+    bool wasFree = t.free;
     t.race = to;
     t.growth = 0;
+    t.free = false;                          // R71-F4: won back by the sword
+    t.sacks = wasFree ? 0 : t.sacks + 1;     // R71-F4: a freed town starts its count again
+    t.neglect = t.freeTicks = 0;
     t.flipCooldown = kTownFlipCooldownTicks;
     t.flipFlash = kTownFlipFlashFrames;
     t.flashFrames = storehouseFlashFrames;
-    string line = string(racePlurals[to]) + " sack the " + racePlurals[from] + "' new town and raise their own pennant";
+    string line = string(racePlurals[to]) + " sack the " + racePlurals[from] + (wasFree ? "' old free town" : "' new town")
+                  + " and raise their own pennant";
     printf("---TOWN TAKEN--- %s (town %d at (%.0f, %.0f), %d cart%s cancelled, cooldown %d ticks)\n", line.c_str(), t.id,
            t.crate.x, t.crate.y, carts, carts == 1 ? "" : "s", kTownFlipCooldownTicks);
     logEvent(line, kRaidTickerTint);
@@ -18247,7 +18326,10 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
         }
         if (won) raidPlunder(barbs, ri);   // R53-F1
         if (won && raid.gateBroken) bindVassal(att, def);   // R58-F1
-        if (won && ti >= 0) flipTown(ti, att);   // R70-F1: only now, after every fighter's step and the outcome are settled
+        if (won && ti >= 0) {   // R70-F1: only now, after every fighter's step and the outcome are settled
+            if (!towns[ti].free && towns[ti].sacks + 1 >= kTownFreeSacks) freeTown(towns[ti], "sacked twice");   // R71-F4
+            else flipTown(ti, att);
+        }
         return;
     }
 
@@ -25035,12 +25117,14 @@ void chronicleRestoreSites(chronicleData& d, world& wd, vector<house>& houses, v
         t.crate = crate;
         t.growth = ct.growth;
         t.plot = ct.plot != 0;
+        t.free = ct.free != 0;   // R71-F4: false without the tail
+        t.sacks = ct.sacks;
         for (int k = 0; k < (int)spots.size(); k++)
             d.houseNewId[ct.houses[k]] = houses[townAddHouse(t, houses, houseshapes, spots[k])].id;
         towns.push_back(t);
         townsBack++;
-        printf("CHRONICLE - %s New Town %d back at (%.0f, %.0f): %d houses, growth %d/%d%s\n", raceDefs[r].name, t.id, crate.x, crate.y,
-               (int)t.houses.size(), t.growth, kTownGrowthPerStep, t.plot ? ", plot tilled" : "");
+        printf("CHRONICLE - %s New Town %d back at (%.0f, %.0f): %d houses, growth %d/%d%s%s\n", raceDefs[r].name, t.id, crate.x, crate.y,
+               (int)t.houses.size(), t.growth, kTownGrowthPerStep, t.plot ? ", plot tilled" : "", t.free ? ", free" : "");
     }
 
     int foldsBack = 0, foldsMoved = 0, foldsLost = 0, lambsBack = 0;   // FOLD
