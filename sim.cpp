@@ -3129,6 +3129,18 @@ const float kTownLabelGapPx = 3.0f;             // screen px between the pennant
 const Color kTownLabelPanelColor(10, 14, 12, 160);   // the inspect panel's translucent near-black
 const uint8_t kTownLabelRimAlpha = 150;         // 1px rim in the race's lens colour, softened; the text takes it at full
 const float kTownPennantShade = 0.25f;          // the flag's bottom row, eased toward black for a little depth
+// R70-F1 Sacked Daughter Towns, phase 1: a raid (war raids too) on a race with a town may march on the town crate
+// instead of the quarter, held by Town::id and re-looked-up every raidTick(). No siege there (no gate). A won town raid
+// hands the town to the winner through flipTown() once the fight has been settled: race (crate tint, pennant, label),
+// the old owner's cart cancelled, a pennant flash and one ticker line naming both races. A taken town can't be raided
+// again for kTownFlipCooldownTicks. Roofs, tithe re-point, smoke and refugees are phase 2; until then the old townsfolk
+// stay in their houses and haul to their own mother crate (ownTownOf()).
+const float kTownRaidChance = 0.5f;             // a launch on a race with an open town marches on the town this often
+const int kTownFlipCooldownTicks = 3 * 24 * ticksPerGameHour;   // three game days before a taken town is a target again
+const int kTownFlipFlashFrames = 96;            // drawn frames the new pennant blinks pale after a flip (~1.6s at 60fps)
+const int kTownFlipBlinkFrames = 16;            // one blink: pale for half, the new race colour for half
+const Color kTownFlipFlashColor(238, 232, 214); // pale parchment, the finial's family; reads over every lens colour
+const float kTownFlipBodyMix = 0.3f;            // peak crate-body blend toward white while the flag blinks (deposit is 0.4)
 // R69-F1b Supply Cart, phase 2: one townCart per town (not a barb) waits by the mother crate, loads kTownGrainOutflow food
 // only through townTitheOk() (townGrow()'s own floor check), rolls in a straight line to the town crate (no route or tree
 // search; slowed on water like a wader, sped by worn road like a barb), unloads there and rolls home empty. The town
@@ -4113,9 +4125,17 @@ struct Town {
     int flashFrames = 0;   // deposit flash, per drawn frame (like storehouse::flashFrames)
     int growth = 0;        // R69-F1: tithed grain toward the next growth step (0..kTownGrowthPerStep)
     bool plot = false;     // R69-F1: the green plot beside the pennant has appeared
+    int flipCooldown = 0;  // R70-F1: sim ticks before a raid may target it again (set by flipTown(), not saved)
+    int flipFlash = 0;     // R70-F1: drawn frames left of the pennant blink after a flip
 };
 vector<Town> towns;
 int nextTownId = 0;
+// R70-F1: index into towns of the town with stable id `id`, -1 = gone
+int findTownById(int id) {
+    if (id < 0) return -1;
+    for (int t = 0; t < (int)towns.size(); t++) if (towns[t].id == id) return t;
+    return -1;
+}
 // The one town lookup: index into towns of the town house id belongs to, -1 = a quarter house (or no house)
 int townOf(int houseId) {
     if (houseId < 0) return -1;
@@ -5058,6 +5078,7 @@ struct raidParty {
     bool gateBroken = false;                // R58-F1: the Siege broke the gate (a won raid then makes a vassal)
     int id = 0;                             // R60-F1: raid serial, set at launch (0 = none); wars log raids by this id
     bool torchRolled = false;               // R62-F2c: the one bridge-torch roll this raid has been made
+    int townId = -1;                        // R70-F1: Town::id of the raided daughter town (-1 = the quarter crate)
 };
 raidParty raid;
 int raidSerial = 0;                         // R60-F1: last raid id handed out
@@ -12027,6 +12048,9 @@ void drawStorehouses(RenderWindow& window, const storehouse (&stores)[raceCount]
     for (auto& tw : towns) {   // R66-F1: a daughter town's crate, same build, under an 8x10 race-tinted swallowtail pennant
         int r = clampRace(tw.race);
         float t = storehouseFlashMix * (float)tw.flashFrames / storehouseFlashFrames;
+        float flip = (float)tw.flipFlash / kTownFlipFlashFrames;   // R70-F1: 1 at the flip, easing to 0
+        bool blinkPale = tw.flipFlash > 0 && (tw.flipFlash / (kTownFlipBlinkFrames / 2)) % 2 == 1;
+        t = max(t, kTownFlipBodyMix * flip);
         Vector2f o = snapPx(tw.crate);
         drawParts(va, storeShadowParts, o, Color::White);
         drawParts(va, storeBodyParts, o, lerpColor(storehouseColors[r], Color::White, t));
@@ -12038,6 +12062,7 @@ void drawStorehouses(RenderWindow& window, const storehouse (&stores)[raceCount]
             pushQuad(va, q + Vector2f(1.0f, 3.0f), Vector2f(kTownPlotSize.x - 2.0f, 1.0f), kTownPlotRowColor);
         }
         Color flag = lensRaceColors[r];
+        if (blinkPale) flag = lerpColor(flag, kTownFlipFlashColor, 0.4f + 0.6f * flip);   // R70-F1: the new flag blinks in
         Vector2f p = o + Vector2f(kTownPennantX, kTownPennantTop);   // pole top
         pushQuad(va, p, Vector2f(1.0f, 1.0f), kTownPennantTipColor);                        // finial
         pushQuad(va, p + Vector2f(0.0f, 1.0f), Vector2f(1.0f, -kTownPennantTop - 1.0f), kTownPennantPoleColor);   // pole to the lid
@@ -16973,6 +16998,7 @@ void drawTownCarts(RenderWindow& window, bool paused) {
 // the expedition walk and leave a dust trail; once all stand at the site the crate and houses rise, the founders move
 // in, their flag clears, and the one ticker line goes out. R69-F1: townGrow() runs first, every tick, trek or not.
 void townTick(vector<barb>& barbs, vector<RectangleShape>& squares, vector<house>& houses, vector<RectangleShape>& houseshapes) {
+    for (auto& t : towns) if (t.flipCooldown > 0) t.flipCooldown--;   // R70-F1
     townGrow(barbs, houses, houseshapes);
     townCartTick(barbs);   // R69-F1b: the supply carts, independent of growth
     if (!trek.active) return;
@@ -17117,6 +17143,37 @@ Vector2f raidCentre(const RectangleShape& sq) { return sq.getPosition() + sq.get
 
 // R52-F1: raider k's stand spot at race r's crate (hitbox top-left): in a row left of the crate, like the expedition
 Vector2f raidCrateSpot(int r, int k) { return storehousePos[clampRace(r)] + storehouseStandOffset + Vector2f(-kRaidColumnGapPx * k, 0.0f); }
+// R70-F1: the raid's target crate, ti = towns index of the raided town (-1 = the defender's quarter crate)
+Vector2f raidTargetCentre(int ti) { return ti >= 0 ? towns[ti].crate + storehouseSize / 2.0f : quarterCentre(clampRace(raid.def)); }
+Vector2f raidTargetSpot(int ti, int k) {
+    return ti >= 0 ? towns[ti].crate + storehouseStandOffset + Vector2f(-kRaidColumnGapPx * k, 0.0f) : raidCrateSpot(raid.def, k);
+}
+
+// R70-F1: the one way a town changes hands (raidTick(), after a won town raid's fight is settled). The old owner's cart
+// is cancelled (its load back to the old larder; townCartTick() rolls a fresh one out of the new owner's crate), the
+// tithed growth is lost in the sack, the cooldown starts, the new pennant blinks, and one ticker line names both races.
+void flipTown(int ti, int to) {
+    if (ti < 0 || ti >= (int)towns.size() || to < 0 || to >= raceCount) return;
+    Town& t = towns[ti];
+    int from = clampRace(t.race);
+    if (from == to) return;
+    int carts = 0;
+    for (int i = (int)townCarts.size() - 1; i >= 0; i--) {
+        if (townCarts[i].townId != t.id) continue;
+        stock[from].food += townCarts[i].load;
+        swapRemove(townCarts, i);
+        carts++;
+    }
+    t.race = to;
+    t.growth = 0;
+    t.flipCooldown = kTownFlipCooldownTicks;
+    t.flipFlash = kTownFlipFlashFrames;
+    t.flashFrames = storehouseFlashFrames;
+    string line = string(racePlurals[to]) + " sack the " + racePlurals[from] + "' new town and raise their own pennant";
+    printf("---TOWN TAKEN--- %s (town %d at (%.0f, %.0f), %d cart%s cancelled, cooldown %d ticks)\n", line.c_str(), t.id,
+           t.crate.x, t.crate.y, carts, carts == 1 ? "" : "s", kTownFlipCooldownTicks);
+    logEvent(line, kRaidTickerTint);
+}
 
 // R52-F1: a cold pair whose cooldown has run out, by daylight, both crates built. The aggressor is the side with more
 // eligible armed barbs (at least kRaidPartySize, its bell silent); ties are rolled. The column is the nearest eligible
@@ -17347,7 +17404,11 @@ void tryLaunchRaid(vector<barb>& barbs, vector<RectangleShape>& squares, const s
         }
         if (!ok) continue;
         if (!war && trySendEnvoy(barbs, att, def)) return;   // R56-F2: the column stays home while the envoy walks (R60-F1: not in war)
+        int townId = -1;   // R70-F1: the defender's first open town, taken as the target on a kTownRaidChance roll
+        for (auto& t : towns) if (t.race == def && t.flipCooldown <= 0) { townId = t.id; break; }
+        if (townId >= 0 && !bernoulli_distribution(kTownRaidChance)(gen)) townId = -1;
         raid = raidParty{};
+        raid.townId = townId;
         resetSiege();   // R57-F2: every launch starts at full gates (endRaid() already did; defensive)
         raid.active = true;
         raid.id = ++raidSerial;   // R60-F1
@@ -17363,9 +17424,10 @@ void tryLaunchRaid(vector<barb>& barbs, vector<RectangleShape>& squares, const s
             raid.raiderIds[k] = m.id;
             names += string(k == 0 ? "" : k == kRaidPartySize - 1 ? " and " : ", ") + m.name;
         }
-        printf("---RAID OUT--- %s march on the %s (%s), relation %.2f%s\n", racePlurals[att], racePlurals[def], names.c_str(),
-               raceRelation[att][def], war ? ", war raid" : "");
-        logEvent(string(racePlurals[att]) + " march on the " + racePlurals[def] + ": " + names, kRaidTickerTint);
+        printf("---RAID OUT--- %s march on the %s%s (%s), relation %.2f%s\n", racePlurals[att], racePlurals[def],
+               townId >= 0 ? "' new town" : "", names.c_str(), raceRelation[att][def], war ? ", war raid" : "");
+        logEvent(string(racePlurals[att]) + " march on the " + racePlurals[def] + (townId >= 0 ? "' new town: " : ": ") + names,
+                 kRaidTickerTint);
         return;
     }
 }
@@ -17799,14 +17861,21 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
         endRaid(barbs);
         return;
     }
+    int ti = findTownById(raid.townId);   // R70-F1: re-looked-up every tick; -1 = a quarter raid
+    if (raid.townId >= 0 && raid.phase != raidParty::Home && (ti < 0 || towns[ti].race != def)) {
+        printf("---RAID ABANDONED--- %s (town %d %s)\n", pairText.c_str(), raid.townId, ti < 0 ? "gone" : "already taken");
+        logEvent(pairText + "' new town is abandoned", kRaidTickerTint);
+        endRaid(barbs);
+        return;
+    }
 
     if (raid.phase == raidParty::March) {
-        raidColumnStep(barbs, squares, ri, raidCrateSpot(def, 0));
+        raidColumnStep(barbs, squares, ri, raidTargetSpot(ti, 0));
         for (int k = 0; k < kRaidPartySize; k++) {
             if (ri[k] < 0) continue;
-            Vector2f d = raidCentre(squares[ri[k]]) - quarterCentre(def);
+            Vector2f d = raidCentre(squares[ri[k]]) - raidTargetCentre(ti);
             if (d.x * d.x + d.y * d.y < kRaidAlarmPx * kRaidAlarmPx) {
-                if (siegeReady(def)) {   // R57-F2: keep, finished wall and both towers stand: the gate first
+                if (ti < 0 && siegeReady(def)) {   // R57-F2: keep, finished wall and both towers stand: the gate first (R70-F1: no gate at a town)
                     raid.phase = raidParty::Siege;
                     raid.siegeTicks = 0;
                     gateHp[def] = kGateHpMax;
@@ -17874,7 +17943,7 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
             raid.scanTimer = kRaidDefendScanTicks;
             for (int k = 0; k < kRaidDefenderMax; k++) {
                 if (di[k] >= 0) continue;
-                int j = findNearest(quarterCentre(def), kRaidDefendRadius, n,
+                int j = findNearest(raidTargetCentre(ti), kRaidDefendRadius, n,   // R70-F1: round the raided crate
                                     [&](int i) { return raidCentre(squares[i]); },
                                     [&](int i) { return !raidDefenderOk(barbs[i], def); });
                 if (j < 0) break;
@@ -17890,7 +17959,7 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
             barb& b = barbs[i];
             if (b.raidBeaten) { if (b.moving) { b.moving = false; clearRoute(b); b.stepTimer = 0; } continue; }
             if (raidFightStep(barbs, squares, i, di, kRaidDefenderMax, kRaidEngagePx)) continue;
-            Vector2f spot = raidCrateSpot(def, k);
+            Vector2f spot = raidTargetSpot(ti, k);
             b.targetx = (int)spot.x;
             b.targety = (int)spot.y;
             Vector2f diff = spot - squares[i].getPosition();
@@ -17923,7 +17992,7 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
             int i = ri[k];
             if (i < 0 || barbs[i].raidBeaten) continue;
             standing++;
-            Vector2f diff = raidCrateSpot(def, k) - squares[i].getPosition();
+            Vector2f diff = raidTargetSpot(ti, k) - squares[i].getPosition();
             if (diff.x * diff.x + diff.y * diff.y < 4.0f) atCrate = true;
         }
         raid.holdTicks = defenders == 0 && atCrate ? raid.holdTicks + 1 : 0;
@@ -17941,7 +18010,7 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
         }
         for (int k = 0; k < kRaidPartySize; k++) if (ri[k] >= 0) { barbs[ri[k]].raidPreyId = -1; barbs[ri[k]].raidCooldown = 0; }
         string line;
-        if (won) line = string(racePlurals[att]) + " win their raid on the " + racePlurals[def]
+        if (won) line = string(racePlurals[att]) + " win their raid on the " + racePlurals[def] + (ti >= 0 ? "' new town" : "")
                       + (raid.defendersBeaten > 0 ? " (" + to_string(raid.defendersBeaten) + " defender" + (raid.defendersBeaten == 1 ? "" : "s") + " beaten)"
                                                   : " (unopposed)");
         else line = string(racePlurals[def]) + " drive off the " + racePlurals[att] + "' raid"
@@ -17959,6 +18028,7 @@ void raidTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storeh
         }
         if (won) raidPlunder(barbs, ri);   // R53-F1
         if (won && raid.gateBroken) bindVassal(att, def);   // R58-F1
+        if (won && ti >= 0) flipTown(ti, att);   // R70-F1: only now, after every fighter's step and the outcome are settled
         return;
     }
 
@@ -19382,7 +19452,9 @@ void drawRaidMarker(RenderWindow& window, int frame) {
     c.a = (uint8_t)(kRaidMarkerAlphaMin + (255 - kRaidMarkerAlphaMin) * pulse);
     RectangleShape m(kRaidMarkerSize);
     m.setFillColor(c);
-    m.setPosition(snapPx(storehousePos[raid.def]) + kRaidMarkerOffset);
+    int ti = findTownById(raid.townId);   // R70-F1: a town raid marks the town crate's top-right (the pennant pole is top-left)
+    if (ti >= 0) m.setPosition(snapPx(towns[ti].crate) + Vector2f(storehouseSize.x - kRaidMarkerSize.x, kRaidMarkerOffset.y));
+    else m.setPosition(snapPx(storehousePos[raid.def]) + kRaidMarkerOffset);
     window.draw(m);
 }
 
@@ -20504,8 +20576,14 @@ bool millDepot(const barb& b) {
     return b.carryKind == carryWheat && b.race >= 0 && b.race < raceCount && mills[b.race].built;
 }
 
+// R70-F1: townOf() of b's home, only while that town is still b's race's (a sacked town's old folk haul to the mother)
+int ownTownOf(const barb& b) {
+    int tw = townOf(b.homeHouse);
+    return tw >= 0 && towns[tw].race == b.race ? tw : -1;
+}
+
 Vector2f depotSpot(const barb& b, const storehouse (&stores)[raceCount]) {
-    int tw = townOf(b.homeHouse);   // R66-F1: a town household hauls everything (sheaves too) to its own town's crate
+    int tw = ownTownOf(b);   // R66-F1: a town household hauls everything (sheaves too) to its own town's crate
     if (tw >= 0) return towns[tw].crate + storehouseStandOffset;
     if (millDepot(b)) return millWorkSpot(mills[b.race]);   // FARM-F2: sheaves go to the mill while it stands
     if (b.race >= 0 && b.race < raceCount && stores[b.race].built) return storehousePos[b.race] + storehouseStandOffset;
@@ -20715,7 +20793,7 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
         bool milled = millDepot(b);
         Vector2f ms = milled ? millWorkSpot(mills[b.race]) : Vector2f();
         if (milled && (b.targetx != (int)ms.x || b.targety != (int)ms.y)) milled = false;   // stood at another depot instead
-        int tw = townOf(b.homeHouse);   // R66-F1: depotSpot() sent a town household to its town's crate
+        int tw = ownTownOf(b);   // R66-F1: depotSpot() sent a town household to its town's crate
         storehouse* st = (!milled && tw < 0 && b.race >= 0 && b.race < raceCount && stores[b.race].built) ? &stores[b.race] : nullptr;
         int yield = (milled ? millFoodYield : fieldFoodYield) + forageBonus(b)   // R25-F1: Forager +1
                   + (b.carryAmount - 1);   // R67-F1a: a rested plot's sheaf carries restYieldBonus extra units
@@ -20744,7 +20822,7 @@ void haulTick(barb& b, RectangleShape& sq, storehouse (&stores)[raceCount], cons
             rs.stone += forgeStoneBonus;
             spawnForgeSparks();
         }
-        int tw = townOf(b.homeHouse);   // R66-F1: depotSpot() sent a town household to its town's crate
+        int tw = ownTownOf(b);   // R66-F1: depotSpot() sent a town household to its town's crate
         storehouse* st = (tw < 0 && b.race >= 0 && b.race < raceCount && stores[b.race].built) ? &stores[b.race] : nullptr;
         if (st) { st->stored++; st->flashFrames = storehouseFlashFrames; }
         else if (tw >= 0) towns[tw].flashFrames = storehouseFlashFrames;
@@ -25395,6 +25473,7 @@ int main() {
 	drawEnvyPips(window);   // R61-F4b: red pip at an envious rival's crate while its envy lasts
 	for (auto& st : stores) if (st.flashFrames > 0 && !paused) st.flashFrames--;
 	for (auto& tw : towns) if (tw.flashFrames > 0 && !paused) tw.flashFrames--;   // R66-F1
+	for (auto& tw : towns) if (tw.flipFlash > 0 && !paused) tw.flipFlash--;       // R70-F1
 	for (int r = 0; r < raceCount; r++)
 	    for (auto& fp : fields[r]) drawField(window, fp, r, frameCount);
 	drawScarecrows(window, fields, frameCount);   // R67-F1b: over the crop rows
