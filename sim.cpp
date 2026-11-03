@@ -336,8 +336,9 @@ const char* const kChroniclePath = "chronicle.sav";
 const char* const kChronicleTmpPath = "chronicle.sav.tmp";
 const int32_t kChronicleMagic = 0x4C524843;         // "CHRL" little-endian
 const int32_t kChronicleEndMark = 0x444E4543;       // "CEND": trailer, so a truncated file is rejected
-const int32_t kChronicleVersion = 7;                // R69-F4: v7 adds the "PLOT", "TOWN", "FOLD" and "JTTY" blocks and widens BARB with the cloak
-const int32_t kChronicleVersionVassal = 6;          // R65-F4: v6 adds the "VASL" block; still loads, with no towns, folds, jetties or cloaks
+const int32_t kChronicleVersion = 8;                // R70-F4: v8 adds the "COG " block and widens each FOLD sheep with its lamb age
+const int32_t kChronicleVersionSites = 7;           // R69-F4: v7 adds the "PLOT", "TOWN", "FOLD" and "JTTY" blocks and widens BARB with the cloak; still loads, no cog or lambs
+const int32_t kChronicleVersionVassal = 6;         // R65-F4: v6 adds the "VASL" block; still loads, with no towns, folds, jetties or cloaks
 const int32_t kChronicleVersionAlly = 5;           // R59-F1: v5 adds the "ALLY" block (alliances and their brides); still loads, no vassals
 const int32_t kChronicleVersionDynasty = 4;        // R58-F2: v4 widens each BARB entry with parents and dynasty; still loads
 const int32_t kChronicleVersionBlocks = 3;          // R55-F4: v3 adds tagged blocks (named barbs first) after the houses; still loads
@@ -369,14 +370,23 @@ const int kChronicleBarbWords = 13;                 // R69-F4 (v7): + cloak (0/1
 // R69-F4 (v7) blocks. Each is read whole into memory and parsed there; a block whose counts or size don't add up is
 // skipped (nothing of it restored) rather than rejecting the file, and a bad entry inside a good block drops only that
 // entry. Restored in the order PLOT, TOWN, FOLD, JTTY by chronicleRestoreSites(), each entry checked whole before any
-// vector is touched. The merchant cog is never saved: a load leaves it absent (see merchantCog in chronicleRestore()).
+// vector is touched. R70-F4 (v8): the merchant cog is saved in "COG " and put back by chronicleRestoreSites() after the
+// jetty; a v7-or-older file (or a cog whose jetty did not come back) leaves it departed for its saved year.
 const int32_t kChronicleBlockPlot = 0x544F4C50;     // "PLOT": raceCount, fieldsPerRace, then per race per plot {crop, lastCrop}
 const int32_t kChronicleBlockTown = 0x4E574F54;     // "TOWN": count, then per town {race, crate dx, dy, growth, plot, n, n file house indices}
 const int32_t kChronicleBlockFold = 0x444C4F46;     // "FOLD": count, then per built fold {race, dx, dy, wool, loom, shearYear, n, n x {slot, shorn, shornDay}}
 const int32_t kChronicleBlockJetty = 0x5954544A;    // "JTTY": count, then per jetty {race, holed, holedTicks}
 const int kChronicleTownWords = 6;                  // words before a town's house list
 const int kChronicleFoldWords = 7;                  // words before a fold's sheep list
-const int kChronicleSheepWords = 3;
+const int kChronicleSheepWordsV7 = 3;               // v7: slot, shorn, shornDay
+const int kChronicleSheepWords = 4;                 // R70-F4 (v8): + lambAge (ticks, 0 = grown, 0..kLambGrowTicks)
+// R70-F4 (v8) "COG ": {state, timer, visitYear, jetty race (-1 none), raceCount, then per race one word reserved for
+// R70-F2 (the harbour toll's first-toll flag; written 0 until F2 fills it)}. "CAMP" is reserved inside v8 for R70-F3's
+// brigand camps: the loader takes one such block and skips its words, so F3 adds it with no further version bump.
+const int32_t kChronicleBlockCog = 0x20474F43;      // "COG "
+const int32_t kChronicleBlockCamp = 0x504D4143;     // "CAMP" (R70-F3, reserved)
+const int kChronicleCogWords = 5;                   // words before the per-race reserved words
+const char* const kChronicleV7TestPath = "chronicle_v7test.sav";   // R70-F4: scratch v7 file for the round-trip's old-loader check
 const int kChronicleJettyWords = 3;
 const int kChronicleMaxHungerMult = 4;              // hunger saved clamped to hungerThreshold * this; a larger value is rejected
 const int kChronicleReturnNames = 2;                // barbs named on the restore line ("Hild, Orm and 6 more return")
@@ -5788,6 +5798,9 @@ struct world {
 	vector<RectangleShape> deershape;   // parallel to deers: every push and swapRemove touches both at the same index
 	vector<barb> barbs;
 	vector<RectangleShape> squares;     // parallel to barbs: every push and swapRemove touches both at the same index
+	// R70-F4 slice 3: the house pair, same names; main binds references to it. Grown only by addHouse(), never removed.
+	vector<house> houses;
+	vector<RectangleShape> houseshapes; // parallel to houses: addHouse() pushes both at the same index
 };
 
 void checkWorldSync(const world& wd) {
@@ -5799,6 +5812,12 @@ void checkWorldSync(const world& wd) {
 		        wd.barbs.size(), wd.squares.size(), min(wd.barbs.size(), wd.squares.size()));
 #endif
 	SIM_DEBUG_ASSERT(wd.barbs.size() == wd.squares.size());
+#ifdef SIM_DEBUG
+	if (wd.houses.size() != wd.houseshapes.size())   // R70-F4: same report for the house pair
+		fprintf(stderr, "checkWorldSync: houses %zu vs houseshapes %zu, first mismatched index %zu\n",
+		        wd.houses.size(), wd.houseshapes.size(), min(wd.houses.size(), wd.houseshapes.size()));
+#endif
+	SIM_DEBUG_ASSERT(wd.houses.size() == wd.houseshapes.size());
 }
 
 struct trader {
@@ -5919,7 +5938,7 @@ struct jetty {
 };
 vector<jetty> jetties;
 int nextJettyId = 0, nextBoatId = 0;
-// R69-F3: the one merchant cog. Not saved: a chronicle load resets it to absent.
+// R69-F3: the one merchant cog. R70-F4: saved in the v8 "COG " block (the pip is not); a v7 load leaves it absent.
 enum class cogState { absent, arriving, docked, leaving };   // scoped, so the short names never clash
 struct cog {
     cogState state = cogState::absent;
@@ -10482,7 +10501,7 @@ struct chronicleBarb { int name = -1, race = 0, birthRace = 0, trait = 0, leader
                        int cloak = 0, cloakAge = 0; };                 // R69-F4 (v7): 0 from an older file (no cloak)
 // R69-F4 (v7): the structure blocks, as read (counts checked; entries judged again by chronicleRestoreSites())
 struct chronicleTown { int race = 0, dx = 0, dy = 0, growth = 0, plot = 0; vector<int> houses; };   // houses: file house indices
-struct chronicleSheep { int slot = 0, shorn = 0, shornDay = 0; };
+struct chronicleSheep { int slot = 0, shorn = 0, shornDay = 0, lambAge = 0; };   // lambAge: R70-F4 (v8), 0 from a v7 file
 struct chronicleFold { int race = 0, dx = 0, dy = 0, wool = 0, loom = 0, shearYear = -1; vector<chronicleSheep> sheep; };
 struct chronicleJetty { int race = 0, holed = 0, holedTicks = 0; };
 struct chronicleData {
@@ -10517,6 +10536,10 @@ struct chronicleData {
     vector<chronicleFold> folds;
     vector<chronicleJetty> jetties;
     vector<char> townHouse;                        // R69-F4: per file house, 1 = listed by a town (placed by chronicleRestoreSites())
+    int version = 0;                               // R70-F4: the file's version word
+    bool haveCog = false;                          // R70-F4: a valid "COG " block was read (absent before v8)
+    int cogPhase = 0, cogTimer = 0, cogYear = -1, cogRace = -1;   // checked ranges; the jetty is looked up by race on restore
+    int tollReserved[raceCount] = {};              // R70-F2's reserved words, read and kept for it (0 until F2 writes them)
 };
 
 int chronicleNameIndex(const barb& b) {   // R55-F4: -1 for Sasuke; names only ever come from barbNames or shinobiName
@@ -10686,9 +10709,11 @@ bool chronicleSaveTown(FILE* f, const vector<house>& houses, int housesWritten) 
 
 // R69-F4: the "FOLD" block: every built fold (a staked-out site is not saved; it is picked again) with its sheep. A bale
 // in a weaver's hands is counted back into the store, since the weave itself is never saved.
-bool chronicleSaveFold(FILE* f, const vector<deer>& deers) {
+// R70-F4: a v8 sheep adds its lamb age (a v7 write, for the round-trip's old-loader check, leaves it out).
+bool chronicleSaveFold(FILE* f, const vector<deer>& deers, int version) {
     vector<int32_t> w{0};
     int n = 0, year = game_day / yearDays;
+    const int perSheep = version >= kChronicleVersion ? kChronicleSheepWords : kChronicleSheepWordsV7;
     for (int r = 0; r < raceCount; r++) {
         const sheepFold& fd = folds[r];
         if (!fd.built) continue;
@@ -10700,10 +10725,11 @@ bool chronicleSaveFold(FILE* f, const vector<deer>& deers) {
             if (!tame(d) || d.foldId != fd.id || d.flockSlot < 0 || d.flockSlot >= kFlockMax || slotUsed[d.flockSlot]) continue;
             slotUsed[d.flockSlot] = true;
             sh.insert(sh.end(), {d.flockSlot, d.shorn ? 1 : 0, d.shorn ? clamp(d.shornDay, 0, game_day) : 0});
+            if (perSheep >= kChronicleSheepWords) sh.push_back(clamp(d.lambAge, 0, kLambGrowTicks));   // R70-F4 (v8)
         }
         w.insert(w.end(), {r, (int32_t)p.x - c.x, (int32_t)p.y - c.y,
                            clamp(fd.wool + (fd.weaveStage == 1 ? 1 : 0), 0, kWoolStoreMax), fd.loomBuilt ? 1 : 0,
-                           clamp(fd.shearYear, -1, year), (int32_t)(sh.size() / kChronicleSheepWords)});
+                           clamp(fd.shearYear, -1, year), (int32_t)(sh.size() / perSheep)});
         w.insert(w.end(), sh.begin(), sh.end());
         n++;
     }
@@ -10729,10 +10755,26 @@ bool chronicleSaveJetty(FILE* f) {
     return chronPutBlock(f, kChronicleBlockJetty, w);
 }
 
-bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses, const fieldGrid& fields, const vector<deer>& deers) {
-    FILE* f = fopen(kChronicleTmpPath, "wb");
-    if (!f) { printf("CHRONICLE - save failed: cannot open %s\n", kChronicleTmpPath); return false; }
-    bool ok = chronPut(f, kChronicleMagic) && chronPut(f, kChronicleVersion) && chronPut(f, raceCount)
+// R70-F4: the "COG " block (v8). The jetty is written as its race (ids are not kept across a load); a cog whose jetty is
+// gone is written absent with its visit year. The pip is not kept. The per-race words are R70-F2's reserved slot.
+bool chronicleSaveCog(FILE* f) {
+    const cog& c = merchantCog;
+    int race = -1;
+    for (auto& j : jetties) if (j.id == c.jettyId) { race = clampRace(j.race); break; }
+    bool away = c.state == cogState::absent || race < 0;
+    int timerMax = c.state == cogState::docked ? kCogDockTicks : kCogSailTicks;
+    vector<int32_t> w{away ? 0 : (int32_t)c.state, away ? 0 : clamp(c.timer, 1, timerMax), max(c.visitYear, -1), away ? -1 : race, raceCount};
+    for (int r = 0; r < raceCount; r++) w.push_back(0);   // R70-F2 reserved: first-toll flag per race
+    return chronPutBlock(f, kChronicleBlockCog, w);
+}
+
+// R70-F4: the whole file, at the given version, into path (kChronicleVersion for the dawn save; kChronicleVersionSites
+// only for the round-trip's v7 check, which leaves out the v8 block and the lamb word, byte for byte the old format).
+bool chronicleWrite(const char* path, int version, const vector<barb>& barbs, const vector<house>& houses, const fieldGrid& fields,
+                    const vector<deer>& deers, int& n) {
+    FILE* f = fopen(path, "wb");
+    if (!f) { printf("CHRONICLE - save failed: cannot open %s\n", path); return false; }
+    bool ok = chronPut(f, kChronicleMagic) && chronPut(f, version) && chronPut(f, raceCount)
            && chronPut(f, game_day) && chronPut(f, game_time);
     for (int r = 0; ok && r < raceCount; r++)
         ok = chronPut(f, stock[r].wood) && chronPut(f, stock[r].stone) && chronPut(f, stock[r].food);
@@ -10740,7 +10782,7 @@ bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses, const
         for (int b = a + 1; ok && b < raceCount; b++)
             ok = chronPut(f, (int32_t)lround(clamp(raceRelation[a][b], kRelationMin, kRelationMax) * kChronicleRelScale));
     for (int r = 0; ok && r < raceCount; r++) ok = chronPut(f, (int32_t)raceEra[r]);   // R54-F4 (v2)
-    int n = min((int)houses.size(), kChronicleMaxHouses);   // never write a file the loader would reject
+    n = min((int)houses.size(), kChronicleMaxHouses);   // never write a file the loader would reject
     ok = ok && chronPut(f, n);
     for (int i = 0; ok && i < n; i++) {
         const house& h = houses[i];
@@ -10758,15 +10800,22 @@ bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses, const
     ok = ok && chronicleSaveWonder(f);                    // R60-F3: likewise
     ok = ok && chronicleSavePlot(f, fields);              // R69-F4 (v7): restored in this order
     ok = ok && chronicleSaveTown(f, houses, n);
-    ok = ok && chronicleSaveFold(f, deers);
+    ok = ok && chronicleSaveFold(f, deers, version);
     ok = ok && chronicleSaveJetty(f);
+    if (version >= kChronicleVersion) ok = ok && chronicleSaveCog(f);   // R70-F4 (v8); R70-F3's "CAMP" goes after it
     ok = ok && chronPut(f, kChronicleEndMark);
     if (fclose(f) != 0) ok = false;
     if (!ok) {
         printf("CHRONICLE - save failed: write error\n");
-        remove(kChronicleTmpPath);
+        remove(path);
         return false;
     }
+    return true;
+}
+
+bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses, const fieldGrid& fields, const vector<deer>& deers) {
+    int n = 0;
+    if (!chronicleWrite(kChronicleTmpPath, kChronicleVersion, barbs, houses, fields, deers, n)) return false;   // R70-F4: split out
     if (rename(kChronicleTmpPath, kChroniclePath) != 0) {   // Windows rename() will not replace an existing file
         remove(kChroniclePath);
         if (rename(kChronicleTmpPath, kChroniclePath) != 0) {
@@ -10785,7 +10834,7 @@ bool chronicleSave(const vector<barb>& barbs, const vector<house>& houses, const
 // R58-F2: a v4 entry adds parentA, parentB and dynasty; a v3 entry has none, so those stay -1 (no parents, no house).
 bool chronicleReadBarbs(FILE* f, int words, int version, chronicleData& d, const char*& why) {
     int n = 0;
-    const int perBarb = version >= kChronicleVersion ? kChronicleBarbWords                                   // R69-F4: v7
+    const int perBarb = version >= kChronicleVersionSites ? kChronicleBarbWords                              // R69-F4: v7; R70-F4: v8 too
                       : version >= kChronicleVersionDynasty ? kChronicleBarbWordsV4 : kChronicleBarbWordsV3;   // R59-F1: v5, v6 too
     if (words < 1 || !chronGetIn(f, 0, kChronicleMaxBarbs, n)) { why = "barb count over the cap"; return false; }
     if (words != 1 + n * perBarb) { why = "barb block size differs"; return false; }
@@ -11007,11 +11056,13 @@ bool chronicleReadTown(FILE* f, int words, chronicleData& d, const char*& why) {
 
 // R69-F4: "FOLD" into d. Same rule: an exact parse or the block is skipped; a second fold of one race, or a sheep slot
 // listed twice, drops that fold. shearYear and shornDay are bounded by the file's own clock (d.day).
+// R70-F4: a v8 sheep carries its lamb age as a fourth word (0..kLambGrowTicks); a v7 sheep has three and comes back grown.
 bool chronicleReadFold(FILE* f, int words, chronicleData& d, const char*& why) {
     vector<int32_t> w;
     if (!chronicleReadWords(f, words, w, why)) return false;
     chronCursor c{w};
     const int offMax = (int)worldSize;
+    const bool lambWord = d.version >= kChronicleVersion;
     int n = 0;
     bool ok = c.get(0, raceCount, n);
     vector<chronicleFold> got;
@@ -11024,6 +11075,7 @@ bool chronicleReadFold(FILE* f, int words, chronicleData& d, const char*& why) {
         for (int k = 0; ok && k < cnt; k++) {
             chronicleSheep s;
             ok = c.get(0, kFlockMax - 1, s.slot) && c.get(0, 1, s.shorn) && c.get(0, s.shorn ? d.day : 0, s.shornDay);
+            if (ok && lambWord) ok = c.get(0, kLambGrowTicks, s.lambAge);
             fd.sheep.push_back(s);
         }
         if (ok) got.push_back(fd);
@@ -11065,10 +11117,29 @@ bool chronicleReadJetty(FILE* f, int words, chronicleData& d, const char*& why) 
     return true;
 }
 
+// R70-F4: "COG " into d. An exact parse or the block is skipped (the cog comes back departed). The state's timer is
+// bounded by its own leg; an absent cog carries no timer or jetty, a sailing one must name a jetty race.
+bool chronicleReadCog(FILE* f, int words, chronicleData& d, const char*& why) {
+    vector<int32_t> w;
+    if (!chronicleReadWords(f, words, w, why)) return false;
+    chronCursor c{w};
+    int races = 0;
+    bool ok = c.get(0, (int)cogState::leaving, d.cogPhase);
+    bool away = d.cogPhase == (int)cogState::absent;
+    int timerMax = away ? 0 : d.cogPhase == (int)cogState::docked ? kCogDockTicks : kCogSailTicks;
+    ok = ok && c.get(away ? 0 : 1, timerMax, d.cogTimer) && c.get(-1, d.day / yearDays, d.cogYear)
+      && c.get(away ? -1 : 0, away ? -1 : raceCount - 1, d.cogRace) && c.get(raceCount, raceCount, races);
+    for (int r = 0; ok && r < raceCount; r++) ok = c.get(0, 1, d.tollReserved[r]);
+    if (!ok || !c.done()) { printf("CHRONICLE - cog block invalid: the cog is restored departed\n"); return true; }
+    d.haveCog = true;
+    return true;
+}
+
 // Reads and bounds-checks the whole file into out; nothing global is touched here. why = the rejection reason.
-bool chronicleRead(chronicleData& out, const char*& why) {
+// R70-F4: path defaults to the chronicle; the round-trip also reads its scratch v7 file through here.
+bool chronicleRead(chronicleData& out, const char*& why, const char* path = kChroniclePath) {
     why = nullptr;
-    FILE* f = fopen(kChroniclePath, "rb");
+    FILE* f = fopen(path, "rb");
     if (!f) return false;   // no chronicle yet: a fresh world, not an error
     chronicleData d;
     int32_t v = 0;
@@ -11077,11 +11148,12 @@ bool chronicleRead(chronicleData& out, const char*& why) {
     const int offMax = (int)worldSize;
     do {
         if (!chronGet(f, v) || v != kChronicleMagic) { why = "not a chronicle file"; break; }
-        if (!chronGet(f, v) || (v != kChronicleVersion && v != kChronicleVersionVassal && v != kChronicleVersionAlly && v != kChronicleVersionDynasty&& v != kChronicleVersionBlocks
+        if (!chronGet(f, v) || (v != kChronicleVersion && v != kChronicleVersionSites && v != kChronicleVersionVassal && v != kChronicleVersionAlly && v != kChronicleVersionDynasty&& v != kChronicleVersionBlocks
                                 && v != kChronicleVersionEras && v != kChronicleVersionNoEras)) {
             why = "unknown version"; break;
         }
         int version = v;
+        d.version = version;   // R70-F4: block parsers that widened in v8 read it from d
         if (!chronGet(f, v) || v != raceCount) { why = "race count differs"; break; }
         if (!chronGetIn(f, 0, kChronicleMaxDay, d.day) || !chronGetIn(f, 0, 23, d.hour)) { why = "clock out of range"; break; }
         bool ok = true;
@@ -11114,6 +11186,7 @@ bool chronicleRead(chronicleData& out, const char*& why) {
         if (version >= 3) {   // R55-F4: tagged blocks up to the end mark (v1/v2 go straight to the end mark)
             bool haveBarbs = false;
             bool seenPlot = false, seenTown = false, seenFold = false, seenJetty = false;   // R69-F4: a block may be skipped yet seen
+            bool seenCog = false, seenCamp = false;   // R70-F4 (v8)
             int blocks = 0;
             while (!why) {
                 if (!chronGet(f, v)) { why = "truncated"; break; }
@@ -11163,6 +11236,14 @@ bool chronicleRead(chronicleData& out, const char*& why) {
                     if (seenJetty) { why = "two jetty blocks"; break; }
                     seenJetty = true;
                     if (!chronicleReadJetty(f, words, d, why)) break;
+                } else if (tag == kChronicleBlockCog) {   // R70-F4 (v8)
+                    if (seenCog) { why = "two cog blocks"; break; }
+                    seenCog = true;
+                    if (!chronicleReadCog(f, words, d, why)) break;
+                } else if (tag == kChronicleBlockCamp) {   // R70-F4: reserved in v8 for R70-F3's camps; one only, skipped for now
+                    if (seenCamp) { why = "two camp blocks"; break; }
+                    seenCamp = true;
+                    for (int k = 0; k < words && !why; k++) if (!chronGet(f, v)) why = "truncated";
                 } else {   // a block from a later feature: skipped word by word, so a short file still fails
                     for (int k = 0; k < words && !why; k++) if (!chronGet(f, v)) why = "truncated";
                 }
@@ -11238,7 +11319,7 @@ bool chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
     for (auto& row : relationClashCooldown) for (auto& c : row) c = 0;
     for (int r = 0; r < raceCount; r++) { allyOf[r] = -1; allyBrideId[r] = -1; marriageCooldown[r] = 0; }   // R59-F1: chronicleRestoreBarbs() re-binds
     marriage = marriageTrip{};
-    merchantCog = cog{};   // R69-F3: the cog is never saved; a load sends it away (absent, this year's visit may come again)
+    merchantCog = cog{};   // R69-F3: cleared here; R70-F4: chronicleRestoreSites() puts a saved (v8) cog back after the jetty
     releaseSellswords("the chronicle is restored");   // R65-F2: hunters are never saved; free them before the wars go
     for (auto& w : wars) w = warState{};   // R60-F1: chronicleRestoreWar() re-declares a valid saved war
     for (auto& row : warCooldown) for (auto& c : row) c = 0;
@@ -11285,7 +11366,9 @@ bool chronicleRestore(const vector<barb>& barbs, vector<house>& houses, vector<R
 // (the loader's own checks) and the v7 state is compared with the live world: cloaks and their ages, every plot's
 // rotation, each town's growth, plot flag and houses, each fold's wool, loom, shearing year, flock and shorn sheep, and
 // each jetty's holed boat. printf only: "ok", or the first thing that differs.
-void chronicleRoundTrip(const vector<barb>& barbs, const fieldGrid& fields, const vector<deer>& deers) {
+// R70-F4: also the v8 cog (state, timer, year, jetty race) and each fold's lamb count; then the same world is written as
+// a v7 file to kChronicleV7TestPath and read back, which must load with no cog block, no lamb ages and the same counts.
+void chronicleRoundTrip(const vector<barb>& barbs, const vector<house>& houses, const fieldGrid& fields, const vector<deer>& deers) {
     chronicleData d;
     const char* why = nullptr;
     string bad;
@@ -11309,31 +11392,61 @@ void chronicleRoundTrip(const vector<barb>& barbs, const fieldGrid& fields, cons
         if (c.race != towns[t].race || c.growth != towns[t].growth || c.plot != (towns[t].plot ? 1 : 0) || c.houses.size() != towns[t].houses.size())
             bad = "town " + to_string(towns[t].id);
     }
-    int built = 0, shorn = 0;
+    int built = 0, shorn = 0, lambs = 0;
     for (auto& f : folds) built += f.built ? 1 : 0;
     if (bad.empty() && (!d.haveFold || (int)d.folds.size() != built)) bad = "fold count";
     for (auto& c : d.folds) {
         if (!bad.empty()) break;
         const sheepFold& f = folds[clampRace(c.race)];
-        int flock = 0, fShorn = 0, cShorn = 0;
-        for (auto& dd : deers) if (tame(dd) && dd.foldId == f.id) { flock++; fShorn += dd.shorn ? 1 : 0; }
-        for (auto& s : c.sheep) cShorn += s.shorn;
+        int flock = 0, fShorn = 0, cShorn = 0, fLambs = 0, cLambs = 0;
+        for (auto& dd : deers) if (tame(dd) && dd.foldId == f.id) { flock++; fShorn += dd.shorn ? 1 : 0; fLambs += dd.lambAge > 0 ? 1 : 0; }
+        for (auto& s : c.sheep) { cShorn += s.shorn; cLambs += s.lambAge > 0 ? 1 : 0; }
         shorn += cShorn;
+        lambs += cLambs;
         if (!f.built || c.wool != min(kWoolStoreMax, f.wool + (f.weaveStage == 1 ? 1 : 0)) || c.loom != (f.loomBuilt ? 1 : 0)
             || c.shearYear != f.shearYear || (int)c.sheep.size() != flock || cShorn != fShorn)
             bad = "fold of the " + string(racePlurals[clampRace(c.race)]);
+        else if (cLambs != fLambs) bad = "lamb count of the " + string(racePlurals[clampRace(c.race)]) + " fold";   // R70-F4
     }
     if (bad.empty() && (!d.haveJetty || d.jetties.size() != jetties.size())) bad = "jetty count";
     for (int j = 0; bad.empty() && j < (int)jetties.size(); j++)
         if (d.jetties[j].race != jetties[j].race || d.jetties[j].holed != (jetties[j].boat.state == boatHoled ? 1 : 0)) bad = "jetty " + to_string(jetties[j].id);
+    // R70-F4: the cog as chronicleSaveCog() writes it (a cog whose jetty is gone counts as away)
+    const cog& mc = merchantCog;
+    int cogRace = -1;
+    for (auto& j : jetties) if (j.id == mc.jettyId) { cogRace = clampRace(j.race); break; }
+    bool away = mc.state == cogState::absent || cogRace < 0;
+    if (bad.empty() && (!d.haveCog || d.cogPhase != (away ? 0 : (int)mc.state) || d.cogYear != max(mc.visitYear, -1)
+                        || d.cogRace != (away ? -1 : cogRace)
+                        || (!away && d.cogTimer != clamp(mc.timer, 1, mc.state == cogState::docked ? kCogDockTicks : kCogSailTicks))))
+        bad = "merchant cog";
+    // R70-F4: the v7 loader path, on the same world written the old way
+    if (bad.empty()) {
+        chronicleData d7;
+        const char* why7 = nullptr;
+        int n7 = 0;
+        if (!chronicleWrite(kChronicleV7TestPath, kChronicleVersionSites, barbs, houses, fields, deers, n7)) bad = "v7 write failed";
+        else if (!chronicleRead(d7, why7, kChronicleV7TestPath)) bad = string("v7 read back failed (") + (why7 ? why7 : "no file") + ")";
+        else if (d7.version != kChronicleVersionSites || d7.haveCog) bad = "v7 file carries v8 data";
+        else if (d7.barbs.size() != d.barbs.size() || d7.houses.size() != d.houses.size() || d7.towns.size() != d.towns.size()
+                 || d7.folds.size() != d.folds.size() || d7.jetties.size() != d.jetties.size() || !d7.havePlot)
+            bad = "v7 counts";
+        for (size_t k = 0; bad.empty() && k < d7.folds.size(); k++) {
+            if (d7.folds[k].sheep.size() != d.folds[k].sheep.size()) { bad = "v7 flock size"; break; }
+            for (auto& s : d7.folds[k].sheep) if (s.lambAge != 0) { bad = "v7 lamb age"; break; }
+        }
+        remove(kChronicleV7TestPath);
+    }
     if (!bad.empty()) { printf("CHRONICLE ROUND-TRIP - MISMATCH: %s\n", bad.c_str()); return; }
-    printf("CHRONICLE ROUND-TRIP - ok: %d cloaks, %d towns, %d folds (%d shorn sheep), %d jetties, %d plots' rotation\n",
-           cloaks, (int)d.towns.size(), (int)d.folds.size(), shorn, (int)d.jetties.size(), raceCount * fieldsPerRace);
+    printf("CHRONICLE ROUND-TRIP - ok: %d cloaks, %d towns, %d folds (%d shorn sheep, %d lambs), %d jetties, %d plots' rotation, "
+           "cog %s; v7 file loads\n",
+           cloaks, (int)d.towns.size(), (int)d.folds.size(), shorn, lambs, (int)d.jetties.size(), raceCount * fieldsPerRace,
+           away ? "away" : "at the jetty");
 }
 
 void chronicleDawn(const vector<barb>& barbs, const vector<house>& houses, const fieldGrid& fields, const vector<deer>& deers) {
     if (!chronicleSave(barbs, houses, fields, deers)) { logEvent("Chronicle could not be saved", kChronicleSaveTint); return; }
-    chronicleRoundTrip(barbs, fields, deers);   // R69-F4
+    chronicleRoundTrip(barbs, houses, fields, deers);   // R69-F4; R70-F4: + cog, lambs and the v7 load
     pushEvent("Chronicle saved, day " + to_string(game_day + 1), kChronicleSaveTint, true);
     if (!events.empty()) events.back().age = max(events.back().age, eventFadeTicks - kChronicleSaveLineTicks);
 }
@@ -23931,6 +24044,7 @@ void lambTick(world& wd, vector<barb>& barbs) {
 // jetty whose race is not this map's coastal race is dropped. Restored folds are penned with their saved flock
 // (shorn flags and days kept); a restored jetty takes this map's scanned site with its boat afloat or holed as saved.
 // A v6-or-older file has no blocks here: nothing changes and no line is posted.
+// R70-F4: then the v8 cog (after the jetty, so it can find its dock) and the folds' lambs, with one ticker line for both.
 void chronicleRestoreSites(chronicleData& d, world& wd, vector<house>& houses, vector<RectangleShape>& houseshapes, fieldGrid& fields,
                            const vector<shrine>& shrines, const vector<tree>& trees, const vector<rock>& rocks,
                            const vector<CircleShape>& bushshapes) {
@@ -23988,7 +24102,7 @@ void chronicleRestoreSites(chronicleData& d, world& wd, vector<house>& houses, v
                (int)t.houses.size(), t.growth, kTownGrowthPerStep, t.plot ? ", plot tilled" : "");
     }
 
-    int foldsBack = 0, foldsMoved = 0, foldsLost = 0;   // FOLD
+    int foldsBack = 0, foldsMoved = 0, foldsLost = 0, lambsBack = 0;   // FOLD
     for (auto& cf : d.folds) {
         int r = clampRace(cf.race);
         if (folds[r].placed) { foldsLost++; continue; }
@@ -24020,6 +24134,8 @@ void chronicleRestoreSites(chronicleData& d, world& wd, vector<house>& houses, v
             sh.y = (int)p.y;
             sh.shorn = s.shorn != 0 && game_day - s.shornDay < kShornDays;   // a fleece already due back is not drawn tan
             sh.shornDay = sh.shorn ? s.shornDay : 0;
+            sh.lambAge = clamp(s.lambAge, 0, kLambGrowTicks);   // R70-F4 (v8): addAnimal() gives a lamb its 2x1 whiter body
+            lambsBack += sh.lambAge > 0 ? 1 : 0;
             flock.push_back(sh);
         }
         folds[r] = f;
@@ -24057,6 +24173,34 @@ void chronicleRestoreSites(chronicleData& d, world& wd, vector<house>& houses, v
         jettiesBack++;
         printf("CHRONICLE - %s jetty %d back at (%.0f, %.0f), boat %d %s\n", raceDefs[r].name, j.id, j.foot.x, j.foot.y, j.boat.id,
                cj.holed ? "holed" : "afloat");
+    }
+
+    // R70-F4 COG (v8): back at its race's restored jetty in the saved state and timer (a docked cog has traded already, an
+    // arriving one trades on docking as usual). No saved block, or its jetty didn't come back: departed for the saved year.
+    bool cogBack = false;
+    if (d.haveCog) {
+        cog& c = merchantCog;
+        c = cog{};
+        c.visitYear = d.cogYear;
+        const jetty* at = nullptr;
+        for (auto& j : jetties) if (d.cogRace >= 0 && j.race == d.cogRace) { at = &j; break; }
+        if (d.cogPhase != (int)cogState::absent && at) {
+            c.state = (cogState)d.cogPhase;
+            c.timer = d.cogTimer;
+            c.jettyId = at->id;
+            c.dock = cogDockPos(*at);
+            c.seaward = at->seaward;
+            c.faceLeft = at->seaward.x > 0.0f;   // same prow rule as cogTick()
+            cogBack = true;
+            printf("CHRONICLE - merchant cog back at the %s jetty %d (state %d, %d ticks left)\n", racePlurals[clampRace(at->race)],
+                   at->id, d.cogPhase, c.timer);
+        } else if (d.cogPhase != (int)cogState::absent)
+            printf("CHRONICLE - the merchant cog's jetty did not come back: the cog has departed for year %d\n", d.cogYear + 1);
+    }
+    if (cogBack || lambsBack > 0) {
+        string what = cogBack ? "the merchant cog" : "";
+        if (lambsBack > 0) what += string(cogBack ? " and " : "") + to_string(lambsBack) + (lambsBack == 1 ? " lamb" : " lambs");
+        logEvent("Chronicle restored " + what, kChronicleRestoreTint);
     }
 
     if (!d.havePlot && !d.haveTown && !d.haveFold && !d.haveJetty) return;   // v6 or older: nothing to report
@@ -24867,8 +25011,8 @@ int main() {
             if (rollInZone(z, 12.0f, p)) rocks.push_back(rock{p.x, p.y, false});   // 6px-radius pentagon
     }
 
-    vector<house> houses;
-    vector<RectangleShape> houseshapes;
+    vector<house>& houses = wd.houses;                    // R70-F4: the house pair lives in wd; same names below
+    vector<RectangleShape>& houseshapes = wd.houseshapes;
     vector<shrine> shrines;
     shrines.reserve(maxShrines);
     smokehouseSet smoke;   // INBOX2-F1: one per race, indexed by barbRace
