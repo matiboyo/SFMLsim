@@ -381,7 +381,8 @@ const int kChronicleFoldWords = 7;                  // words before a fold's she
 const int kChronicleSheepWordsV7 = 3;               // v7: slot, shorn, shornDay
 const int kChronicleSheepWords = 4;                 // R70-F4 (v8): + lambAge (ticks, 0 = grown, 0..kLambGrowTicks)
 // R70-F4 (v8) "COG ": {state, timer, visitYear, jetty race (-1 none), raceCount, then per race one word reserved for
-// R70-F2 (the harbour toll's first-toll flag, 0/1: harbourFirstTollPaid)}. "CAMP" was reserved inside v8 for R70-F3's
+// R70-F2 (the harbour toll's first-toll flag, 0/1: harbourFirstTollPaid), then R71-F3's optional versioned goods tail
+// {kCogGoodsSaveVersion, ingot lots in the hold, ingot price}; a block without the tail loads default goods}. "CAMP" was reserved inside v8 for R70-F3's
 // brigand camps, which now fill it with no further version bump: {count (0..kBrigandCampCap), then per camp {race,
 // site dx, dy from the race's crate, founder name index (-1 none), rest ticks, robbed tally}}.
 const int32_t kChronicleBlockCog = 0x20474F43;      // "COG "
@@ -1330,6 +1331,30 @@ const Color kCogSailSeamColor(168, 158, 136);        // faint seam row so the sa
 const Color kCogPipColor(240, 222, 150);             // gold, the paid-cart pip's brass
 const Color kCogPipOutlineColor(20, 16, 10);         // dark rim so the pip reads on sea, sand or grass
 const Color kCogTickerTint(206, 190, 136);           // pale brass ticker line for the arrival
+// R71-F3 Cog Bazaar, phase 1: the cog also sells ingots. Right after its grain trade on docking, the jetty race buys
+// whole lots (kCogIngotLot ingots each) with coin from its purse, paid away through transferCoin() to kCoinWildfolk (the
+// coin leaves the races), into raceIngots (capped at kIngotStockMax). The cog's price falls kCogIngotPriceDrop per lot it
+// sells (floor kCogIngotPriceFloor) and recovers kCogIngotPriceRecover once per visit, on arrival (ceiling
+// kCogIngotPriceCeil); its hold restocks kCogIngotRestock lots per visit up to kCogIngotStockMax. A visit sells at most
+// kCogIngotMaxBuy lots, below the hold, and a slow restock, so the hold cannot be bought out on every visit. The buying
+// barb (the jetty race's barb nearest the jetty foot) shows one brief pale-steel "-Nc" pip; nothing else changes on
+// the dock. Stock and price are saved as a versioned tail on the v8 "COG " block (no file version bump).
+const int kCogIngotLot = 1;                          // ingots in one lot
+const int kCogIngotStockMax = 4;                     // lots the cog's hold carries at most (a fresh world starts full)
+const int kCogIngotRestock = 1;                      // lots restocked per visit, on arrival
+const int kCogIngotMaxBuy = 2;                       // lots one visit sells at most (below the hold, so never a buy-out)
+const int kCogIngotPriceCeil = 10;                   // coin per lot at most (and at the start): five grain lots' worth
+const int kCogIngotPriceFloor = 6;                   // coin per lot at least
+const int kCogIngotPriceDrop = 1;                    // the price falls this much per lot sold
+const int kCogIngotPriceRecover = 2;                 // and recovers this much per visit (not per tick), on arrival
+const int kCogIngotPurseKeep = 4;                    // coin the buying race keeps back in its purse
+const int kCogGoodsSaveVersion = 1;                  // tail word of the "COG " block's goods section (absent = defaults)
+static_assert(kCogIngotPriceFloor > 0 && kCogIngotPriceFloor <= kCogIngotPriceCeil, "cog ingot price: floor within ceiling");
+static_assert(kCogIngotMaxBuy < kCogIngotStockMax && kCogIngotRestock < kCogIngotMaxBuy, "cog ingots: no buy-out every visit");
+const int kCogBuyPipFrames = 150;                    // "-Nc" pip life in drawn frames (~2.5s at 60fps): brief
+const float kCogBuyPipRisePx = 8.0f;
+const unsigned int kCogBuyPipFontSize = 11;
+const Color kCogBuyPipColor(200, 208, 216);          // pale steel: an ingot bought, apart from the gold "+Nc" coin pips
 // R66-F3 Sheep Folds and Shepherds, phase 1: with kFoldMinHouses houses a race picks one fold site just outside its house
 // disc (reserved through forgeClear(), its ground cleared through inClearing()) and a builder fences it (jobFold). The
 // fold is penned with a fixed flock of kFlockMax sheep: pale off-white speciesSheep animals in the deer vectors, marked
@@ -6065,6 +6090,11 @@ vector<jetty> jetties;
 int nextJettyId = 0, nextBoatId = 0;
 // R69-F3: the one merchant cog. R70-F4: saved in the v8 "COG " block (the pip is not); a v7 load leaves it absent.
 enum class cogState { absent, arriving, docked, leaving };   // scoped, so the short names never clash
+// R71-F3: the cog's wares beyond its grain trade (phase 1: ingots only). Kept across visits; saved in "COG ".
+struct cogGoods {
+    int cogStock = kCogIngotStockMax;    // ingot lots in the hold, 0..kCogIngotStockMax
+    int cogPrice = kCogIngotPriceCeil;   // coin per lot, kCogIngotPriceFloor..kCogIngotPriceCeil
+};
 struct cog {
     cogState state = cogState::absent;
     int jettyId = -1;          // stable id of the jetty it docks at
@@ -6075,8 +6105,19 @@ struct cog {
     bool faceLeft = false;     // prow toward the strand when the coast runs north-south
     int pipCoin = 0;           // coin shown in the "+Nc" pip
     int pipFrames = 0;         // drawn frames the pip has left
+    cogGoods goods;            // R71-F3: kept when the cog departs (cogDepart() carries it over)
+    int buyerId = -1;          // R71-F3: barb id of the ingot buyer the "-Nc" pip rides over (not saved)
+    int buyPipCoin = 0, buyPipFrames = 0;
 };
 cog merchantCog;
+// R71-F3: the cog back to absent, keeping only its visit year and its goods
+void cogDepart(cog& c) {
+    int year = c.visitYear;
+    cogGoods g = c.goods;
+    c = cog{};
+    c.visitYear = year;
+    c.goods = g;
+}
 struct jettySiteCache { bool scanned = false, found = false; int race = -1; Vector2f deck, deckSize, moor, seaward, foot; };
 jettySiteCache jettySite;     // the coastal race's one site, scanned once by scanJettySite()
 struct boatWake { Vector2f c; bool horiz; int frames; };
@@ -10666,6 +10707,8 @@ struct chronicleData {
     bool haveCog = false;                          // R70-F4: a valid "COG " block was read (absent before v8)
     int cogPhase = 0, cogTimer = 0, cogYear = -1, cogRace = -1;   // checked ranges; the jetty is looked up by race on restore
     int tollReserved[raceCount] = {};              // R70-F2: per race first-toll flag (0/1), into harbourFirstTollPaid on load
+    bool haveCogGoods = false;                     // R71-F3: the "COG " block carried its goods tail (version 1)
+    int cogIngotStock = kCogIngotStockMax, cogIngotPrice = kCogIngotPriceCeil;   // defaults = a fresh cog's goods
     bool haveCamp = false;                         // R70-F3: a valid "CAMP" block was read (absent before v8 and in early v8 files)
     vector<chronicleCamp> camps;                   // at most kBrigandCampCap; sites judged again by chronicleRestoreCamps()
 };
@@ -10893,6 +10936,9 @@ bool chronicleSaveCog(FILE* f) {
     int timerMax = c.state == cogState::docked ? kCogDockTicks : kCogSailTicks;
     vector<int32_t> w{away ? 0 : (int32_t)c.state, away ? 0 : clamp(c.timer, 1, timerMax), max(c.visitYear, -1), away ? -1 : race, raceCount};
     for (int r = 0; r < raceCount; r++) w.push_back(harbourFirstTollPaid[r] ? 1 : 0);   // R70-F2: first-toll flag per race
+    // R71-F3: versioned goods tail {kCogGoodsSaveVersion, ingot lots in the hold, ingot price}; older v8 files end above
+    w.insert(w.end(), {kCogGoodsSaveVersion, clamp(c.goods.cogStock, 0, kCogIngotStockMax),
+                       clamp(c.goods.cogPrice, kCogIngotPriceFloor, kCogIngotPriceCeil)});
     return chronPutBlock(f, kChronicleBlockCog, w);
 }
 
@@ -11277,7 +11323,13 @@ bool chronicleReadCog(FILE* f, int words, chronicleData& d, const char*& why) {
     ok = ok && c.get(away ? 0 : 1, timerMax, d.cogTimer) && c.get(-1, d.day / yearDays, d.cogYear)
       && c.get(away ? -1 : 0, away ? -1 : raceCount - 1, d.cogRace) && c.get(raceCount, raceCount, races);
     for (int r = 0; ok && r < raceCount; r++) ok = c.get(0, 1, d.tollReserved[r]);
-    if (!ok || !c.done()) { printf("CHRONICLE - cog block invalid: the cog is restored departed\n"); return true; }
+    int goodsVer = 0;   // R71-F3: an early v8 block ends here (goods stay at their defaults)
+    if (ok && !c.done()) {
+        ok = c.get(kCogGoodsSaveVersion, kCogGoodsSaveVersion, goodsVer) && c.get(0, kCogIngotStockMax, d.cogIngotStock)
+          && c.get(kCogIngotPriceFloor, kCogIngotPriceCeil, d.cogIngotPrice);
+        d.haveCogGoods = ok;
+    }
+    if (!ok || !c.done()) { d.haveCogGoods = false; printf("CHRONICLE - cog block invalid: the cog is restored departed\n"); return true; }
     d.haveCog = true;
     return true;
 }
@@ -11592,6 +11644,9 @@ void chronicleRoundTrip(const vector<barb>& barbs, const vector<house>& houses, 
         bad = "merchant cog";
     for (int r = 0; bad.empty() && r < raceCount; r++)   // R70-F2: the first-toll flags in the cog block's per-race words
         if ((d.tollReserved[r] != 0) != harbourFirstTollPaid[r]) bad = "first-toll flag of the " + string(racePlurals[r]);
+    if (bad.empty() && (!d.haveCogGoods || d.cogIngotStock != clamp(mc.goods.cogStock, 0, kCogIngotStockMax)
+                        || d.cogIngotPrice != clamp(mc.goods.cogPrice, kCogIngotPriceFloor, kCogIngotPriceCeil)))
+        bad = "merchant cog goods";   // R71-F3
     // R70-F3: the brigand camps, entry by entry as chronicleSaveCamp() writes them
     if (bad.empty() && (!d.haveCamp || d.camps.size() != brigands.size())) bad = "brigand camp count";
     for (size_t k = 0; bad.empty() && k < d.camps.size(); k++) {
@@ -18686,6 +18741,48 @@ int cogTrade(const vector<barb>& barbs, const jetty& j) {
     return coin;
 }
 
+// R71-F3: the bazaar's buy pass, right after cogTrade() on docking. The jetty race buys whole ingot lots while the hold
+// has any, the visit's kCogIngotMaxBuy is not reached, its ingots stay within kIngotStockMax and its purse covers the
+// price above kCogIngotPurseKeep. Each lot is paid through transferCoin() (to kCoinWildfolk) at the current price, which
+// then falls by kCogIngotPriceDrop (clamped to the floor). The buyer is the race's barb nearest the jetty foot; with no
+// barb of the race nobody buys. Returns the coin spent; buyerId is set to the buyer's id (-1 = no buy).
+int cogBuyIngots(const vector<barb>& barbs, const vector<RectangleShape>& squares, const jetty& j, cogGoods& g, int& buyerId) {
+    buyerId = -1;
+    int r = clampRace(j.race);
+    float best = 0.0f;
+    for (int i = 0; i < (int)barbs.size() && i < (int)squares.size(); i++) {
+        if (barbs[i].race != r || barbs[i].health <= 0) continue;
+        Vector2f d = squares[i].getPosition() - j.foot;
+        float dsq = d.x * d.x + d.y * d.y;
+        if (buyerId < 0 || dsq < best) { best = dsq; buyerId = barbs[i].id; }
+    }
+    if (buyerId < 0) return 0;
+    int before = toolTierOf(r), lots = 0, spent = 0;
+    while (lots < kCogIngotMaxBuy && g.cogStock > 0 && raceIngots[r] + kCogIngotLot <= kIngotStockMax
+           && purse[r] - g.cogPrice >= kCogIngotPurseKeep && transferCoin(r, kCoinWildfolk, g.cogPrice)) {
+        spent += g.cogPrice;
+        lots++;
+        g.cogStock--;
+        raceIngots[r] = min(kIngotStockMax, raceIngots[r] + kCogIngotLot);
+        g.cogPrice = clamp(g.cogPrice - kCogIngotPriceDrop, kCogIngotPriceFloor, kCogIngotPriceCeil);
+    }
+    if (lots <= 0) {
+        printf("COG BAZAAR - the %s buy no ingots (purse %d, price %dc, hold %d, ingots %d)\n", racePlurals[r], purse[r], g.cogPrice,
+               g.cogStock, raceIngots[r]);
+        buyerId = -1;
+        return 0;
+    }
+    toolTierSeen = true;
+    int after = toolTierOf(r);
+    if (after > before) {   // as a smelt would: the wear-drop cue ends and the best tier is kept
+        raceTierBest[r] = max(raceTierBest[r], after);
+        raceTierDimFrames[r] = 0;
+    }
+    printf("---COG BAZAAR--- the %s buy %d ingot lot%s from the merchant cog for %dc (ingots %d, tool tier %d, purse %d; hold %d, price now %dc)\n",
+           racePlurals[r], lots, lots == 1 ? "" : "s", spent, raceIngots[r], after, purse[r], g.cogStock, g.cogPrice);
+    return spent;
+}
+
 // R70-F2: an inland race's harbour cart, bound for the docked cog. Not a barb: no job, route or tree search.
 enum class harbourCartState { toDock, unloading, home };   // scoped, so the short names never clash
 struct harbourCart {
@@ -18907,7 +19004,7 @@ void drawHarbourToll(RenderWindow& window, const Font& font, const View& worldVi
 // brings the cog in, with one ticker line. Arriving: sails in and fades up; on docking cogTrade() runs once and a "+Nc"
 // pip rises. Docked for kCogDockTicks (the sail furls, then is let down), then it sails out and is absent again. A jetty
 // gone from under it sends it away at once.
-void cogTick(const vector<barb>& barbs) {
+void cogTick(const vector<barb>& barbs, const vector<RectangleShape>& squares) {
     static bool wasNight = false;
     bool night = isNightHour(game_time);
     bool dawn = wasNight && !night;
@@ -18925,6 +19022,11 @@ void cogTick(const vector<barb>& barbs) {
         c.seaward = j.seaward;
         c.faceLeft = j.seaward.x > 0.0f;   // prow toward the strand
         c.pipCoin = c.pipFrames = 0;
+        c.buyerId = -1;
+        c.buyPipCoin = c.buyPipFrames = 0;
+        // R71-F3: once per visit, on arrival: the hold restocks and the ingot price recovers, each clamped
+        c.goods.cogStock = clamp(c.goods.cogStock + kCogIngotRestock, 0, kCogIngotStockMax);
+        c.goods.cogPrice = clamp(c.goods.cogPrice + kCogIngotPriceRecover, kCogIngotPriceFloor, kCogIngotPriceCeil);
         for (int q = 0; q < raceCount; q++) { harbour.runs[q] = 0; harbour.launchTicks[q] = kHarbourFirstLaunchTicks; }   // R70-F2
         harbour.tally = 0;
         int r = clampRace(j.race);
@@ -18936,9 +19038,7 @@ void cogTick(const vector<barb>& barbs) {
     if (k < 0) {
         printf("MERCHANT COG - its jetty %d is gone; it sails away\n", c.jettyId);
         harbourCancelCarts("the jetty is gone");   // R70-F2
-        int year = c.visitYear;
-        c = cog{};
-        c.visitYear = year;
+        cogDepart(c);   // R71-F3: keeps the goods
         return;
     }
     if (--c.timer > 0) return;
@@ -18948,6 +19048,8 @@ void cogTick(const vector<barb>& barbs) {
             c.timer = kCogDockTicks;
             int coin = cogTrade(barbs, jetties[k]);
             if (coin > 0) { c.pipCoin = coin; c.pipFrames = kCogPipFrames; }
+            int spent = cogBuyIngots(barbs, squares, jetties[k], c.goods, c.buyerId);   // R71-F3: after the grain coin is in
+            if (spent > 0) { c.buyPipCoin = spent; c.buyPipFrames = kCogBuyPipFrames; }
             break;
         }
         case cogState::docked:
@@ -18958,9 +19060,7 @@ void cogTick(const vector<barb>& barbs) {
             break;
         case cogState::leaving: {
             printf("MERCHANT COG - gone over the horizon until next summer\n");
-            int year = c.visitYear;
-            c = cog{};
-            c.visitYear = year;
+            cogDepart(c);   // R71-F3: keeps the goods
             break;
         }
         case cogState::absent:
@@ -18972,7 +19072,7 @@ void cogTick(const vector<barb>& barbs) {
 // Otherwise the fisher is re-resolved by id (a missing, dead, released or re-raced one frees the boat) and taken
 // through the trip: walk to the jetty, along the deck, row out, cast, row home, along the deck and land the catch.
 void jettyTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
-    cogTick(barbs);   // R69-F3: the summer merchant cog's visit and its one trade
+    cogTick(barbs, squares);   // R69-F3: the summer merchant cog's visit and its one trade
     harbourTick(barbs);   // R70-F2: the inland races' harbour carts and the jetty race's toll
     for (auto& j : jetties) {
         fishingBoat& bt = j.boat;
@@ -19167,6 +19267,36 @@ void drawCogPip(RenderWindow& window, const Font& font, const View& worldView, b
     Vector2f pos(round(s.x - lb.size.x / 2.0f), round(s.y - 2.0f - kCogPipRisePx * life - lb.size.y));
     Vector2u wsz = window.getSize();
     if (!paused) c.pipFrames--;
+    if (pos.x < 0.0f || pos.x + lb.size.x > (float)wsz.x || pos.y < hudBarHeight || pos.y + lb.size.y > (float)wsz.y) return;
+    t.setPosition(pos - lb.position);
+    window.draw(t);
+}
+
+// R71-F3: the brief pale-steel "-Nc" pip over the barb that bought the cog's ingots, same layer and placement rules as
+// drawCogPip(). It follows the buyer (looked up by id each frame) and ends at once if the buyer is gone. Shorter life,
+// smaller text and a lower rise than the cog's own pip; fading over the last half of its life.
+void drawCogBuyPip(RenderWindow& window, const Font& font, const View& worldView, bool paused, const vector<barb>& barbs,
+                   const vector<RectangleShape>& squares) {
+    cog& c = merchantCog;
+    if (c.buyPipFrames <= 0) return;
+    int i = findBarbById(barbs, c.buyerId);
+    if (c.state == cogState::absent || i < 0 || i >= (int)squares.size()) { c.buyPipFrames = 0; return; }
+    float life = 1.0f - (float)c.buyPipFrames / kCogBuyPipFrames;   // 0 fresh .. 1 gone
+    float a = life < 0.5f ? 1.0f : clamp((1.0f - life) / 0.5f, 0.0f, 1.0f);
+    const RectangleShape& sq = squares[i];
+    Vector2f anchor = sq.getPosition() + Vector2f(sq.getSize().x / 2.0f, -1.0f);   // just over the buyer's head
+    Vector2f s = window.mapPixelToCoords(window.mapCoordsToPixel(anchor, worldView), window.getDefaultView());
+    Text t(font, "-" + to_string(c.buyPipCoin) + "c", kCogBuyPipFontSize);
+    Color fill = kCogBuyPipColor, rim = kCogPipOutlineColor;
+    fill.a = (uint8_t)(255.0f * a);
+    rim.a = (uint8_t)(220.0f * a);
+    t.setFillColor(fill);
+    t.setOutlineColor(rim);
+    t.setOutlineThickness(1.0f);
+    FloatRect lb = t.getLocalBounds();
+    Vector2f pos(round(s.x - lb.size.x / 2.0f), round(s.y - 2.0f - kCogBuyPipRisePx * life - lb.size.y));
+    Vector2u wsz = window.getSize();
+    if (!paused) c.buyPipFrames--;
     if (pos.x < 0.0f || pos.x + lb.size.x > (float)wsz.x || pos.y < hudBarHeight || pos.y + lb.size.y > (float)wsz.y) return;
     t.setPosition(pos - lb.position);
     window.draw(t);
@@ -24993,6 +25123,7 @@ void chronicleRestoreSites(chronicleData& d, world& wd, vector<house>& houses, v
         cog& c = merchantCog;
         c = cog{};
         c.visitYear = d.cogYear;
+        if (d.haveCogGoods) c.goods = cogGoods{d.cogIngotStock, d.cogIngotPrice};   // R71-F3: else a fresh cog's goods
         const jetty* at = nullptr;
         for (auto& j : jetties) if (d.cogRace >= 0 && j.race == d.cogRace) { at = &j; break; }
         if (d.cogPhase != (int)cogState::absent && at) {
@@ -26395,6 +26526,7 @@ int main() {
                 }
             drawTownLabels(window, hudFont, worldView);   // R66-F1: over the world and overlays, under every HUD panel
             drawCogPip(window, hudFont, worldView, paused);   // R69-F3: the cog's "+Nc", same layer as the town labels
+            drawCogBuyPip(window, hudFont, worldView, paused, barbs, squares);   // R71-F3: the ingot buyer's "-Nc"
             drawHarbourToll(window, hudFont, worldView, paused);   // R70-F2: toll "+Nc" pip and the visit's toll tally
             hudRect = drawHud(window, hudFont, hv);
             tickerRect = drawEvents(window, hudFont);
