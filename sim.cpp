@@ -381,10 +381,11 @@ const int kChronicleFoldWords = 7;                  // words before a fold's she
 const int kChronicleSheepWordsV7 = 3;               // v7: slot, shorn, shornDay
 const int kChronicleSheepWords = 4;                 // R70-F4 (v8): + lambAge (ticks, 0 = grown, 0..kLambGrowTicks)
 // R70-F4 (v8) "COG ": {state, timer, visitYear, jetty race (-1 none), raceCount, then per race one word reserved for
-// R70-F2 (the harbour toll's first-toll flag; written 0 until F2 fills it)}. "CAMP" is reserved inside v8 for R70-F3's
-// brigand camps: the loader takes one such block and skips its words, so F3 adds it with no further version bump.
+// R70-F2 (the harbour toll's first-toll flag; written 0 until F2 fills it)}. "CAMP" was reserved inside v8 for R70-F3's
+// brigand camps, which now fill it with no further version bump: {count (0..kBrigandCampCap), then per camp {race,
+// site dx, dy from the race's crate, founder name index (-1 none), rest ticks, robbed tally}}.
 const int32_t kChronicleBlockCog = 0x20474F43;      // "COG "
-const int32_t kChronicleBlockCamp = 0x504D4143;     // "CAMP" (R70-F3, reserved)
+const int32_t kChronicleBlockCamp = 0x504D4143;     // "CAMP" (R70-F3)
 const int kChronicleCogWords = 5;                   // words before the per-race reserved words
 const char* const kChronicleV7TestPath = "chronicle_v7test.sav";   // R70-F4: scratch v7 file for the round-trip's old-loader check
 const int kChronicleJettyWords = 3;
@@ -1487,6 +1488,47 @@ const Color kExileCloakColors[raceCount] = {
     Color(140, 120, 162),                     // dwarf-born: dull lavender
     Color(112, 150, 104),                     // elf-born: dull mint
 };
+// R70-F3 Brigand Camp, phase 1: a race's second exile within a year (exileSeasonMark still holds the last departure's
+// season) may, on a kBrigandFormChance roll, walk off to a site beside a trade or supply road instead of emigrating, and
+// raise a camp there (it leaves the barbs list with no grave). At most kBrigandCampCap camps. Each camp's band stalks a
+// laden supply cart or caravan passing within kBrigandAmbushRadius (squared-distance check from the camp centre): a cart
+// loses its load at once, a caravan fights it out through brigandFightStep() (its own step, no raid flags; nobody dies).
+// Camps are saved in the v8 "CAMP" block. Phase 2: the loot pile with its fading icon, and a winning raid party clearing a camp.
+const int kBrigandCampCap = 2;                  // hard cap on camps in the world
+const float kBrigandFormChance = 0.5f;          // a qualifying second exile turns brigand on this roll (else emigrates as before)
+const int kBrigandYearSeasons = yearDays / daysPerSeason;   // "within a year": fewer seasons than this since the last departure
+const Vector2f kBrigandCampSize(6.0f, 5.0f);    // the masked hide: a wildfolk tent's size, under a house (8x7)
+const Vector2f kBrigandBandHome(8.0f, 1.0f);    // camped band's lead pip, right of the camp top-left
+const Vector2f kBrigandPipSize(2.0f, 3.0f);     // one brigand: barb-wide (2px), a row shorter than most bodies
+const Vector2f kBrigandPipGap(3.0f, 1.0f);      // second pip beside and a row below the lead
+const float kBrigandRoadOffsetMin = 40.0f;      // camp centre off the road's straight line...
+const float kBrigandRoadOffsetMax = 70.0f;      // ...within this, so the road runs inside the ambush radius
+const float kBrigandQuarterPad = 24.0f;         // camp centre beyond each quarter's outermost slab by this
+const float kBrigandSiteGap = 90.0f;            // camp centre -> another camp, a town crate or the wildfolk camp
+const float kBrigandPoiGap = 40.0f;             // camp centre -> any hut or well
+const int kBrigandSiteTries = 120;
+const float kBrigandAmbushRadius = 110.0f;      // prey within this of the camp centre is stalked
+const float kBrigandChaseRadius = 180.0f;       // a stalk that strays further than this from the camp is given up
+const float kBrigandStrikePx = 3.0f;            // band lead this close to the prey: the ambush
+const int kBrigandStepTicks = 7;                // band 1px step (barbs and carts 10): fast enough to catch a cart
+const int kBrigandScanTicks = 30;               // a resting camp looks for prey this often (O(carts), never trees)
+const int kBrigandRestTicks = 24 * ticksPerGameHour;   // per camp between ambushes: one game day
+const int kBrigandFirstRestTicks = 6 * ticksPerGameHour;   // a new camp settles in before its first stalk
+const int kBrigandChaseMaxTicks = 6000;         // a stalk or fight longer than this is given up
+const int kBrigandHitEveryTicks = 40;           // fight round
+const float kBrigandHitChance = 0.6f;           // the band strikes the haliest escort...
+const int kBrigandDamage = 8;                   // ...for this much
+const int kBrigandHealthFloor = 30;             // blows stop here: brigands rob, they never kill
+const int kBrigandYieldHealth = 50;             // an escort hit below this hands over the cart
+const float kBrigandEscortHitChance = 0.5f;     // each escort strikes back...
+const int kBrigandEscortDamage = 6;             // ...for this much of the band's
+const int kBrigandBandHp = 40;                  // pooled band hp; at 0 the band breaks off (restored on its return)
+const Color kBrigandCampColor(104, 102, 98);    // weathered grey hide
+const Color kBrigandCampShadeColor(82, 80, 78); // the hide's bottom row
+const Color kBrigandMaskColor(34, 34, 38);      // the dark mask band and the door
+const Color kBrigandEyeColor(168, 162, 150);    // two pale eye holes in the mask
+const Color kBrigandBodyColor(120, 118, 112);   // band pips, under a dark mask row
+const Color kBrigandTickerTint(164, 160, 152);  // ash grey: apart from the exile tan and the raid reds
 // R56-F2 Coin for Peace, phase 1: when tryLaunchRaid() picks a cold pair, the defender's leader (free, hale, its race able
 // to spare the coin) walks to the attacker's crate as an envoy and the column does not march: the raid stays unlaunched
 // while the envoy is on the road. On arrival transferCoin() and the raid cancel happen in one step. A dead envoy, a
@@ -5217,11 +5259,38 @@ struct exileTrip {
     int barbId = -1;
     int from = -1, to = -1;
     int ticks = 0;
+    bool toCamp = false;   // R70-F3: walking to campSite to turn brigand (to == from), not to a rival crate
+    Vector2f campSite;     // R70-F3: the camp's top-left
 };
 exileTrip exile;
 struct exileTransfer { int barbId, from, to; };
 vector<exileTransfer> exileQueue;
 int exileSeasonMark[raceCount] = {-1, -1, -1};   // absolute season (game_day / daysPerSeason) of each race's last departure
+
+// R70-F3: one brigand camp and its band. Only applyBrigandJoins() and chronicleRestoreCamps() add one; none is removed in
+// phase 1 (clearing is phase 2). Prey is held by id (town id for a supply cart, the cart barb's id for the caravan) and
+// re-resolved every tick. The band is drawn from band; it has no RectangleShape, so there is no parallel vector.
+enum class brigandState { camped, stalking, fighting, returning };
+enum brigandPrey { preyNone, preyTownCart, preyCaravan };
+struct brigand {
+    int id = -1;
+    int race = 0;            // the race its founder was cast out of
+    int nameIdx = -1;        // founder's barbNames index (-1 = unnamed), for the ticker and the save
+    Vector2f site;           // camp top-left
+    brigandState state = brigandState::camped;
+    Vector2f band;           // lead pip top-left
+    brigandPrey prey = preyNone;
+    int preyId = -1;
+    int rest = 0;            // ticks before the camp stalks again
+    int ticks = 0;           // in the current stalk or fight
+    int stepTicks = 0, scanTicks = 0, hitTicks = 0;
+    int bandHp = kBrigandBandHp;
+    int robbed = 0;          // carts and caravans robbed, all told (saved)
+};
+vector<brigand> brigands;
+int nextBrigandId = 0;
+struct brigandJoin { int barbId, from; Vector2f site; };
+vector<brigandJoin> brigandQueue;   // R70-F3: exiles at their camp site, applied by applyBrigandJoins() outside every barb loop
 
 // R56-F2: the one envoy. The leader is held by barb id (never an index) and re-resolved by envoyTick() every tick;
 // removeBarb() invalidates a dying envoy's id through envoyMemberLost(), and the trip aborts the next tick unpaid.
@@ -10555,6 +10624,7 @@ struct chronicleTown { int race = 0, dx = 0, dy = 0, growth = 0, plot = 0; vecto
 struct chronicleSheep { int slot = 0, shorn = 0, shornDay = 0, lambAge = 0; };   // lambAge: R70-F4 (v8), 0 from a v7 file
 struct chronicleFold { int race = 0, dx = 0, dy = 0, wool = 0, loom = 0, shearYear = -1; vector<chronicleSheep> sheep; };
 struct chronicleJetty { int race = 0, holed = 0, holedTicks = 0; };
+struct chronicleCamp { int race = 0, dx = 0, dy = 0, nameIdx = -1, rest = 0, robbed = 0; };   // R70-F3 (v8 "CAMP")
 struct chronicleData {
     int day = 0, hour = 0;
     raceStock stocks[raceCount];
@@ -10591,6 +10661,8 @@ struct chronicleData {
     bool haveCog = false;                          // R70-F4: a valid "COG " block was read (absent before v8)
     int cogPhase = 0, cogTimer = 0, cogYear = -1, cogRace = -1;   // checked ranges; the jetty is looked up by race on restore
     int tollReserved[raceCount] = {};              // R70-F2's reserved words, read and kept for it (0 until F2 writes them)
+    bool haveCamp = false;                         // R70-F3: a valid "CAMP" block was read (absent before v8 and in early v8 files)
+    vector<chronicleCamp> camps;                   // at most kBrigandCampCap; sites judged again by chronicleRestoreCamps()
 };
 
 int chronicleNameIndex(const barb& b) {   // R55-F4: -1 for Sasuke; names only ever come from barbNames or shinobiName
@@ -10819,6 +10891,24 @@ bool chronicleSaveCog(FILE* f) {
     return chronPutBlock(f, kChronicleBlockCog, w);
 }
 
+// R70-F3: the "CAMP" block (v8, in the slot R70-F4 reserved). The site is kept as an offset from its race's crate (the
+// map is rolled fresh at each start); the band's stalk is never saved, so a camp always comes back camped.
+bool chronicleSaveCamp(FILE* f) {
+    const int offMax = (int)worldSize;
+    vector<int32_t> w{0};
+    int n = 0;
+    for (auto& c : brigands) {
+        if (n >= kBrigandCampCap) break;
+        int r = clampRace(c.race);
+        int dx = clamp((int)lround(c.site.x - storehousePos[r].x), -offMax, offMax), dy = clamp((int)lround(c.site.y - storehousePos[r].y), -offMax, offMax);
+        w.insert(w.end(), {r, dx, dy, c.nameIdx >= 0 && c.nameIdx < barbNameCount ? c.nameIdx : -1, clamp(c.rest, 0, kBrigandRestTicks),
+                           clamp(c.robbed, 0, kChronicleMaxStock)});
+        n++;
+    }
+    w[0] = n;
+    return chronPutBlock(f, kChronicleBlockCamp, w);
+}
+
 // R70-F4: the whole file, at the given version, into path (kChronicleVersion for the dawn save; kChronicleVersionSites
 // only for the round-trip's v7 check, which leaves out the v8 block and the lamb word, byte for byte the old format).
 bool chronicleWrite(const char* path, int version, const vector<barb>& barbs, const vector<house>& houses, const fieldGrid& fields,
@@ -10853,7 +10943,8 @@ bool chronicleWrite(const char* path, int version, const vector<barb>& barbs, co
     ok = ok && chronicleSaveTown(f, houses, n);
     ok = ok && chronicleSaveFold(f, deers, version);
     ok = ok && chronicleSaveJetty(f);
-    if (version >= kChronicleVersion) ok = ok && chronicleSaveCog(f);   // R70-F4 (v8); R70-F3's "CAMP" goes after it
+    if (version >= kChronicleVersion) ok = ok && chronicleSaveCog(f);   // R70-F4 (v8)
+    if (version >= kChronicleVersion) ok = ok && chronicleSaveCamp(f);  // R70-F3 (v8, same bump): after the cog
     ok = ok && chronPut(f, kChronicleEndMark);
     if (fclose(f) != 0) ok = false;
     if (!ok) {
@@ -11186,6 +11277,28 @@ bool chronicleReadCog(FILE* f, int words, chronicleData& d, const char*& why) {
     return true;
 }
 
+// R70-F3: "CAMP" into d. An exact parse within the cap or the block is skipped (no camp comes back); sites are judged
+// by chronicleRestoreCamps().
+bool chronicleReadCamp(FILE* f, int words, chronicleData& d, const char*& why) {
+    vector<int32_t> w;
+    if (!chronicleReadWords(f, words, w, why)) return false;
+    chronCursor c{w};
+    const int offMax = (int)worldSize;
+    int n = 0;
+    bool ok = c.get(0, kBrigandCampCap, n);
+    vector<chronicleCamp> got;
+    for (int i = 0; ok && i < n; i++) {
+        chronicleCamp cc;
+        ok = c.get(0, raceCount - 1, cc.race) && c.get(-offMax, offMax, cc.dx) && c.get(-offMax, offMax, cc.dy)
+          && c.get(-1, barbNameCount - 1, cc.nameIdx) && c.get(0, kBrigandRestTicks, cc.rest) && c.get(0, kChronicleMaxStock, cc.robbed);
+        if (ok) got.push_back(cc);
+    }
+    if (!ok || !c.done()) { printf("CHRONICLE - camp block invalid: no brigand camp restored\n"); return true; }
+    d.camps = got;
+    d.haveCamp = true;
+    return true;
+}
+
 // Reads and bounds-checks the whole file into out; nothing global is touched here. why = the rejection reason.
 // R70-F4: path defaults to the chronicle; the round-trip also reads its scratch v7 file through here.
 bool chronicleRead(chronicleData& out, const char*& why, const char* path = kChroniclePath) {
@@ -11291,10 +11404,10 @@ bool chronicleRead(chronicleData& out, const char*& why, const char* path = kChr
                     if (seenCog) { why = "two cog blocks"; break; }
                     seenCog = true;
                     if (!chronicleReadCog(f, words, d, why)) break;
-                } else if (tag == kChronicleBlockCamp) {   // R70-F4: reserved in v8 for R70-F3's camps; one only, skipped for now
+                } else if (tag == kChronicleBlockCamp) {   // R70-F4 reserved it in v8; R70-F3 reads it
                     if (seenCamp) { why = "two camp blocks"; break; }
                     seenCamp = true;
-                    for (int k = 0; k < words && !why; k++) if (!chronGet(f, v)) why = "truncated";
+                    if (!chronicleReadCamp(f, words, d, why)) break;
                 } else {   // a block from a later feature: skipped word by word, so a short file still fails
                     for (int k = 0; k < words && !why; k++) if (!chronGet(f, v)) why = "truncated";
                 }
@@ -11471,6 +11584,16 @@ void chronicleRoundTrip(const vector<barb>& barbs, const vector<house>& houses, 
                         || d.cogRace != (away ? -1 : cogRace)
                         || (!away && d.cogTimer != clamp(mc.timer, 1, mc.state == cogState::docked ? kCogDockTicks : kCogSailTicks))))
         bad = "merchant cog";
+    // R70-F3: the brigand camps, entry by entry as chronicleSaveCamp() writes them
+    if (bad.empty() && (!d.haveCamp || d.camps.size() != brigands.size())) bad = "brigand camp count";
+    for (size_t k = 0; bad.empty() && k < d.camps.size(); k++) {
+        const brigand& b = brigands[k];
+        const chronicleCamp& cc = d.camps[k];
+        Vector2f back = storehousePos[cc.race] + Vector2f((float)cc.dx, (float)cc.dy);
+        if (cc.race != clampRace(b.race) || cc.nameIdx != b.nameIdx || cc.robbed != b.robbed || cc.rest != clamp(b.rest, 0, kBrigandRestTicks)
+            || fabs(back.x - b.site.x) > 0.5f || fabs(back.y - b.site.y) > 0.5f)
+            bad = "brigand camp " + to_string(b.id);
+    }
     // R70-F4: the v7 loader path, on the same world written the old way
     if (bad.empty()) {
         chronicleData d7;
@@ -11478,7 +11601,7 @@ void chronicleRoundTrip(const vector<barb>& barbs, const vector<house>& houses, 
         int n7 = 0;
         if (!chronicleWrite(kChronicleV7TestPath, kChronicleVersionSites, barbs, houses, fields, deers, n7)) bad = "v7 write failed";
         else if (!chronicleRead(d7, why7, kChronicleV7TestPath)) bad = string("v7 read back failed (") + (why7 ? why7 : "no file") + ")";
-        else if (d7.version != kChronicleVersionSites || d7.haveCog) bad = "v7 file carries v8 data";
+        else if (d7.version != kChronicleVersionSites || d7.haveCog || d7.haveCamp) bad = "v7 file carries v8 data";   // R70-F3: + camps
         else if (d7.barbs.size() != d.barbs.size() || d7.houses.size() != d.houses.size() || d7.towns.size() != d.towns.size()
                  || d7.folds.size() != d.folds.size() || d7.jetties.size() != d.jetties.size() || !d7.havePlot)
             bad = "v7 counts";
@@ -11490,9 +11613,9 @@ void chronicleRoundTrip(const vector<barb>& barbs, const vector<house>& houses, 
     }
     if (!bad.empty()) { printf("CHRONICLE ROUND-TRIP - MISMATCH: %s\n", bad.c_str()); return; }
     printf("CHRONICLE ROUND-TRIP - ok: %d cloaks, %d towns, %d folds (%d shorn sheep, %d lambs), %d jetties, %d plots' rotation, "
-           "cog %s; v7 file loads\n",
+           "cog %s, %d brigand camps; v7 file loads\n",
            cloaks, (int)d.towns.size(), (int)d.folds.size(), shorn, lambs, (int)d.jetties.size(), raceCount * fieldsPerRace,
-           away ? "away" : "at the jetty");
+           away ? "away" : "at the jetty", (int)d.camps.size());
 }
 
 void chronicleDawn(const vector<barb>& barbs, const vector<house>& houses, const fieldGrid& fields, const vector<deer>& deers) {
@@ -14331,8 +14454,9 @@ void allianceBrideLost(const barb& b) {
 // R30-F5: the only place a barb is removed. Releases everything the barb holds or is referenced by (hunt, carried load,
 // reserved house/shrine materials, one-off build claims, paving/spear jobs, the crown), then swapRemoves barbs and
 // squares at the same index. Callers removing several must go in descending index order.
+// R70-F3: died = false for a barb leaving the world alive (an exile turning brigand): no grave, no veil soul, no death line.
 void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
-                smokehouseSet& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields) {
+                smokehouseSet& sh, forge& fg, storehouse (&stores)[raceCount], fieldGrid& fields, bool died = true) {
     barb& b = barbs[i];
     releaseBarbWork(b, sh, fg, stores, fields);   // garrison state (INBOX-F1) lives in the struct and goes with the swapRemove
     ungarrison(b);                                // R31-F3: the shared reset also frees any keep slot before the swapRemove
@@ -14363,12 +14487,14 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
         if (o.parentBId == b.id) o.parentBId = -1;
     }
     int deadId = b.id;
-    printf("BARB DIED - %s the %s (%s, %s), id %d - %d left\n", b.name, traitOf(b).name, raceOf(b).name,
+    printf("BARB %s - %s the %s (%s, %s), id %d - %d left\n", died ? "DIED" : "LEFT", b.name, traitOf(b).name, raceOf(b).name,
            isGentry(b) ? "Gentry" : "Commoner", b.id, (int)barbs.size() - 1);
-    addGrave(b, squares[i]);   // R47-F9: copied out by value; nothing in graves points back at barbs
+    if (died) addGrave(b, squares[i]);   // R47-F9: copied out by value; nothing in graves points back at barbs
     clearPlague(b);            // R59-F2: after the stone (plagueTick() sets plagueGraveNext for its own deaths)
-    veilDeposit(b.race, squares[i].getPosition() + squares[i].getSize() / 2.0f, veilSoulPerDeath);   // R50-F1a: by value
-    veilAddSite(b.race, squares[i].getPosition() + squares[i].getSize() / 2.0f, b.name);   // R50-F1b: mote site, by value
+    if (died) {
+        veilDeposit(b.race, squares[i].getPosition() + squares[i].getSize() / 2.0f, veilSoulPerDeath);   // R50-F1a: by value
+        veilAddSite(b.race, squares[i].getPosition() + squares[i].getSize() / 2.0f, b.name);   // R50-F1b: mote site, by value
+    }
     b.homeHouse = -1;
     clearRoute(b);   // R39-F1: the route lives in the struct; the swapped-in barb keeps its own route
     swapRemove(barbs, i);
@@ -19985,11 +20111,59 @@ float exileFedOf(int r, const int (&members)[raceCount]) {
     return (float)stockOfRace(r).food / (float)max(1, members[clampRace(r)]);
 }
 
+// R70-F3: a brigand camp centred on c: off every quarter (past its outermost slab), out of every clearing, town and fold,
+// clear of water, of every tree's footprint (so no canopy hides it), and apart from the other camps, the town crates, the
+// wildfolk camp and the huts and wells. O(trees) per call: only run at dawn and on load.
+bool brigandSiteOk(Vector2f c, const vector<CircleShape>& tris) {
+    const float m = 40.0f;
+    if (c.x < m || c.y < m || c.x > worldSize - m || c.y > worldSize - m) return false;
+    for (int r = 0; r < raceCount; r++) {
+        Vector2f d = c - quarterCentre(r);
+        float reach = quarterReachFor(r) + kBrigandQuarterPad;
+        if (d.x * d.x + d.y * d.y < reach * reach) return false;
+    }
+    if (inClearing(c - Vector2f(treeFootprint, treeFootprint) / 2.0f)) return false;   // village clearing, towns, folds
+    auto far = [&](Vector2f p, float gap) { Vector2f d = p - c; return d.x * d.x + d.y * d.y >= gap * gap; };
+    for (auto& t : towns) if (!far(t.crate, kBrigandSiteGap)) return false;
+    for (auto& b : brigands) if (!far(b.site + kBrigandCampSize / 2.0f, kBrigandSiteGap)) return false;
+    for (auto& s : wildCampShapes) if (!far(s.getPosition() + s.getSize() / 2.0f, kBrigandSiteGap)) return false;
+    for (int i = 0; i < (int)pois.size(); i++) if (!far(poiCentre(i), kBrigandPoiGap)) return false;
+    FloatRect box(c - kBrigandCampSize / 2.0f - Vector2f(2.0f, 2.0f), kBrigandCampSize + Vector2f(4.0f + kBrigandBandHome.x, 4.0f));
+    if (!lakeClear(box)) return false;
+    for (auto& t : tris) if (box.findIntersection(FloatRect(t.getPosition(), Vector2f(treeFootprint, treeFootprint)))) return false;
+    return true;
+}
+
+// R70-F3: a site (top-left) for a camp of race r's exiles: a random point along one of the roads its carts and caravans
+// use (its crate to each rival crate, any mother crate to its daughter town), pushed kBrigandRoadOffsetMin..Max to one
+// side, and reachable on foot from r's quarter. False when no try fits.
+bool brigandFindSite(int r, const vector<CircleShape>& tris, Vector2f& out) {
+    vector<pair<Vector2f, Vector2f>> roads;
+    for (int o = 0; o < raceCount; o++) if (o != r) roads.push_back({quarterCentre(r), quarterCentre(o)});
+    for (auto& t : towns) roads.push_back({quarterCentre(clampRace(t.race)), t.crate + storehouseSize / 2.0f});
+    uniform_int_distribution<int> pick(0, (int)roads.size() - 1);
+    uniform_real_distribution<float> along(0.3f, 0.7f), off(kBrigandRoadOffsetMin, kBrigandRoadOffsetMax), unit(0.0f, 1.0f);
+    for (int k = 0; k < kBrigandSiteTries; k++) {
+        auto& rd = roads[pick(gen)];
+        Vector2f d = rd.second - rd.first;
+        float len = hypot(d.x, d.y);
+        if (len < 1.0f) continue;
+        Vector2f side(-d.y / len, d.x / len);
+        Vector2f c = rd.first + d * along(gen) + side * (off(gen) * (unit(gen) < 0.5f ? -1.0f : 1.0f));
+        if (!brigandSiteOk(c, tris) || !regionReachable(quarterCentre(r), c)) continue;
+        out = snapPx(c - kBrigandCampSize / 2.0f);
+        return true;
+    }
+    return false;
+}
+
 // R54-F3: once at dawn. With no migrant on the road, picks one long-starving, free barb (raidIdle(), not a leader, not
 // Sasuke, no order) from a race that has not lost one this season, and the best-fed rival that will take it: not a cold
 // pair, crate built, at least one house, food per head over kExileFedMinPerHead and kExileFedMarginPerHead above home.
 // A friendly pair (R54-F1) needs only kExileFriendlyStarveTicks; without the friendly tier the cold rule alone applies.
-void exileDawn(vector<barb>& barbs, const vector<house>& houses, const storehouse (&stores)[raceCount]) {
+// R70-F3: a race's second departure within a year (exileSeasonMark under kBrigandYearSeasons back), with a camp free under
+// the cap and a road-side site found, turns brigand on a kBrigandFormChance roll and walks to the site instead.
+void exileDawn(vector<barb>& barbs, const vector<house>& houses, const storehouse (&stores)[raceCount], const vector<CircleShape>& tris) {
     if (exile.active || barbs.empty()) return;
     int season = game_day / daysPerSeason;
     int members[raceCount] = {}, raceHouses[raceCount] = {};
@@ -20014,14 +20188,28 @@ void exileDawn(vector<barb>& barbs, const vector<house>& houses, const storehous
             bestFed = fed;
         }
         if (best < 0) continue;
+        int prevSeason = exileSeasonMark[from];
+        Vector2f site;
+        bool toCamp = prevSeason >= 0 && season - prevSeason < kBrigandYearSeasons
+                   && (int)(brigands.size() + brigandQueue.size()) < kBrigandCampCap
+                   && uniform_real_distribution<float>(0.0f, 1.0f)(gen) < kBrigandFormChance && brigandFindSite(from, tris, site);
         expeditionReset(b);   // ends any drill or wander walk first
         beginActivity(b, actExile);
         exile = exileTrip{};
         exile.active = true;
         exile.barbId = b.id;
         exile.from = from;
-        exile.to = best;
+        exile.to = toCamp ? from : best;
+        exile.toCamp = toCamp;
+        exile.campSite = site;
         exileSeasonMark[from] = season;
+        if (toCamp) {   // R70-F3
+            string line = string(b.name) + ", the second of the " + racePlurals[from] + " cast out this year, takes to the woods";
+            printf("---EXILE BRIGAND--- %s (id %d, camp site %.0f, %.0f, last departure season %d)\n", line.c_str(), b.id,
+                   site.x, site.y, prevSeason);
+            logEvent(line, kBrigandTickerTint);
+            return;
+        }
         string line = string(b.name) + " leaves the starving " + racePlurals[from] + " for the " + racePlurals[best];
         printf("---EXILE OUT--- %s (id %d, starving %d ticks, food/head %.1f vs %.1f%s)\n", line.c_str(), b.id, b.starveTicks,
                homeFed, bestFed, pairFriendly(from, best) ? ", friendly" : "");
@@ -20044,6 +20232,7 @@ void exileTick(vector<barb>& barbs, vector<RectangleShape>& squares, const store
     }
     if (!exile.active) return;
     for (auto& q : exileQueue) if (q.barbId == exile.barbId) return;   // already arrived, waiting on the transfer
+    for (auto& q : brigandQueue) if (q.barbId == exile.barbId) return;   // R70-F3: likewise, waiting on the camp
     exile.ticks++;
     int i = findBarbById(barbs, exile.barbId);
     if (i < 0 || i >= n) { cancelExile(barbs, "migrant gone"); return; }
@@ -20052,6 +20241,13 @@ void exileTick(vector<barb>& barbs, vector<RectangleShape>& squares, const store
         || m.race != exile.from || m.health <= 0 || isLeader(m)) {
         printf("EXILE CONFLICT - barb %d (%s)\n", m.id, activityDefs[m.activity].name);
         cancelExile(barbs, "state conflict");
+        return;
+    }
+    if (exile.toCamp) {   // R70-F3: no rival to check, only the walk's backstop
+        if (exile.ticks > kExileMaxTicks) { cancelExile(barbs, "timeout on the way to the woods"); return; }
+        int ci[1] = {i};
+        if (raidColumnStep(barbs, squares, ci, exile.campSite + Vector2f(kBrigandCampSize.x + 1.0f, 0.0f)))
+            brigandQueue.push_back({m.id, exile.from, exile.campSite});
         return;
     }
     int to = clampRace(exile.to);
@@ -20088,6 +20284,283 @@ void applyExileTransfers(vector<barb>& barbs, vector<RectangleShape>& squares, c
         printf("---EXILE JOINS--- %s (id %d, born %s) joins the %s, house %d\n", barbs[i].name, barbs[i].id,
                raceDefs[clampRace(barbs[i].birthRace)].name, racePlurals[clampRace(q.to)], houseId + 1);
     }
+}
+
+// R70-F3: applies queued camp arrivals once exileTick() has returned (no barb loop is live). Each entry is re-resolved by
+// id and re-checked, the camp is raised (cap checked again), and the exile leaves the barbs list through removeBarb()
+// with died = false, so no grave or veil soul is left behind.
+void applyBrigandJoins(vector<barb>& barbs, vector<RectangleShape>& squares, smokehouseSet& sh, forge& fg,
+                       storehouse (&stores)[raceCount], fieldGrid& fields) {
+    if (brigandQueue.empty()) return;
+    vector<brigandJoin> todo;
+    todo.swap(brigandQueue);
+    for (auto& q : todo) {
+        int i = findBarbById(barbs, q.barbId);
+        if (i < 0 || i >= (int)squares.size() || barbs[i].activity != actExile || barbs[i].race != q.from
+            || !exile.active || exile.barbId != q.barbId || !exile.toCamp) {
+            if (exile.active && exile.barbId == q.barbId) cancelExile(barbs, "camp arrival no longer valid");
+            continue;
+        }
+        if ((int)brigands.size() >= kBrigandCampCap) { cancelExile(barbs, "the woods already hold their brigands"); continue; }
+        brigand c;
+        c.id = nextBrigandId++;
+        c.race = clampRace(q.from);
+        for (int k = 0; k < barbNameCount; k++) if (barbs[i].name == barbNames[k]) { c.nameIdx = k; break; }
+        c.site = q.site;
+        c.band = q.site + kBrigandBandHome;
+        c.rest = kBrigandFirstRestTicks;
+        brigands.push_back(c);
+        string line = string(barbs[i].name) + " raises a brigand camp in the woods beyond the " + racePlurals[c.race];
+        printf("---BRIGAND CAMP--- %s (camp %d at %.0f, %.0f, %d of %d)\n", line.c_str(), c.id, c.site.x, c.site.y,
+               (int)brigands.size(), kBrigandCampCap);
+        logEvent(line, kBrigandTickerTint);
+        releaseExileBarb(barbs[i]);
+        exile = exileTrip{};
+        removeBarb(barbs, squares, i, sh, fg, stores, fields, false);
+    }
+}
+
+Vector2f brigandCentre(const brigand& c) { return c.site + kBrigandCampSize / 2.0f; }
+const char* brigandName(const brigand& c) { return c.nameIdx >= 0 && c.nameIdx < barbNameCount ? barbNames[c.nameIdx] : "outcast"; }
+
+// R70-F3: true if p lies inside any quarter's clearing (prey there is home and safe)
+bool brigandPreySafe(Vector2f p) {
+    for (int r = 0; r < raceCount; r++) {
+        Vector2f d = p - quarterCentre(r);
+        float cr = quarterClearRadiusFor(r);
+        if (d.x * d.x + d.y * d.y < cr * cr) return true;
+    }
+    return false;
+}
+
+// R70-F3: the camp's prey, re-resolved by id: a rolling, laden supply cart of town preyId, or the laden caravan on the
+// road whose cart barb has id preyId. False once it is gone, empty, standing, at a crate or safe in a quarter.
+bool brigandPreyPos(const brigand& c, const vector<barb>& barbs, const vector<RectangleShape>& squares, Vector2f& out) {
+    if (c.prey == preyTownCart) {
+        for (auto& t : townCarts) {
+            if (t.townId != c.preyId) continue;
+            if (!t.rolling || t.load <= 0) return false;
+            out = t.pos;
+            return !brigandPreySafe(out);
+        }
+        return false;
+    }
+    if (c.prey == preyCaravan) {
+        if (!caravan.active || !caravanLaden() || caravan.phase == caravanTrip::Trade || caravanCartId() != c.preyId) return false;
+        int i = findBarbById(barbs, c.preyId);
+        if (i < 0 || i >= (int)squares.size()) return false;
+        out = squares[i].getPosition();
+        return !brigandPreySafe(out);
+    }
+    return false;
+}
+
+// R70-F3: nearest laden prey within kBrigandAmbushRadius of the camp centre (squared distances only)
+bool brigandPickPrey(brigand& c, const vector<barb>& barbs, const vector<RectangleShape>& squares) {
+    Vector2f cc = brigandCentre(c);
+    float best = kBrigandAmbushRadius * kBrigandAmbushRadius;
+    brigandPrey prey = preyNone;
+    int preyId = -1;
+    for (auto& t : townCarts) {
+        if (!t.rolling || t.load <= 0 || brigandPreySafe(t.pos)) continue;
+        Vector2f d = t.pos - cc;
+        float dSq = d.x * d.x + d.y * d.y;
+        if (dSq < best) { best = dSq; prey = preyTownCart; preyId = t.townId; }
+    }
+    if (caravan.active && caravanLaden() && caravan.phase != caravanTrip::Trade) {
+        int i = findBarbById(barbs, caravanCartId());
+        if (i >= 0 && i < (int)squares.size() && !brigandPreySafe(squares[i].getPosition())) {
+            Vector2f d = squares[i].getPosition() - cc;
+            float dSq = d.x * d.x + d.y * d.y;
+            if (dSq < best) { best = dSq; prey = preyCaravan; preyId = barbs[i].id; }
+        }
+    }
+    if (prey == preyNone) return false;
+    c.prey = prey;
+    c.preyId = preyId;
+    return true;
+}
+
+// R70-F3: the band's lead pip one 1px step toward goal every kBrigandStepTicks (fords only); true once within px of it
+bool brigandMove(brigand& c, Vector2f goal, float px) {
+    Vector2f d = goal - c.band;
+    if (d.x * d.x + d.y * d.y <= px * px) return true;
+    if (++c.stepTicks < kBrigandStepTicks) return false;
+    c.stepTicks = 0;
+    c.band += pathStep(c.band, goal);
+    return false;
+}
+
+void brigandGoHome(brigand& c, const char* why) {
+    printf("BRIGANDS - camp %d heads home: %s\n", c.id, why);
+    c.state = brigandState::returning;
+    c.prey = preyNone;
+    c.preyId = -1;
+    c.ticks = 0;
+}
+
+// R70-F3: the camp's own fight step against the caravan's escorts (no raid flags, no raidFightStep). Every
+// kBrigandHitEveryTicks the band may strike the haliest escort (never below kBrigandHealthFloor) and each escort may strike
+// the band's pooled hp. 1 = an escort is beaten below kBrigandYieldHealth (the cart is handed over), -1 = the band
+// breaks off, 0 = the fight goes on.
+int brigandFightStep(brigand& c, vector<barb>& barbs) {
+    if (++c.hitTicks < kBrigandHitEveryTicks) return 0;
+    c.hitTicks = 0;
+    uniform_real_distribution<float> roll(0.0f, 1.0f);
+    int esc[kTradeMembers], n = 0, hale = -1;
+    for (int id : caravan.memberIds) {
+        int i = findBarbById(barbs, id);
+        if (i < 0) continue;
+        esc[n++] = i;
+        if (hale < 0 || barbs[i].health > barbs[hale].health) hale = i;
+    }
+    if (n == 0) return 0;   // caravanTick() aborts the trip; the prey check sends the band home
+    if (roll(gen) < kBrigandHitChance && barbs[hale].health > kBrigandHealthFloor)
+        barbs[hale].health = max(kBrigandHealthFloor, barbs[hale].health - kBrigandDamage);
+    for (int k = 0; k < n; k++) if (roll(gen) < kBrigandEscortHitChance) c.bandHp -= kBrigandEscortDamage;
+    if (c.bandHp <= 0) return -1;
+    for (int k = 0; k < n; k++) if (barbs[esc[k]].health < kBrigandYieldHealth) return 1;
+    return 0;
+}
+
+// R70-F3: in the fixed-step loop after the exile transfers. Each camp rests, scans for prey on a throttle, stalks it,
+// robs a supply cart on contact or fights a caravan through brigandFightStep(), then walks home. Prey is re-resolved by
+// id every tick; nothing here removes a barb, cart or camp (a robbed caravan ends through endCaravan()).
+void brigandTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
+    for (auto& c : brigands) {
+        Vector2f goal;
+        switch (c.state) {
+            case brigandState::camped:
+                if (c.rest > 0) { c.rest--; break; }
+                if (++c.scanTicks < kBrigandScanTicks) break;
+                c.scanTicks = 0;
+                if (!brigandPickPrey(c, barbs, squares)) break;
+                c.state = brigandState::stalking;
+                c.ticks = c.stepTicks = c.hitTicks = 0;
+                c.bandHp = kBrigandBandHp;
+                printf("BRIGANDS - camp %d stalks the %s\n", c.id, c.prey == preyTownCart ? "supply cart" : "caravan");
+                break;
+            case brigandState::stalking:
+            case brigandState::fighting: {
+                if (!brigandPreyPos(c, barbs, squares, goal)) { brigandGoHome(c, "the prey got away"); break; }
+                Vector2f away = c.band - brigandCentre(c);
+                if (++c.ticks > kBrigandChaseMaxTicks || away.x * away.x + away.y * away.y > kBrigandChaseRadius * kBrigandChaseRadius) {
+                    brigandGoHome(c, "the chase ran too long");
+                    break;
+                }
+                bool contact = brigandMove(c, goal, kBrigandStrikePx);
+                if (c.state == brigandState::stalking) {
+                    if (!contact) break;
+                    if (c.prey == preyCaravan) { c.state = brigandState::fighting; c.hitTicks = 0; printf("BRIGANDS - camp %d falls on the caravan\n", c.id); break; }
+                    for (auto& t : townCarts) {   // a supply cart has no escort: the load is gone at once (no loot pile in phase 1)
+                        if (t.townId != c.preyId) continue;
+                        int r = clampRace(t.race), lost = t.load;
+                        t.load = 0;
+                        c.robbed++;
+                        string line = "Brigands of " + string(brigandName(c)) + "'s camp rob the " + racePlurals[r] + "' supply cart";
+                        printf("---BRIGAND AMBUSH--- %s (%d food lost, camp %d)\n", line.c_str(), lost, c.id);
+                        logEvent(line, kBrigandTickerTint);
+                        break;
+                    }
+                    c.rest = kBrigandRestTicks;
+                    brigandGoHome(c, "the cart is robbed");
+                    break;
+                }
+                int fight = brigandFightStep(c, barbs);
+                if (fight == 0) break;
+                int from = clampRace(caravan.from);
+                if (fight < 0) {
+                    string line = string(racePlurals[from]) + "' caravan drives off the brigands";
+                    printf("---BRIGAND AMBUSH--- %s (camp %d)\n", line.c_str(), c.id);
+                    logEvent(line, kBrigandTickerTint);
+                } else {
+                    string what = lootText(caravan.cargo);
+                    caravan.cargo = raceStock{0, 0, 0};   // gone with the band (no loot pile in phase 1)
+                    c.robbed++;
+                    string line = "Brigands rob the " + string(racePlurals[from]) + "' caravan of " + what;
+                    printf("---BRIGAND AMBUSH--- %s (camp %d)\n", line.c_str(), c.id);
+                    logEvent(line, kBrigandTickerTint);
+                    endCaravan(barbs, false);   // the escorts are released where they stand and walk home
+                }
+                c.rest = kBrigandRestTicks;
+                brigandGoHome(c, fight < 0 ? "driven off" : "the caravan is robbed");
+                break;
+            }
+            case brigandState::returning:
+                if (!brigandMove(c, c.site + kBrigandBandHome, 0.5f)) break;
+                c.band = c.site + kBrigandBandHome;
+                c.state = brigandState::camped;
+                c.bandHp = kBrigandBandHp;
+                c.scanTicks = 0;
+                break;
+        }
+    }
+}
+
+// R70-F3: the camps with the buildings: a 6x5 weathered grey hide with a dark mask band across its second row (two pale
+// eye holes), a 2x2 dark door and a shaded bottom row. Only camps touching the view.
+void drawBrigandCamps(RenderWindow& window, const FloatRect& camRect) {
+    if (brigands.empty()) return;
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (auto& c : brigands) {
+        Vector2f p = snapPx(c.site);
+        if (!camRect.findIntersection(FloatRect(p, kBrigandCampSize))) continue;
+        pushQuad(va, p, kBrigandCampSize, kBrigandCampColor);
+        pushQuad(va, p + Vector2f(0.0f, kBrigandCampSize.y - 1.0f), Vector2f(kBrigandCampSize.x, 1.0f), kBrigandCampShadeColor);
+        pushQuad(va, p + Vector2f(0.0f, 1.0f), Vector2f(kBrigandCampSize.x, 1.0f), kBrigandMaskColor);
+        pushQuad(va, p + Vector2f(1.0f, 1.0f), Vector2f(1.0f, 1.0f), kBrigandEyeColor);
+        pushQuad(va, p + Vector2f(kBrigandCampSize.x - 2.0f, 1.0f), Vector2f(1.0f, 1.0f), kBrigandEyeColor);
+        pushQuad(va, p + Vector2f(kBrigandCampSize.x / 2.0f - 1.0f, kBrigandCampSize.y - 2.0f), Vector2f(2.0f, 2.0f), kBrigandMaskColor);
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R70-F3: each camp's band of two with the barbs (after the carts): 2x3 grey pips with a dark mask top row, the second
+// beside and a row below the lead
+void drawBrigandBands(RenderWindow& window, const FloatRect& camRect) {
+    if (brigands.empty()) return;
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (auto& c : brigands) {
+        Vector2f p = snapPx(c.band);
+        if (!camRect.findIntersection(FloatRect(p, kBrigandPipGap + kBrigandPipSize))) continue;
+        for (Vector2f q : {p, p + kBrigandPipGap}) {
+            pushQuad(va, q, kBrigandPipSize, kBrigandBodyColor);
+            pushQuad(va, q, Vector2f(kBrigandPipSize.x, 1.0f), kBrigandMaskColor);
+        }
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
+}
+
+// R70-F3 (v8 "CAMP"): startup restore, after chronicleRestoreSites(). Each saved camp goes back at its old offset from its
+// race's crate, or (the new map put something there) at a fresh road-side site; one that fits nowhere is dropped. A camp
+// always comes back camped, its band at home, with its saved rest and tally.
+void chronicleRestoreCamps(const chronicleData& d, const vector<CircleShape>& tris) {
+    brigands.clear();
+    brigandQueue.clear();
+    if (!d.haveCamp) return;
+    int back = 0, moved = 0, lost = 0;
+    for (auto& cc : d.camps) {
+        if ((int)brigands.size() >= kBrigandCampCap) { lost++; continue; }
+        Vector2f site = snapPx(storehousePos[cc.race] + Vector2f((float)cc.dx, (float)cc.dy));
+        bool ok = brigandSiteOk(site + kBrigandCampSize / 2.0f, tris), wasMoved = false;
+        if (!ok) ok = wasMoved = brigandFindSite(cc.race, tris, site);
+        if (!ok) { lost++; printf("CHRONICLE - a %s brigand camp found no site: dropped\n", raceDefs[cc.race].name); continue; }
+        brigand c;
+        c.id = nextBrigandId++;
+        c.race = cc.race;
+        c.nameIdx = cc.nameIdx;
+        c.site = site;
+        c.band = site + kBrigandBandHome;
+        c.rest = cc.rest;
+        c.robbed = cc.robbed;
+        brigands.push_back(c);
+        back++;
+        moved += wasMoved ? 1 : 0;
+    }
+    printf("CHRONICLE - brigand camps: %d back (%d moved), %d lost\n", back, moved, lost);
+    if (back > 0) logEvent("Chronicle restored " + to_string(back) + (back == 1 ? " brigand camp" : " brigand camps"), kChronicleRestoreTint);
 }
 
 // R56-F2: hand the envoy back to the other systems, standing where it is (every exit goes through here)
@@ -25392,6 +25865,7 @@ int main() {
         chronicleData chron;
         if (chronicleRestore(barbs, houses, houseshapes, fields, trees, rocks, bushshapes, chron)) {
             chronicleRestoreSites(chron, wd, houses, houseshapes, fields, shrines, trees, rocks, bushshapes);   // R69-F4: town houses before the homes resolve
+            chronicleRestoreCamps(chron, tris);   // R70-F3: after the towns, so a camp's site check sees them
             chronicleRestoreBarbs(chron, barbs, squares, birthRings);   // R55-F4: after the houses, so home ids resolve
             chronicleRestoreWar(chron, barbs);   // R60-F1: after the alliances and returners, so the checks see them
             chronicleRestoreVassals(chron, barbs);   // R65-F4: last, once the barbs exist, so both race ids resolve
@@ -25570,6 +26044,8 @@ int main() {
                 campTick(barbs, squares, wd);   // R55-F1: wildfolk hunters, deer trade, trespass and tents
                 exileTick(barbs, squares, stores);     // R54-F3: walks the migrant; an arrival is only queued here...
                 applyExileTransfers(barbs, squares, houses);   // ...and applied here, outside every barb loop
+                applyBrigandJoins(barbs, squares, smoke, dwarfForge, stores, fields);   // R70-F3: an exile at its camp site leaves the barbs here
+                brigandTick(barbs, squares);   // R70-F3: camp bands stalk and rob laden supply carts and caravans
                 envoyTick(barbs, squares, stores);     // R56-F2: the tribute envoy's walk and payment
                 marriageTick(barbs, squares, houses, stores);   // R59-F1: wedding procession walk, the wedding and alliance upkeep
                 bellTick(barbs, squares, houses, houseshapes, wolves, stores, smoke, dwarfForge, fields,
@@ -25582,7 +26058,7 @@ int main() {
                     clockk();
                     if (game_time != hourWas && game_time == nightEndHour) {
                         chronicleDawn(barbs, houses, fields, deers);   // R54-F2: dawn autosave; R55-F4: with the named barbs; R69-F4: sites
-                        exileDawn(barbs, houses, stores);   // R54-F3: the dawn emigration check
+                        exileDawn(barbs, houses, stores, tris);   // R54-F3: the dawn emigration check; R70-F3: tris for a camp site
                         marriageDawn(barbs, squares, houses, stores);   // R59-F1: a leader's child may set out to wed
                         townDawn(barbs, squares, houses, trees, rocks, bushshapes, stores);   // R66-F1: a crowded race may send founders
                         jettyDawn(barbs, squares);   // R66-F2: each afloat boat takes a fisher for the day's trip
@@ -25699,6 +26175,7 @@ int main() {
 	drawCamps(window);
 	drawPois(window, camRect, frameCount);   // R47-F4: huts and wells, with the buildings
 	drawWildCamp(window, camRect, frameCount, isNightHour(game_time));   // R55-F1: hide tents, hearth smoke, pennant
+	drawBrigandCamps(window, camRect);   // R70-F3: masked grey hides, with the buildings, under the bands and barbs
 	drawDens(window, camRect);   // R63-F6: wolf den mound + fading scuffs, with the buildings, under the pups and barbs
 	drawFolds(window);   // R66-F3: fence, gate and lamp post, with the buildings, under the sheep and barbs
 	drawStall(window, activeTrader);
@@ -25747,6 +26224,7 @@ int main() {
         drawTownDust(window, paused);   // R66-F1: the founders' dust trail, under the barbs
         drawTownCarts(window, paused);   // R69-F1b: supply carts and their wheel dust, on the ground under the barbs
         drawHarbourCarts(window);   // R70-F2: harbour carts, same layer
+        drawBrigandBands(window, camRect);   // R70-F3: the camp bands, over the carts they rob, under the barbs
         drawBarbs(window, barbs, squares, frameCount, zoom);
         drawTitlePips(window, camRect, zoom);   // R56-F3: pale 1px pip over titled barbs, capped
         for (auto& b : barbs) if (b.raidFlash > 0 && !paused) b.raidFlash--;   // R52-F1: the hit flash lasts 2 drawn frames
