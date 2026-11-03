@@ -1554,6 +1554,40 @@ const Color kBrigandMaskColor(34, 34, 38);      // the dark mask band and the do
 const Color kBrigandEyeColor(168, 162, 150);    // two pale eye holes in the mask
 const Color kBrigandBodyColor(120, 118, 112);   // band pips, under a dark mask row
 const Color kBrigandTickerTint(164, 160, 152);  // ash grey: apart from the exile tan and the raid reds
+// R71-F2 Bounty Posse (bounty and posse only): at dawn councilTick() lets a race robbed kBountyRobberies times by one
+// camp post a bounty on it (one red flag over the hide). posseTick() then calls up armed, drilled barbs of the race able to
+// spare the most (the poster wins a tie) as a posse: each member carries barb::posseId, which barbAvailable() checks, so
+// every job selector skips it. The posse marches on the camp, waits for the band to be home and fights it through its own
+// step (no raid flags). A win clears the camp and pays the bounty via transferCoin() (nothing moves if the poster's own
+// posse won); a beaten posse enters the explicit retreat state (members released at once) and the bounty doubles, at most
+// kBountyMaxRaises times and never above kBountyMax. Ticker lines only on a post and an outcome. Bounties and posses are
+// never saved (resetPosse() on a load; restored camps carry no bounty). Stocks and prisoners are later phases.
+const int kBountyRobberies = 2;                 // robberies of one race by one camp before that race posts a bounty
+const int kBountyBase = 3;                      // coin offered; the poster's purse must hold this much to post
+const int kBountyMaxRaises = 2;                 // doublings after beaten posses at most (3 -> 6 -> 12)...
+const int kBountyMax = 12;                      // ...and never above this
+const int kPosseMax = 4;                        // members at most
+const int kPosseMinMembers = 2;                 // a race musters no posse with fewer eligible barbs than this
+const int kPosseCheckTicks = 600;               // muster scan throttle (~10s at 1x)
+const int kPosseGapTicks = 2 * ticksPerGameHour;    // after any posse ends, before the next may muster
+const int kPosseRetreatTicks = 24 * ticksPerGameHour;   // retreat state: a beaten posse's day before the next one rides
+const int kPosseMaxTicks = 8 * ticksPerMinute;  // march + fight backstop: the posse gives up the hunt
+const float kPosseStandPx = 12.0f;              // head stands this far left of the camp centre (the band is on the right)
+const int kPosseHitEveryTicks = 40;             // fight round (kBrigandHitEveryTicks)
+const int kPosseBandStrikes = 2;                // the band of two strikes twice a round (kBrigandHitChance, kBrigandDamage)
+const float kPosseHitChance = 0.5f;             // each member strikes the band...
+const int kPosseDamage = 6;                     // ...for this much
+const int kPosseCampHpBonus = 30;               // the band fights harder at its own hide: pooled hp kBrigandBandHp + this
+const int kPosseYieldHealth = 50;               // a member struck below this leaves the posse (brigands never kill)
+const int kPosseRenown = 3;                     // each member standing when the camp falls
+const float kBountyPoleH = 6.0f;                // flag pole over the hide, column 1, its foot on the hide's top edge
+const Vector2f kBountyFlagSize(3.0f, 2.0f);     // the single red flag, flying right of the pole's top
+const Color kBountyFlagColor(192, 58, 50);      // muted red, apart from the grey hide and the race pennants
+const float kPossePipX = -2.0f;                 // pip column: 1px wide, this far left of the hide (clear of the posse's stand)
+const Vector2f kPossePipSize(1.0f, 2.0f);       // one pip per standing member, bottom-up from the hide's bottom row
+const float kPossePipStep = 3.0f;               // pip pitch (1px gap)
+const int kPossePipFadeFrames = 90;             // drawn frames the column takes to fade after a disband
+const Color kBountyTickerTint(214, 132, 108);   // rust: apart from the brigand ash grey and the war crimson
 // R56-F2 Coin for Peace, phase 1: when tryLaunchRaid() picks a cold pair, the defender's leader (free, hale, its race able
 // to spare the coin) walks to the attacker's crate as an envoy and the column does not march: the raid stays unlaunched
 // while the envoy is on the road. On arrival transferCoin() and the raid cancel happen in one step. A dead envoy, a
@@ -4944,7 +4978,7 @@ enum raidRole { raidNone, raidAttacker, raidDefender };   // R52-F1
 // R53-F4: the one exclusive state a barb is in (work flags like chopping/building stay separate). Set only by
 // beginActivity(), cleared only by endActivity(), which also runs the activity's cleanup.
 enum barbActivity { actNone, actShelter, actExpedition, actRaidAttack, actRaidDefend, actTemper, actSmelt, actDrill, actWatch,
-                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, actHeal, actHost, actHollowHunt, actGather, actFound, actFisher, actShepherd, activityCount };   // R66-F3: actShepherd = the fold's shepherd   // R66-F2: actFisher = the jetty boat's fisher   // R66-F1: actFound = a founder on the trek to a daughter town   // R63-F5a: actGather = called to a gathering (gatherIdleAt)   // R62-F3b: actHollowHunt = a joint wyrm hunter   // R61-F2: actHost = a field host fighter. R60-F2: actHeal = an elf walking to cure a patient   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
+                    actKneel, actHerb, actCaravan, actExile, actEnvoy, actProcession, actStudy, actHeal, actHost, actHollowHunt, actGather, actFound, actFisher, actShepherd, actPosse, activityCount };   // R71-F2: actPosse = a bounty posse member   // R66-F3: actShepherd = the fold's shepherd   // R66-F2: actFisher = the jetty boat's fisher   // R66-F1: actFound = a founder on the trek to a daughter town   // R63-F5a: actGather = called to a gathering (gatherIdleAt)   // R62-F3b: actHollowHunt = a joint wyrm hunter   // R61-F2: actHost = a field host fighter. R60-F2: actHeal = an elf walking to cure a patient   // R59-F3: actStudy = an elder at a Lore Hall bench   // R53-F2: actHerb = tending the herb bed; R54-F1: actCaravan; R54-F3: actExile; R56-F2: actEnvoy; R59-F1: actProcession
 struct activityDef {
     const char* name;
     bool ownsBarb;    // its tick owns the barb outright: every job selector skips it (barbAvailable() false)
@@ -4975,6 +5009,7 @@ const activityDef activityDefs[activityCount] = {
     {"founding",      true,  false, false},  // R66-F1: townTick() owns the founder from launch to arrival or failure
     {"boat fishing",  true,  false, false},  // R66-F2: jettyTick() owns the fisher from the dawn pick to the landing
     {"shepherding",   true,  false, false},  // R66-F3: foldTick() owns the shepherd from the pick to the penning
+    {"posse",         true,  false, false},  // R71-F2: posseTick() owns the member from muster to release
 };
 
 // R62-F3b: what a hunter was doing when the hunt took it. Written only by the muster, read by releaseHuntBarb(), wiped
@@ -5077,6 +5112,7 @@ struct barb {
     const char* gatherLabel = ""; // R63-F5a: tooltip words for the gathering (static string from the caller)
     bool cloak = false;          // R69-F2: wears a wool cloak; given only by woolTick() (a finished weave) or a v7 chronicle load, cleared when it wears out
     int cloakAge = 0;            // R69-F2: days worn (0..kCloakWearDays); counted by woolTick(), 0 whenever cloak is false
+    int posseId = -1;            // R71-F2: bountyPosse::id while in the posse; set only at the muster, cleared by endActivity()
 };
 // R57-F1: age and stage from bornHour on the live clock (same hour count as chronicleNowHour())
 enum lifeStageKind { stageChild, stageAdult, stageElder };
@@ -5107,7 +5143,7 @@ void clearRoute(barb& b) {
 bool barbHidden(const barb& b) { return b.activity == actShelter && b.garrisonInside; }   // INBOX-F1
 // R45-F2: the one eligibility gate every job selector checks: false while bellTick() (garrison), expeditionTick() or
 // raidTick() owns the barb (R53-F4: one table check, activityDef::ownsBarb)
-bool barbAvailable(const barb& b) { return !activityDefs[b.activity].ownsBarb; }
+bool barbAvailable(const barb& b) { return !activityDefs[b.activity].ownsBarb && b.posseId < 0; }   // R71-F2: + the posse id
 // R47-F7: busy at the forge (temperTick() or smeltTick() walks and works the barb); wander, hunts and orders skip it
 bool atForgeTask(const barb& b) { return activityDefs[b.activity].atForge; }
 
@@ -5314,8 +5350,8 @@ struct exileTransfer { int barbId, from, to; };
 vector<exileTransfer> exileQueue;
 int exileSeasonMark[raceCount] = {-1, -1, -1};   // absolute season (game_day / daysPerSeason) of each race's last departure
 
-// R70-F3: one brigand camp and its band. Only applyBrigandJoins() and chronicleRestoreCamps() add one; none is removed in
-// phase 1 (clearing is phase 2). Prey is held by id (town id for a supply cart, the cart barb's id for the caravan) and
+// R70-F3: one brigand camp and its band. Only applyBrigandJoins() and chronicleRestoreCamps() add one; only a posse's
+// win in posseTick() removes one (R71-F2). Prey is held by id (town id for a supply cart, the cart barb's id for the caravan) and
 // re-resolved every tick. The band is drawn from band; it has no RectangleShape, so there is no parallel vector.
 enum class brigandState { camped, stalking, fighting, returning };
 enum brigandPrey { preyNone, preyTownCart, preyCaravan };
@@ -5333,9 +5369,41 @@ struct brigand {
     int stepTicks = 0, scanTicks = 0, hitTicks = 0;
     int bandHp = kBrigandBandHp;
     int robbed = 0;          // carts and caravans robbed, all told (saved)
+    int robbedFrom[raceCount] = {0, 0, 0};   // R71-F2: robberies per victim race since the last bounty (unsaved)
+    int bounty = 0;          // R71-F2: coin on the camp (0 = none); posted by bountyDawn(), unsaved
+    int bountyRace = -1;     // R71-F2: the race that posted it and pays it
+    int bountyRaises = 0;    // R71-F2: doublings so far (<= kBountyMaxRaises)
 };
-vector<brigand> brigands;
+static_assert(raceCount == 3, "brigand::robbedFrom initialiser is written for three races");
+vector<brigand> brigands;   // R71-F2: a cleared camp is erased by posseTick() (nothing holds a camp index)
 int nextBrigandId = 0;
+
+// R71-F2: the one bounty posse. Members are held by barb id (never an index) and each carries posseId == id; both the
+// members and the camp (brigand::id) are re-resolved by posseTick() every tick. retreat = a beaten posse's cooldown,
+// its members already released.
+enum class posseState { none, march, fight, retreat };
+struct bountyPosse {
+    posseState state = posseState::none;
+    int id = 0;                  // serial (barb::posseId), set at the muster
+    int race = -1;
+    int campId = -1;             // brigand::id of the camp it hunts
+    int memberIds[kPosseMax] = {-1, -1, -1, -1};
+    int ticks = 0;               // march + fight ticks; in retreat, ticks left
+    int hitTicks = 0, checkTicks = 0;
+    int pipCount = 0, pipRace = -1, pipFade = 0;   // the pip column, kept after a disband so it fades where it stood
+    Vector2f pipPos;             // camp top-left the column stands beside
+};
+static_assert(kPosseMax == 4, "bountyPosse::memberIds initialiser is written for four members");
+bountyPosse posse;
+int posseSerial = 0;
+int posseGap = 0;                // ticks before the next muster may be tried
+bool inPosse(const barb& b) { return b.activity == actPosse; }
+bool posseLive() { return posse.state == posseState::march || posse.state == posseState::fight; }
+bool posseOnCamp(int campId) { return posseLive() && posse.campId == campId; }
+void posseMemberLost(const barb& b) {
+    if (b.posseId < 0) return;
+    for (auto& id : posse.memberIds) if (id == b.id) id = -1;
+}
 struct brigandJoin { int barbId, from; Vector2f site; };
 vector<brigandJoin> brigandQueue;   // R70-F3: exiles at their camp site, applied by applyBrigandJoins() outside every barb loop
 
@@ -5865,6 +5933,10 @@ void endActivity(barb& b) {
         case actFound:       // R66-F1: the trek lives on townTrek; endTownTrek() resets the walk
         case actFisher:      // R66-F2: the trip lives on the boat; jettyTick() re-resolves the fisher by id and frees the boat
         case actShepherd:    // R66-F3: the day lives on the fold; foldTick() re-resolves the shepherd by id and frees the fold
+            break;
+        case actPosse:       // R71-F2: death, defeat, disband, retreat and win all clear posseId here
+            b.posseId = -1;
+            break;
         case actNone:
         case activityCount:
             break;
@@ -5874,6 +5946,12 @@ void endActivity(barb& b) {
 void endActivity(barb& b, barbActivity a) { if (b.activity == a) endActivity(b); }
 // R63-F5a: chronicle load: gatherings are never saved; endActivity() clears the flags, walk and slot
 void resetGathers(vector<barb>& barbs) { for (auto& b : barbs) endActivity(b, actGather); }
+// R71-F2: chronicle load: posses are never saved (restored camps carry no bounty); endActivity() clears every posseId
+void resetPosse(vector<barb>& barbs) {
+    for (auto& b : barbs) { endActivity(b, actPosse); b.posseId = -1; }
+    posse = bountyPosse{};
+    posseGap = 0;
+}
 
 // R41-F2: every way out of a temper (finished, interrupted, reassigned, forge gone, sheltering, death) goes through here.
 // Refunds the stone if it is still owed (in endActivity()) and resets toolCharges even with no temper live (the tempered
@@ -6690,6 +6768,8 @@ const char* barbTaskName(const barb& b) {
         return host.phase == warHost::Home ? "field host: marching home"
              : host.phase == warHost::Clash ? (b.raidPreyId >= 0 ? "field host: fighting" : "field host: holding the line")
              : "field host: marching to battle";
+    if (inPosse(b))   // R71-F2
+        return posse.state == posseState::fight ? "posse: fighting the brigands" : "posse: marching on the brigands";
     if (inHollowHunt(b))   // R62-F3b
         return hollowHunt.phase == hollowHuntParty::Gather ? (b.moving ? "wyrm hunt: to the Hollow" : "wyrm hunt: waiting at the Hollow")
              : wyrmFightable() ? "wyrm hunt: after the wyrm" : "wyrm hunt: watching the Hollow";
@@ -13276,7 +13356,8 @@ void chronicleRestoreBarbs(const chronicleData& d, vector<barb>& barbs, vector<R
     truce = wyrmTruce{};  // R62-F3: nor the truce
     resetHollowHunt(barbs);   // R62-F3b: nor the joint hunt
     resetGathers(barbs);      // R63-F5a: nor any gathering
-    resetVigil();             // R63-F5: nor a vigil, nor its morale lift
+    resetPosse(barbs);        // R71-F2: nor a posse (the restored camps carry no bounty)
+    resetVigil();            // R63-F5: nor a vigil, nor its morale lift
     resetFeast();             // R63-F2: nor a harvest feast fire
     salmon = salmonRun{};     // R63-F3: nor a salmon run (anglers on its banks quit through the fish path's range check)
     resetDens();              // R63-F6: nor a wolf den or its scuffs (its pups leave through wolfTick()'s den check)
@@ -14567,6 +14648,8 @@ void removeBarb(vector<barb>& barbs, vector<RectangleShape>& squares, int i,
     endActivity(b, actHost);
     huntMemberLost(b);                            // R62-F3b: drops its hunt id; endActivity() wipes its saved flags (no restore)
     endActivity(b, actHollowHunt);
+    posseMemberLost(b);                           // R71-F2: drops its posse id; endActivity() clears posseId before the swapRemove
+    endActivity(b, actPosse);
     releaseSellswords("their employer is dead", -1, b.id);   // R65-F2: by barb id, before the swapRemove
     endActivity(b, actGather);                  // R63-F5a: explicit (releaseBarbWork() already did it); callers hold ids, so findBarbById() drops it
     envoyMemberLost(b);                         // R56-F2: drops the envoy id; envoyTick() aborts unpaid next tick
@@ -16307,6 +16390,7 @@ void leaderTick(vector<barb>& barbs) {
     }
 }
 
+void bountyDawn();   // R71-F2: defined with the posse, after the brigand camps
 void councilTick(vector<barb>& barbs) {
     static int lastHour = game_time;
     if (game_time == lastHour) return;
@@ -16336,6 +16420,7 @@ void councilTick(vector<barb>& barbs) {
         logEvent(to_string(gentry) + " Gentry cast " + to_string(gentry * gentryVoteWeight) + " of " +
                  to_string(gentry * gentryVoteWeight + (int)barbs.size() - gentry) + " votes");
     leaderTick(barbs);   // R28-F2: elections ride the same dawn
+    bountyDawn();        // R71-F2: a race robbed often enough by one camp posts a bounty on it
 }
 
 int popCap(const vector<house>& houses) {
@@ -17515,7 +17600,8 @@ bool trySendEnvoy(vector<barb>& barbs, int att, int def) {
 bool raceInParty(int r) {
     return (raid.active && (raid.att == r || raid.def == r)) || (caravan.active && caravan.from == r)
         || (envoy.active && envoy.payer == r) || (marriage.active && marriage.from == r) || (party.active && party.race == r)
-        || hostSideOf(r);   // R61-F2
+        || hostSideOf(r)    // R61-F2
+        || (posseLive() && posse.race == r);   // R71-F2
 }
 // R60-F1: the one way a war ends. treaty = the window closed and the raids are over: the side with fewer won raids pays
 // warReparations() in food (nothing on a draw) and the pair warms to neutral. Otherwise the war just fades (a side gone,
@@ -20658,9 +20744,11 @@ int brigandFightStep(brigand& c, vector<barb>& barbs) {
 void brigandTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
     for (auto& c : brigands) {
         Vector2f goal;
+        if (posseOnCamp(c.id) && posse.state == posseState::fight) continue;   // R71-F2: posseTick() fights the band at home
         switch (c.state) {
             case brigandState::camped:
                 if (c.rest > 0) { c.rest--; break; }
+                if (posseOnCamp(c.id)) break;   // R71-F2: a posse is on the way: the band stays home
                 if (++c.scanTicks < kBrigandScanTicks) break;
                 c.scanTicks = 0;
                 if (!brigandPickPrey(c, barbs, squares)) break;
@@ -20686,6 +20774,7 @@ void brigandTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
                         int r = clampRace(t.race), lost = t.load;
                         t.load = 0;
                         c.robbed++;
+                        c.robbedFrom[r]++;   // R71-F2: counts toward a bounty
                         string line = "Brigands of " + string(brigandName(c)) + "'s camp rob the " + racePlurals[r] + "' supply cart";
                         printf("---BRIGAND AMBUSH--- %s (%d food lost, camp %d)\n", line.c_str(), lost, c.id);
                         logEvent(line, kBrigandTickerTint);
@@ -20706,6 +20795,7 @@ void brigandTick(vector<barb>& barbs, vector<RectangleShape>& squares) {
                     string what = lootText(caravan.cargo);
                     caravan.cargo = raceStock{0, 0, 0};   // gone with the band (no loot pile in phase 1)
                     c.robbed++;
+                    c.robbedFrom[from]++;   // R71-F2: counts toward a bounty
                     string line = "Brigands rob the " + string(racePlurals[from]) + "' caravan of " + what;
                     printf("---BRIGAND AMBUSH--- %s (camp %d)\n", line.c_str(), c.id);
                     logEvent(line, kBrigandTickerTint);
@@ -20790,6 +20880,283 @@ void chronicleRestoreCamps(const chronicleData& d, const vector<CircleShape>& tr
     }
     printf("CHRONICLE - brigand camps: %d back (%d moved), %d lost\n", back, moved, lost);
     if (back > 0) logEvent("Chronicle restored " + to_string(back) + (back == 1 ? " brigand camp" : " brigand camps"), kChronicleRestoreTint);
+}
+
+// R71-F2: from councilTick() at dawn. Each camp with no bounty: the race it has robbed most since its last bounty, at
+// least kBountyRobberies times and with kBountyBase in its purse, posts one (nothing is paid until a posse wins).
+void bountyDawn() {
+    for (auto& c : brigands) {
+        if (c.bounty > 0) continue;
+        int poster = -1;
+        for (int r = 0; r < raceCount; r++)
+            if (c.robbedFrom[r] >= kBountyRobberies && purse[r] >= kBountyBase && (poster < 0 || c.robbedFrom[r] > c.robbedFrom[poster]))
+                poster = r;
+        if (poster < 0) continue;
+        c.bounty = kBountyBase;
+        c.bountyRace = poster;
+        c.bountyRaises = 0;
+        for (auto& k : c.robbedFrom) k = 0;
+        string line = "The " + string(racePlurals[poster]) + " post a " + to_string(c.bounty) + "c bounty on " + brigandName(c)
+                      + "'s brigand camp";
+        printf("---BOUNTY POSTED--- %s (camp %d, purse %d)\n", line.c_str(), c.id, purse[poster]);
+        logEvent(line, kBountyTickerTint);
+    }
+}
+
+int brigandIndexById(int id) {
+    for (int k = 0; k < (int)brigands.size(); k++) if (brigands[k].id == id) return k;
+    return -1;
+}
+
+// R71-F2: the one way a barb leaves the posse, standing where it is (defeat, disband, retreat, win, backstop)
+void releasePosseBarb(barb& b) {
+    if (!inPosse(b) && b.posseId < 0) return;
+    expeditionReset(b);
+    endActivity(b, actPosse);   // clears posseId
+    b.posseId = -1;             // a stray id with no posse activity behind it (backstop)
+}
+
+// R71-F2: the one way a posse ends: every member still listed is released, the pip column starts to fade where it stood.
+// next = posseState::retreat holds the retreat's cooldown; anything else ends in none.
+void endPosse(vector<barb>& barbs, posseState next) {
+    for (auto& id : posse.memberIds) {
+        int i = findBarbById(barbs, id);
+        id = -1;
+        if (i >= 0) releasePosseBarb(barbs[i]);
+    }
+    posse.state = next == posseState::retreat ? posseState::retreat : posseState::none;
+    posse.ticks = next == posseState::retreat ? kPosseRetreatTicks : 0;
+    posse.race = posse.campId = -1;
+    posse.hitTicks = posse.checkTicks = 0;
+    posse.pipFade = kPossePipFadeFrames;
+    posseGap = kPosseGapTicks;
+}
+
+// R71-F2: head's stand spot (hitbox top-left): left of the camp centre (the band stands on the right), or below it on water
+Vector2f posseStandSpot(const brigand& c, Vector2f size) {
+    Vector2f cc = brigandCentre(c);
+    Vector2f spot = snapPx(cc + Vector2f(-kPosseStandPx, 0.0f) - size / 2.0f);
+    if (lakeClear(FloatRect(spot, size))) return spot;
+    return snapPx(cc + Vector2f(0.0f, kPosseStandPx) - size / 2.0f);
+}
+
+// R71-F2: by daylight, the camp with the highest bounty draws a posse from the race able to spare the most eligible
+// barbs (hostRecruitOk(): armed, drilled, hale, fed, free; never a leader), at least kPosseMinMembers, up to kPosseMax,
+// nearest its own crate first. The poster wins a tie, then the race whose crate is nearest the camp. No ticker line.
+void tryMusterPosse(vector<barb>& barbs, const vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
+    if (posse.state != posseState::none || posseGap > 0 || isNightHour(game_time) || brigands.empty()) return;
+    int ci = -1;
+    for (int k = 0; k < (int)brigands.size(); k++)
+        if (brigands[k].bounty > 0 && (ci < 0 || brigands[k].bounty > brigands[ci].bounty)) ci = k;
+    if (ci < 0) return;
+    const brigand& c = brigands[ci];
+    Vector2f cc = brigandCentre(c);
+    int n = min((int)barbs.size(), (int)squares.size());
+    int pick[raceCount][kPosseMax];
+    int count[raceCount] = {};
+    int best = -1;
+    for (int r = 0; r < raceCount; r++) {
+        if (!stores[r].built || raceBell[r] > 0 || raceInParty(r)) continue;
+        for (int k = 0; k < kPosseMax; k++) {
+            pick[r][k] = findNearest(quarterCentre(r), kRaidRecruitRadius, n,
+                                     [&](int i) { return raidCentre(squares[i]); },
+                                     [&](int i) {
+                                         for (int q = 0; q < k; q++) if (pick[r][q] == i) return true;
+                                         return !hostRecruitOk(barbs[i], r);
+                                     });
+            if (pick[r][k] < 0) break;
+            count[r]++;
+        }
+        if (count[r] < kPosseMinMembers) continue;
+        bool better = best < 0 || count[r] > count[best];
+        if (!better && count[r] == count[best] && best != c.bountyRace) {   // a tie: the poster, else the nearer crate
+            Vector2f dr = quarterCentre(r) - cc, db = quarterCentre(best) - cc;
+            better = r == c.bountyRace || dr.x * dr.x + dr.y * dr.y < db.x * db.x + db.y * db.y;
+        }
+        if (better) best = r;
+    }
+    if (best < 0) return;
+    posse = bountyPosse{};
+    posse.state = posseState::march;
+    posse.id = ++posseSerial;
+    posse.race = best;
+    posse.campId = c.id;
+    posse.pipCount = count[best];
+    posse.pipRace = best;
+    posse.pipPos = c.site;
+    for (int k = 0; k < count[best]; k++) {
+        barb& m = barbs[pick[best][k]];
+        expeditionReset(m);   // ends any drill or wander walk first
+        beginActivity(m, actPosse);
+        m.posseId = posse.id;
+        m.order = needNone;
+        m.orderTicks = 0;
+        posse.memberIds[k] = m.id;
+    }
+    printf("---POSSE MUSTER--- %d %s ride on %s's camp (camp %d, %dc bounty posted by the %s)\n", count[best], racePlurals[best],
+           brigandName(c), c.id, c.bounty, racePlurals[clampRace(c.bountyRace)]);
+}
+
+// R71-F2: a beaten posse: the explicit retreat state (members released at once, a day's cooldown) and the bounty
+// doubles, at most kBountyMaxRaises times and never above kBountyMax. The band rests up at full hp.
+void posseRetreat(vector<barb>& barbs, brigand& c) {
+    int r = clampRace(posse.race);
+    bool raised = c.bountyRaises < kBountyMaxRaises && c.bounty < kBountyMax;
+    if (raised) { c.bounty = min(kBountyMax, c.bounty * 2); c.bountyRaises++; }
+    c.bandHp = kBrigandBandHp;
+    string line = "Brigands of " + string(brigandName(c)) + "'s camp drive off the " + racePlurals[r] + "' posse";
+    if (raised) line += "; the bounty rises to " + to_string(c.bounty) + "c";
+    printf("---POSSE BEATEN--- %s (camp %d, %d ticks, raises %d of %d)\n", line.c_str(), c.id, posse.ticks, c.bountyRaises, kBountyMaxRaises);
+    logEvent(line, kBountyTickerTint);
+    endPosse(barbs, posseState::retreat);
+}
+
+// R71-F2: the band is broken at its hide: standing members gain renown, the poster pays the bounty (transferCoin(), what
+// its purse holds; nothing moves when its own posse won) and the camp is erased.
+void posseClearCamp(vector<barb>& barbs, int ci, const int (&hi)[kPosseMax]) {
+    brigand& c = brigands[ci];
+    int r = clampRace(posse.race), poster = clampRace(c.bountyRace);
+    for (int k = 0; k < kPosseMax; k++) if (hi[k] >= 0) addRenown(barbs, hi[k], kPosseRenown, deedRaid);
+    int pay = r == poster ? 0 : min(c.bounty, purse[poster]);
+    bool paid = pay > 0 && transferCoin(poster, r, pay);
+    string line = string(racePlurals[r]) + "' posse clears " + brigandName(c) + "'s brigand camp";
+    if (paid) line += " and claims the " + to_string(pay) + "c bounty";
+    else if (r != poster) line += "; the " + string(racePlurals[poster]) + " cannot pay the bounty";
+    printf("---CAMP CLEARED--- %s (camp %d, %d ticks, purses %d / %d)\n", line.c_str(), c.id, posse.ticks, purse[r], purse[poster]);
+    logEvent(line, kBountyTickerTint);
+    brigands.erase(brigands.begin() + ci);
+    endPosse(barbs, posseState::none);
+}
+
+// R71-F2: in the fixed-step loop right after brigandTick(). Owns every posse member's movement. Re-resolves every member
+// and the camp by id each tick; a missing, dead, re-raced or no-longer-posse member is dropped (posseId cleared). March:
+// the column walks to the camp's stand spot and waits there until the band is home. Fight: every kPosseHitEveryTicks the
+// band strikes the haliest members (never below kBrigandHealthFloor) and each member strikes the band's pooled hp; a
+// member under kPosseYieldHealth leaves the posse. Band at 0: the camp is cleared. Nobody standing: the retreat.
+void posseTick(vector<barb>& barbs, vector<RectangleShape>& squares, const storehouse (&stores)[raceCount]) {
+    if (posseGap > 0) posseGap--;
+    int n = min((int)barbs.size(), (int)squares.size());
+    for (int i = 0; i < n; i++) {   // backstop: a posse flag or id with no live posse entry behind it is cleared
+        barb& b = barbs[i];
+        if (!inPosse(b) && b.posseId < 0) continue;
+        bool listed = posseLive() && inPosse(b) && b.posseId == posse.id;
+        if (listed) { listed = false; for (int id : posse.memberIds) listed = listed || id == b.id; }
+        if (!listed) { printf("POSSE FLAG CLEARED - barb %d (no posse entry)\n", b.id); releasePosseBarb(b); }
+    }
+    if (posse.state == posseState::retreat) {
+        if (--posse.ticks <= 0) { posse.state = posseState::none; posse.ticks = 0; printf("POSSE - the retreat is over\n"); }
+        return;
+    }
+    if (posse.state == posseState::none) {
+        if (++posse.checkTicks < kPosseCheckTicks) return;
+        posse.checkTicks = 0;
+        tryMusterPosse(barbs, squares, stores);
+        return;
+    }
+    posse.ticks++;
+    int ci = brigandIndexById(posse.campId);
+    int r = clampRace(posse.race);
+    if (ci < 0 || !stores[r].built) {
+        printf("POSSE DISBANDED - %s (%s)\n", racePlurals[r], ci < 0 ? "the camp is gone" : "crate gone");
+        endPosse(barbs, posseState::none);
+        return;
+    }
+    brigand& c = brigands[ci];
+    int hi[kPosseMax];
+    int standing = 0;
+    for (int k = 0; k < kPosseMax; k++) {
+        int i = findBarbById(barbs, posse.memberIds[k]);
+        bool bad = i < 0 || i >= n || !inPosse(barbs[i]) || barbs[i].posseId != posse.id || barbs[i].race != posse.race
+                || barbs[i].health <= 0;
+        if (bad) {
+            if (posse.memberIds[k] >= 0) printf("POSSE MEMBER DROPPED - barb %d\n", posse.memberIds[k]);
+            if (i >= 0 && i < n) releasePosseBarb(barbs[i]);
+            posse.memberIds[k] = hi[k] = -1;
+            continue;
+        }
+        hi[k] = i;
+        standing++;
+    }
+    if (standing > 0) posse.pipCount = standing;   // the last standing count is the one that fades on a disband
+    posse.pipRace = r;
+    posse.pipPos = c.site;
+    if (standing == 0) {
+        if (posse.state == posseState::fight) { posseRetreat(barbs, c); return; }
+        printf("POSSE DISBANDED - %s (no member left on the road)\n", racePlurals[r]);
+        endPosse(barbs, posseState::none);
+        return;
+    }
+    if (posse.ticks > kPosseMaxTicks) {
+        string line = string(racePlurals[r]) + "' posse gives up the hunt for " + brigandName(c) + "'s camp";
+        printf("---POSSE GIVES UP--- %s (camp %d, %d ticks)\n", line.c_str(), c.id, posse.ticks);
+        logEvent(line, kBountyTickerTint);
+        c.bandHp = kBrigandBandHp;
+        endPosse(barbs, posseState::none);
+        return;
+    }
+
+    if (posse.state == posseState::march) {
+        int head = -1;
+        for (int k = 0; k < kPosseMax && head < 0; k++) head = hi[k];
+        bool there = raidColumnStep(barbs, squares, hi, posseStandSpot(c, squares[head].getSize()));
+        if (!there || c.state != brigandState::camped) return;   // waits at the hide for the band to come home
+        posse.state = posseState::fight;
+        posse.hitTicks = 0;
+        c.bandHp = kBrigandBandHp + kPosseCampHpBonus;
+        printf("POSSE FIGHT - %d %s fall on camp %d after %d ticks\n", standing, racePlurals[r], c.id, posse.ticks);
+        return;
+    }
+
+    // fight: members stand their ground at the hide
+    for (int k = 0; k < kPosseMax; k++)
+        if (hi[k] >= 0 && barbs[hi[k]].moving) { barbs[hi[k]].moving = false; clearRoute(barbs[hi[k]]); barbs[hi[k]].stepTimer = 0; }
+    if (++posse.hitTicks < kPosseHitEveryTicks) return;
+    posse.hitTicks = 0;
+    uniform_real_distribution<float> roll(0.0f, 1.0f);
+    for (int s = 0; s < kPosseBandStrikes; s++) {
+        int hale = -1;
+        for (int k = 0; k < kPosseMax; k++) if (hi[k] >= 0 && (hale < 0 || barbs[hi[k]].health > barbs[hale].health)) hale = hi[k];
+        if (hale < 0 || roll(gen) >= kBrigandHitChance || barbs[hale].health <= kBrigandHealthFloor) continue;
+        barbs[hale].health = max(kBrigandHealthFloor, barbs[hale].health - kBrigandDamage);
+        barbs[hale].raidFlash = kRaidFlashFrames;
+    }
+    for (int k = 0; k < kPosseMax; k++) if (hi[k] >= 0 && roll(gen) < kPosseHitChance) c.bandHp -= kPosseDamage;
+    if (c.bandHp <= 0) { posseClearCamp(barbs, ci, hi); return; }
+    for (int k = 0; k < kPosseMax; k++) {   // a member struck below kPosseYieldHealth leaves the posse where it stands
+        int i = hi[k];
+        if (i < 0 || barbs[i].health >= kPosseYieldHealth) continue;
+        printf("POSSE MEMBER BEATEN - %s (id %d, %s)\n", barbs[i].name, barbs[i].id, racePlurals[r]);
+        releasePosseBarb(barbs[i]);
+        posse.memberIds[k] = hi[k] = -1;
+        standing--;
+    }
+    if (standing > 0) posse.pipCount = standing;
+    if (standing <= 0) posseRetreat(barbs, c);
+}
+
+// R71-F2: with the camps (under the barbs). A camp with a bounty flies one red flag on a short pole over its hide. Left of
+// the hide, a 1px-wide column of race-colour pips counts the posse's standing members; after a disband it fades out where
+// it stood over kPossePipFadeFrames drawn frames.
+void drawBountyMarks(RenderWindow& window, const FloatRect& camRect, bool paused) {
+    static VertexArray va(PrimitiveType::Triangles);
+    va.clear();
+    for (auto& c : brigands) {
+        if (c.bounty <= 0) continue;
+        Vector2f p = snapPx(c.site);
+        if (!camRect.findIntersection(FloatRect(p - Vector2f(0.0f, kBountyPoleH), kBrigandCampSize + Vector2f(0.0f, kBountyPoleH)))) continue;
+        pushQuad(va, p + Vector2f(1.0f, -kBountyPoleH), Vector2f(1.0f, kBountyPoleH), kHostPoleColor);
+        pushQuad(va, p + Vector2f(2.0f, -kBountyPoleH), kBountyFlagSize, kBountyFlagColor);
+    }
+    bool live = posseLive();
+    if (posse.pipCount > 0 && posse.pipRace >= 0 && posse.pipRace < raceCount && (live || posse.pipFade > 0)) {
+        Color col = kHostBannerColors[posse.pipRace];
+        col.a = live ? 255 : (uint8_t)(255.0f * posse.pipFade / (float)kPossePipFadeFrames);
+        Vector2f base = snapPx(posse.pipPos) + Vector2f(kPossePipX, kBrigandCampSize.y - kPossePipSize.y);
+        for (int k = 0; k < min(posse.pipCount, kPosseMax); k++)
+            pushQuad(va, base - Vector2f(0.0f, kPossePipStep * k), kPossePipSize, col);
+        if (!live && !paused) posse.pipFade--;
+    }
+    if (va.getVertexCount() > 0) window.draw(va);
 }
 
 // R56-F2: hand the envoy back to the other systems, standing where it is (every exit goes through here)
@@ -26278,6 +26645,7 @@ int main() {
                 applyExileTransfers(barbs, squares, houses);   // ...and applied here, outside every barb loop
                 applyBrigandJoins(barbs, squares, smoke, dwarfForge, stores, fields);   // R70-F3: an exile at its camp site leaves the barbs here
                 brigandTick(barbs, squares);   // R70-F3: camp bands stalk and rob laden supply carts and caravans
+                posseTick(barbs, squares, stores);   // R71-F2: bounty posse muster, march, fight at the hide, clear or retreat
                 envoyTick(barbs, squares, stores);     // R56-F2: the tribute envoy's walk and payment
                 marriageTick(barbs, squares, houses, stores);   // R59-F1: wedding procession walk, the wedding and alliance upkeep
                 bellTick(barbs, squares, houses, houseshapes, wolves, stores, smoke, dwarfForge, fields,
@@ -26408,6 +26776,7 @@ int main() {
 	drawPois(window, camRect, frameCount);   // R47-F4: huts and wells, with the buildings
 	drawWildCamp(window, camRect, frameCount, isNightHour(game_time));   // R55-F1: hide tents, hearth smoke, pennant
 	drawBrigandCamps(window, camRect);   // R70-F3: masked grey hides, with the buildings, under the bands and barbs
+	drawBountyMarks(window, camRect, paused);   // R71-F2: bounty flag over the hide + the posse's pip column beside it
 	drawDens(window, camRect);   // R63-F6: wolf den mound + fading scuffs, with the buildings, under the pups and barbs
 	drawFolds(window);   // R66-F3: fence, gate and lamp post, with the buildings, under the sheep and barbs
 	drawStall(window, activeTrader);
